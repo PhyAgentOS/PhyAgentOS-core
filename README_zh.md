@@ -164,6 +164,17 @@ paos onboard
 
 ### 3. 配置 Provider 与 Forge
 
+通过隐藏输入配置密钥，再选择默认 Provider：
+
+```bash
+paos provider configure openrouter
+paos provider use openrouter --model anthropic/claude-sonnet-4
+```
+
+Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`、`/status` 会话命令见
+[Provider CLI 指南](docs/zh/02-user-manual.md#2-配置模型与-forge)。会话切换只影响后续请求，
+不改变正在执行的任务及其他会话。
+
 配置保存为 camelCase，同时也接受 snake_case 输入。
 
 ```json
