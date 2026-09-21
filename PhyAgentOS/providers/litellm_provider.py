@@ -10,6 +10,7 @@ from litellm import acompletion
 from loguru import logger
 
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from PhyAgentOS.providers.effort import EffortError, apply_litellm_effort
 from PhyAgentOS.providers.errors import describe_provider_error
 from PhyAgentOS.providers.registry import find_by_model, find_by_name, find_gateway
 
@@ -239,17 +240,16 @@ class LiteLLMProvider(LLMProvider):
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
 
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-            kwargs["drop_params"] = True
-
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
         try:
+            apply_litellm_effort(kwargs, reasoning_effort)
             response = await acompletion(**kwargs)
             return self._parse_response(response)
+        except EffortError as e:
+            return LLMResponse(content=str(e), finish_reason="error")
         except Exception as e:
             # Return error as content for graceful handling
             return LLMResponse(

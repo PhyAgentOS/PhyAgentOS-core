@@ -243,6 +243,13 @@ class ProviderService:
         automatic.agents.defaults.provider = "auto"
         return automatic.get_provider_name(model)
 
+    def background_effort(self, name: str | None, model: str) -> str | None:
+        """Only inherit main effort when the background target is the same."""
+        defaults = self.config.agents.defaults
+        if name == self.config.get_provider_name() and model == defaults.model:
+            return defaults.reasoning_effort
+        return None
+
     def models(self, name: str) -> list[str]:
         """Saved choices, including defaults from configurations predating model lists."""
         spec = provider_spec(name)
@@ -271,27 +278,19 @@ class ProviderService:
     def validate_effort(spec: ProviderSpec, model: str, effort: str | None) -> None:
         if effort is None:
             return
-        if effort not in {"low", "medium", "high", "none"}:
-            raise ProviderError("Reasoning effort must be low, medium, high or none.")
         # 'none' clears our override and uses the model's default behavior.
         if effort == "none":
             return
-        bare = model.split("/")[-1].lower()
-        if spec.name in {"openai", "openai_codex", "azure_openai", "custom"}:
-            supported = bool(re.match(r"(?:gpt-5|o[134](?:-|$)|gpt-oss)", bare))
-        else:
-            import litellm
+        from PhyAgentOS.providers.effort import (
+            EffortError,
+            supported_efforts,
+            validate_effort_level,
+        )
 
-            prefix = spec.litellm_prefix
-            routed = model if not prefix or model.startswith(prefix + "/") else prefix + "/" + model
-            try:
-                supported = bool(litellm.supports_reasoning(model=routed))
-            except Exception:
-                supported = False
-        if not supported:
-            raise ProviderError(
-                "Reasoning effort is not supported by this provider/model in the local capability catalog. Use --reasoning-effort none or choose a supported model."
-            )
+        try:
+            validate_effort_level(effort, supported_efforts(spec, model))
+        except EffortError as exc:
+            raise ProviderError(str(exc)) from None
 
     def selection(
         self, name: str | None = None, model: str | None = None, effort: str | None = None
@@ -498,7 +497,10 @@ class SessionRuntimes:
                     )
                     + "\nUse /model <number> or /model <model-id> to select a model."
                 )
-            return f"Current effort: {current.effort or 'none'}\nOptions: low, medium, high, none (model default)"
+            from PhyAgentOS.providers.effort import supported_efforts
+
+            options = ", ".join(("none (model default)", *supported_efforts(provider_spec(current.name), current.model)))
+            return f"Current effort: {current.effort or 'none'}\nOptions: {options}"
         if argument == "reset":
             self.clear(key)
             return "Session overrides cleared; subsequent turns use startup settings."

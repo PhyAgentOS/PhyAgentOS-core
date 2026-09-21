@@ -95,6 +95,8 @@ class AzureOpenAIProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Prepare the request payload with Azure OpenAI 2024-10-21 compliance."""
+        if reasoning_effort == "none":
+            reasoning_effort = None
         payload: dict[str, Any] = {
             "messages": self._sanitize_request_messages(
                 self._sanitize_empty_content(messages),

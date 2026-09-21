@@ -180,6 +180,48 @@ def test_evolution_does_not_reuse_forced_provider_when_auto_names_match(config):
     assert model == "gpt-4o"
 
 
+@pytest.mark.parametrize("background_name,background_model", [
+    ("openai", "gpt-4o"),
+    ("deepseek", "deepseek-chat"),
+])
+def test_independent_background_model_does_not_inherit_main_effort(
+    config, background_name, background_model,
+):
+    config.providers.deepseek.api_key = "test"
+    config.agents.defaults.reasoning_effort = "high"
+    config.agents.evolution.enabled = True
+    config.agents.evolution.provider = background_name
+    config.agents.evolution.model = background_model
+    config.agents.verification.service_enabled = True
+    config.agents.verification.provider = background_name
+    config.agents.verification.model = background_model
+    main = ProviderService(config).resolve().provider
+
+    evolution, model = _make_evolution_provider(config, main)
+    verifier = _make_forge_verifier(config, main)
+
+    assert model == background_model
+    assert evolution is not main
+    assert evolution._spec.name == background_name
+    assert evolution.generation.reasoning_effort is None
+    assert verifier.service.provider_spec["reasoning_effort"] is None
+    assert main.generation.reasoning_effort == "high"
+
+
+def test_background_same_target_keeps_startup_effort(config):
+    config.agents.defaults.reasoning_effort = "high"
+    config.agents.evolution.enabled = True
+    config.agents.verification.service_enabled = True
+    main = ProviderService(config).resolve().provider
+
+    evolution, model = _make_evolution_provider(config, main)
+    verifier = _make_forge_verifier(config, main)
+
+    assert evolution is main
+    assert model == config.agents.defaults.model
+    assert verifier.service.provider_spec["reasoning_effort"] == "high"
+
+
 def test_explicit_auto_override_infers_a_different_provider(config):
     selected = ProviderService(config).selection("auto", "claude-sonnet-4")
     assert selected.name == "anthropic"

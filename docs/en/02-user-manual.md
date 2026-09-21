@@ -142,13 +142,21 @@ paos gateway --provider openrouter --model anthropic/claude-sonnet-4
 ```
 
 In the Agent, `/help` lists all commands. Use `/provider [list|<provider>]`,
-`/model [list|<number>|<model-id>]`, `/effort [low|medium|high|none]`, and `/status` to inspect or change
+`/model [list|<number>|<model-id>]`, `/effort [list|<level>|none]`, and `/status` to inspect or change
 the current session. `/model list` numbers the current provider's saved models; `/model 2` selects
 the second entry. Defaults from older configurations remain available. Listing is not a chat
 availability check. Unsupported model routes or effort settings are rejected
 without changing the session. `none` removes the explicit effort setting and uses the model default.
 Custom endpoints and Azure deployment aliases with unknown capabilities should use `none`;
 choose a recognized reasoning model ID to request an explicit effort.
+
+Bare `/effort` in terminal chat shows an inline list: Up/Down moves, Enter confirms, and
+Esc or Ctrl+C cancels. `/effort list` displays the current model's supported levels.
+The menu and startup validation use the same provider/model capabilities: `minimal`, `low`,
+`medium`, `high`, `xhigh`, or `max` appear only when supported. Extra levels require explicit
+local catalog support and a working adapter mapping. Gateway choices can differ from native
+provider choices. For adaptive Claude, supported `max` maps to `output_config.effort`; legacy
+Claude continues to use thinking budgets. `none` always means model default, not disabled thinking.
 
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current

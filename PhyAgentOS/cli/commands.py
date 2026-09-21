@@ -320,7 +320,7 @@ def _make_evolution_provider(config: Config, default_provider):
         settings.provider or verification.provider, background_model,
     )
     default_name = config.get_provider_name()
-    if provider_name == default_name:
+    if provider_name == default_name and model == config.agents.defaults.model:
         return default_provider, model
     if not provider_name:
         console.print(
@@ -329,7 +329,10 @@ def _make_evolution_provider(config: Config, default_provider):
         )
         return default_provider, config.agents.defaults.model
     try:
-        return _make_provider(config, model, provider_name.replace("-", "_")), model
+        runtime = service.resolve(
+            provider_name, model, service.background_effort(provider_name, model) or "none",
+        )
+        return runtime.provider, model
     except Exception as exc:
         console.print(
             "[yellow]Evolution provider initialization failed; falling back to the Agent "
@@ -370,7 +373,7 @@ def _make_forge_verifier(config: Config, provider):
         ),
         "temperature": 0.0,
         "max_tokens": min(4096, config.agents.defaults.max_tokens),
-        "reasoning_effort": config.agents.defaults.reasoning_effort,
+        "reasoning_effort": service.background_effort(provider_name, model),
     }
     return ForgeTaskVerifier(
         workspace=config.workspace_path,
@@ -480,7 +483,7 @@ def gateway(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
     provider: str | None = typer.Option(None, "--provider", help="Provider for this process"),
     model: str | None = typer.Option(None, "--model", help="Model for this process"),
-    reasoning_effort: str | None = typer.Option(None, "--reasoning-effort", help="low, medium, high or none"),
+    reasoning_effort: str | None = typer.Option(None, "--reasoning-effort", help="Model-supported effort: minimal, low, medium, high, xhigh, max; none uses model default"),
 ):
     """Start the PhyAgentOS gateway."""
     from PhyAgentOS.agent.loop import AgentLoop
@@ -696,7 +699,7 @@ def agent(
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show PhyAgentOS process logs during chat"),
     provider: str | None = typer.Option(None, "--provider", help="Provider for this process"),
     model: str | None = typer.Option(None, "--model", help="Model for this process"),
-    reasoning_effort: str | None = typer.Option(None, "--reasoning-effort", help="low, medium, high or none"),
+    reasoning_effort: str | None = typer.Option(None, "--reasoning-effort", help="Model-supported effort: minimal, low, medium, high, xhigh, max; none uses model default"),
 ):
     """Interact with the agent directly."""
     from loguru import logger

@@ -619,7 +619,7 @@ class AgentLoop:
                 "/restart — Restart the bot",
                 "/provider [list|<provider>] — Show or switch this session's provider",
                 "/model [list|<model-id>] — Show or switch this session's model",
-                "/effort [low|medium|high|none] — Set this session's reasoning effort",
+                "/effort [list|<level>|none] — Show supported levels or set this session's reasoning effort",
                 "/status — Show session, provider, model, effort and endpoint",
                 "/provider reset — Clear session overrides and use startup settings",
                 "/help — Show available commands",

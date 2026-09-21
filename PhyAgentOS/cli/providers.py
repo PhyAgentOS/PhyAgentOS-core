@@ -146,6 +146,7 @@ def _prompt(message: str, *, default: str = "", secret: bool = False) -> str:
 
 def _model_picker(
     models: list[str], *, selected: list[str] | None = None, multiple: bool = False,
+    title: str | None = None,
 ):
     """Inline model picker with a bounded viewport, also usable for a single default."""
     from prompt_toolkit.application import Application
@@ -192,9 +193,9 @@ def _model_picker(
         event.app.exit(exception=KeyboardInterrupt())
 
     def render():
-        title = "Select models to add" if multiple else "Select a model"
+        heading = title or ("Select models to add" if multiple else "Select a model")
         start = max(0, min(cursor - 5, len(models) - 12))
-        lines = [f"{title} ({cursor + 1}/{len(models)})\n\n"]
+        lines = [f"{heading} ({cursor + 1}/{len(models)})\n\n"]
         for index in range(start, min(start + 12, len(models))):
             marker = "[x]" if models[index] in checked else "[ ]"
             lines.append(f"  {'>' if index == cursor else ' '} {marker if multiple else ''} {models[index]}\n")
@@ -237,7 +238,31 @@ async def _switch_session_model(sessions: SessionRuntimes, key: str) -> str:
 async def _interactive_model_command(
     command: str, sessions: SessionRuntimes | None, key: str,
 ) -> str | None:
-    if command.strip().lower() != "/model" or not _interactive() or sessions is None:
+    parts = command.strip().lower().split(maxsplit=1)
+    if not parts or not _interactive() or sessions is None:
+        return None
+    if parts[0] == "/effort":
+        from PhyAgentOS.providers.effort import effort_error, supported_efforts
+
+        current = sessions.get(key)
+        try:
+            argument = parts[1] if len(parts) > 1 else ""
+            if not argument:
+                levels = supported_efforts(provider_spec(current.name), current.model)
+                if not levels:
+                    raise ProviderError(effort_error())
+                chosen = await _model_picker(
+                    ["none", *levels],
+                    selected=[current.effort or "none"],
+                    title="Select reasoning effort (none = model default)",
+                ).run_async()
+                argument = chosen[0]
+            return sessions.command(key, f"/effort {argument}")
+        except ProviderError as exc:
+            return str(exc)
+        except (KeyboardInterrupt, EOFError, typer.Abort):
+            return "Effort selection cancelled; current effort unchanged."
+    if command.strip().lower() != "/model":
         return None
     try:
         return await _switch_session_model(sessions, key)

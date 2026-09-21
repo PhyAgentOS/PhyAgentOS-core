@@ -59,7 +59,7 @@ class OpenAICodexProvider(LLMProvider):
             "parallel_tool_calls": True,
         }
 
-        if reasoning_effort:
+        if reasoning_effort and reasoning_effort != "none":
             body["reasoning"] = {"effort": reasoning_effort}
 
         if tools:

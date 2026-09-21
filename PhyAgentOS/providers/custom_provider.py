@@ -10,6 +10,7 @@ import json_repair
 from openai import AsyncOpenAI
 
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from PhyAgentOS.providers.effort import is_openai_reasoning_model
 from PhyAgentOS.providers.errors import describe_provider_error
 
 
@@ -49,8 +50,12 @@ class CustomProvider(LLMProvider):
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
         }
-        if reasoning_effort:
+        if reasoning_effort and reasoning_effort != "none":
             kwargs["reasoning_effort"] = reasoning_effort
+        # Clearing effort restores the model default, not legacy request parameters.
+        if "reasoning_effort" in kwargs or is_openai_reasoning_model(kwargs["model"]):
+            kwargs.pop("temperature", None)
+            kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
         if tools:
             kwargs.update(tools=tools, tool_choice=tool_choice or "auto")
         try:

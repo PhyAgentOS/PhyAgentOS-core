@@ -135,7 +135,7 @@ paos gateway --provider openrouter --model anthropic/claude-sonnet-4
 ```
 
 Agent 内 `/help` 列出全部命令。使用 `/provider [list|<provider>]`、
-`/model [list|<编号>|<model-id>]`、`/effort [low|medium|high|none]` 和 `/status` 查看或切换当前会话。
+`/model [list|<编号>|<model-id>]`、`/effort [list|<档位>|none]` 和 `/status` 查看或切换当前会话。
 终端聊天中直接输入 `/model` 会打开模型选择器，展示所有已配置供应商下保存的模型并标注
 供应商。上下键选择、Enter 确认后立即切换当前会话的供应商和模型，下一条消息使用新选择。
 Esc 或 Ctrl+C 取消选择并返回聊天。`/model list` 只查看列表；非终端渠道保留文字列表与编号选择。
@@ -144,6 +144,13 @@ Esc 或 Ctrl+C 取消选择并返回聊天。`/model list` 只查看列表；非
 思考程度会被拒绝，保留原选择。`none` 表示移除显式思考程度，采用模型默认行为。
 Custom endpoint 或 Azure 部署别名的能力未知时应使用 `none`；显式指定思考程度需要可识别的
 推理模型名称。
+
+终端聊天输入 `/effort` 显示行内列表：上下键移动、Enter 确认、Esc / Ctrl+C 取消。
+`/effort list` 查看当前模型可选档位。菜单和启动校验使用同一套供应商及模型能力判断，
+从 `minimal / low / medium / high / xhigh / max` 中仅展示支持的档位。
+额外档位需要本地目录明确支持且适配器可映射；网关可选档位可能与原厂接口不同。
+支持 `max` 的自适应 Claude 使用 `output_config.effort`，传统 Claude 使用思考预算。
+`none` 始终表示模型默认行为，不代表关闭思考。详见[推理强度](reasoning-effort.md)。
 
 优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
 开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
