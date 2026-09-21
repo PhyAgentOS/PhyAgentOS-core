@@ -261,7 +261,8 @@ def onboard():
 
     console.print(f"\n{__logo__} PhyAgentOS is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.PhyAgentOS/config.json[/cyan]")
+    console.print("  1. Configure a provider: [cyan]paos provider configure[/cyan]")
+    console.print("     Set the default: [cyan]paos provider use <provider>[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]paos agent -m \"Hello!\"[/cyan]")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/PhyAgentOS#-chat-apps[/dim]")
@@ -272,93 +273,54 @@ def _make_provider(
     model_override: str | None = None,
     provider_name_override: str | None = None,
 ):
-    """Create the appropriate LLM provider from config."""
-    from PhyAgentOS.providers.azure_openai_provider import AzureOpenAIProvider
-    from PhyAgentOS.providers.base import GenerationSettings
-    from PhyAgentOS.providers.openai_codex_provider import OpenAICodexProvider
+    """Create providers through the same resolver used by session commands."""
+    from PhyAgentOS.providers.service import ProviderError, ProviderService
 
-    model = model_override or config.agents.defaults.model
-    provider_name = provider_name_override or config.get_provider_name(model)
-    p = (
-        getattr(config.providers, provider_name, None)
-        if provider_name_override
-        else config.get_provider(model)
-    )
+    try:
+        return ProviderService(config).resolve(provider_name_override, model_override).provider
+    except ProviderError as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from None
 
-    def api_base() -> str | None:
-        if p is not None and p.api_base:
-            return p.api_base
-        if provider_name_override:
-            from PhyAgentOS.providers.registry import find_by_name
 
-            spec = find_by_name(provider_name)
-            if spec and (spec.is_gateway or spec.is_local):
-                return spec.default_api_base
-            return None
-        return config.get_api_base(model)
+def _apply_startup_overrides(
+    config: Config,
+    provider: str | None,
+    model: str | None,
+    reasoning_effort: str | None,
+) -> Config:
+    """Validate startup overrides on a copy; never persist process settings."""
+    from PhyAgentOS.providers.service import ProviderError, ProviderService
 
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        provider = OpenAICodexProvider(default_model=model)
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    elif provider_name == "custom":
-        from PhyAgentOS.providers.custom_provider import CustomProvider
-        provider = CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=api_base() or "http://localhost:8000/v1",
-            default_model=model,
-        )
-    # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
-    elif provider_name == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.PhyAgentOS/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-    else:
-        from PhyAgentOS.providers.litellm_provider import LiteLLMProvider
-        from PhyAgentOS.providers.registry import find_by_name
-        spec = find_by_name(provider_name)
-        if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and (spec.is_oauth or spec.is_local)):
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.PhyAgentOS/config.json under providers section")
-            raise typer.Exit(1)
-        provider = LiteLLMProvider(
-            api_key=p.api_key if p else None,
-            api_base=api_base(),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            provider_name=provider_name,
-        )
-
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
-    )
-    return provider
+    try:
+        service = ProviderService(config)
+        runtime = service.selection(provider, model, reasoning_effort)
+    except ProviderError as exc:
+        console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(1) from None
+    result = service.config.model_copy(deep=True)
+    result.agents.defaults.provider = runtime.name
+    result.agents.defaults.model = runtime.model
+    result.agents.defaults.reasoning_effort = runtime.effort
+    return result
 
 
 def _make_evolution_provider(config: Config, default_provider):
     """Resolve the optional evolution model/provider independently of verifier budget."""
+    from PhyAgentOS.providers.service import ProviderService
+
     settings = config.agents.evolution
     if not settings.enabled:
         return default_provider, config.agents.defaults.model
     verification = config.agents.verification
-    model = settings.model or verification.model or config.agents.defaults.model
-    provider_name = (
-        settings.provider
-        or verification.provider
-        or config.get_provider_name(model)
+    background_model = settings.model or verification.model
+    model = background_model or config.agents.defaults.model
+    service = ProviderService(config)
+    provider_name = service.background_provider_name(
+        settings.provider or verification.provider, background_model,
     )
-    default_name = config.get_provider_name(config.agents.defaults.model)
-    if provider_name == default_name:
+    default_name = config.get_provider_name()
+    if provider_name == default_name and model == config.agents.defaults.model:
         return default_provider, model
     if not provider_name:
         console.print(
@@ -367,7 +329,10 @@ def _make_evolution_provider(config: Config, default_provider):
         )
         return default_provider, config.agents.defaults.model
     try:
-        return _make_provider(config, model, provider_name.replace("-", "_")), model
+        runtime = service.resolve(
+            provider_name, model, service.background_effort(provider_name, model) or "none",
+        )
+        return runtime.provider, model
     except Exception as exc:
         console.print(
             "[yellow]Evolution provider initialization failed; falling back to the Agent "
@@ -381,31 +346,34 @@ def _make_forge_verifier(config: Config, provider):
     if not config.agents.verification.service_enabled:
         return None
     from PhyAgentOS.agent.session_verifier import ForgeTaskVerifier
+    from PhyAgentOS.providers.service import ProviderService, provider_spec
 
     settings = config.agents.verification
     model = settings.model or config.agents.defaults.model
-    provider_name = settings.provider or config.get_provider_name(model)
+    service = ProviderService(config)
+    provider_name = service.background_provider_name(settings.provider, settings.model)
     if not provider_name:
         raise RuntimeError(f"cannot resolve verification provider for model {model!r}")
     provider_name = provider_name.replace("-", "_")
-    provider_config = getattr(config.providers, provider_name, None)
+    provider_config = getattr(service.config.providers, provider_name, None)
     if settings.provider is not None and provider_config is None:
         raise RuntimeError(f"unknown verification provider {settings.provider!r}")
-    provider_spec = {
+    provider_meta = provider_spec(provider_name)
+    child_provider_spec = {
         "provider_name": provider_name,
         "model": model,
         "api_key": provider_config.api_key if provider_config is not None else None,
         "api_base": (
             provider_config.api_base
             if provider_config is not None and provider_config.api_base
-            else config.get_api_base(model)
+            else provider_meta.default_api_base or None
         ),
         "extra_headers": (
             provider_config.extra_headers if provider_config is not None else None
         ),
         "temperature": 0.0,
         "max_tokens": min(4096, config.agents.defaults.max_tokens),
-        "reasoning_effort": config.agents.defaults.reasoning_effort,
+        "reasoning_effort": service.background_effort(provider_name, model),
     }
     return ForgeTaskVerifier(
         workspace=config.workspace_path,
@@ -415,7 +383,7 @@ def _make_forge_verifier(config: Config, provider):
         timeout_s=settings.timeout_s,
         service_host=settings.service_host,
         service_port=settings.service_port,
-        service_provider_spec=provider_spec,
+        service_provider_spec=child_provider_spec,
         max_calls=settings.max_verifier_calls_per_run,
         write_legacy_lessons=not config.agents.evolution.enabled,
     )
@@ -513,6 +481,9 @@ def gateway(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    provider: str | None = typer.Option(None, "--provider", help="Provider for this process"),
+    model: str | None = typer.Option(None, "--model", help="Model for this process"),
+    reasoning_effort: str | None = typer.Option(None, "--reasoning-effort", help="Model-supported effort: minimal, low, medium, high, xhigh, max; none uses model default"),
 ):
     """Start the PhyAgentOS gateway."""
     from PhyAgentOS.agent.loop import AgentLoop
@@ -530,7 +501,9 @@ def gateway(
 
     from PhyAgentOS.embodiment_registry import EmbodimentRegistry
 
-    config = _load_command_config(config, workspace)
+    config = _apply_startup_overrides(
+        _load_command_config(config, workspace), provider, model, reasoning_effort,
+    )
     _print_deprecated_memory_window_notice(config)
     port = port if port is not None else config.gateway.port
     registry = EmbodimentRegistry(config)
@@ -559,6 +532,7 @@ def gateway(
     agent = AgentLoop(
         bus=bus,
         provider=provider,
+        provider_config=config,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -723,6 +697,9 @@ def agent(
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show PhyAgentOS process logs during chat"),
+    provider: str | None = typer.Option(None, "--provider", help="Provider for this process"),
+    model: str | None = typer.Option(None, "--model", help="Model for this process"),
+    reasoning_effort: str | None = typer.Option(None, "--reasoning-effort", help="Model-supported effort: minimal, low, medium, high, xhigh, max; none uses model default"),
 ):
     """Interact with the agent directly."""
     from loguru import logger
@@ -733,7 +710,9 @@ def agent(
     from PhyAgentOS.cron.service import CronService
     from PhyAgentOS.embodiment_registry import EmbodimentRegistry
 
-    config = _load_command_config(config, workspace)
+    config = _apply_startup_overrides(
+        _load_command_config(config, workspace), provider, model, reasoning_effort,
+    )
     _print_deprecated_memory_window_notice(config)
     registry = EmbodimentRegistry(config)
     if registry.is_fleet:
@@ -763,6 +742,7 @@ def agent(
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
+        provider_config=config,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -840,6 +820,8 @@ def agent(
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
         async def run_interactive():
+            from PhyAgentOS.cli.providers import _interactive_model_command
+
             bus_task = asyncio.create_task(agent_loop.run())
             turn_done = asyncio.Event()
             turn_done.set()
@@ -885,6 +867,13 @@ def agent(
                             _restore_terminal()
                             console.print("\nGoodbye!")
                             break
+
+                        selection_result = await _interactive_model_command(
+                            command, agent_loop.session_runtimes, f"{cli_channel}:{cli_chat_id}",
+                        )
+                        if selection_result is not None:
+                            _print_agent_response(selection_result, render_markdown=markdown)
+                            continue
 
                         turn_done.clear()
                         turn_response.clear()
@@ -1663,7 +1652,8 @@ def status():
 # OAuth Login
 # ============================================================================
 
-provider_app = typer.Typer(help="Manage providers")
+from PhyAgentOS.cli.providers import provider_app  # noqa: E402
+
 app.add_typer(provider_app, name="provider")
 
 
@@ -1679,12 +1669,15 @@ def _register_login(name: str):
 
 @provider_app.command("login")
 def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str | None = typer.Argument(None, help="OAuth provider; omit to select interactively"),
 ):
     """Authenticate with an OAuth provider."""
+    from PhyAgentOS.cli.providers import _provider_argument, _provider_errors
     from PhyAgentOS.providers.registry import PROVIDERS
+    from PhyAgentOS.providers.service import ProviderService
 
-    key = provider.replace("-", "_")
+    with _provider_errors():
+        key = _provider_argument(provider, ProviderService(Config()), action="Login")
     spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
     if not spec:
         names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)

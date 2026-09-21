@@ -32,10 +32,21 @@ from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.embodiment_registry import EmbodimentRegistry
 from PhyAgentOS.providers.base import LLMProvider
 from PhyAgentOS.providers.providers_manager import ProvidersManager
+from PhyAgentOS.providers.service import (
+    ProviderError,
+    ProviderService,
+    RuntimeSelection,
+    SessionRuntimes,
+)
 from PhyAgentOS.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from PhyAgentOS.config.schema import AgentEvolutionConfig, ChannelsConfig, ExecToolConfig
+    from PhyAgentOS.config.schema import (
+        AgentEvolutionConfig,
+        ChannelsConfig,
+        Config,
+        ExecToolConfig,
+    )
     from PhyAgentOS.cron.service import CronService
     from PhyAgentOS.forge.task import AgentTaskCoordinator
     from PhyAgentOS.forge.tool_client import ForgeToolClient
@@ -79,6 +90,7 @@ class AgentLoop:
         evolution_config: AgentEvolutionConfig | None = None,
         evolution_provider: LLMProvider | None = None,
         evolution_model: str | None = None,
+        provider_config: Config | None = None,
     ):
         from PhyAgentOS.config.schema import ExecToolConfig
         self.bus = bus
@@ -86,6 +98,16 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.session_runtimes: SessionRuntimes | None = None
+        if provider_config is not None:
+            service = ProviderService(provider_config)
+            self.session_runtimes = SessionRuntimes(service, RuntimeSelection(
+                name=provider_config.get_provider_name(self.model) or "custom",
+                model=self.model,
+                effort=provider.generation.reasoning_effort,
+                endpoint=provider.api_base,
+                provider=provider,
+            ))
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
         self.brave_api_key = brave_api_key
@@ -303,22 +325,27 @@ class AgentLoop:
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
         experience_session_key: str | None = None,
+        runtime: RuntimeSelection | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        # Pin the entire turn, including retries and tool iterations, to one
+        # selection. Session commands only replace the next turn's selection.
+        provider = runtime.provider if runtime else self.provider
+        model = runtime.model if runtime else self.model
 
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
 
-            response = await self.provider.chat_with_retry(
+            response = await provider.chat_with_retry(
                 messages=messages,
                 tools=tool_defs,
-                model=self.model,
+                model=model,
             )
 
             if response.has_tool_calls:
@@ -391,6 +418,8 @@ class AgentLoop:
                 await self._handle_stop(msg)
             elif cmd == "/restart":
                 await self._handle_restart(msg)
+            elif response := self._runtime_command(msg):
+                await self.bus.publish_outbound(response)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -463,6 +492,20 @@ class AgentLoop:
                     content="Sorry, I encountered an error.",
                 ))
 
+    def _runtime_command(
+        self, msg: InboundMessage, session_key: str | None = None,
+    ) -> OutboundMessage | None:
+        """Handle session settings without interrupting or waiting for active tasks."""
+        if msg.channel == "system" or self.session_runtimes is None:
+            return None
+        try:
+            content = self.session_runtimes.command(session_key or msg.session_key, msg.content)
+        except ProviderError as exc:
+            content = str(exc)
+        if content is None:
+            return None
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+
     async def close_mcp(self) -> None:
         """Close MCP connections."""
         if self._mcp_stack:
@@ -493,6 +536,15 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
+        command_response = self._runtime_command(msg, session_key)
+        if command_response is not None:
+            return command_response
+        key = session_key or msg.session_key
+        runtime = (
+            self.session_runtimes.get(key)
+            if self.session_runtimes is not None and msg.channel != "system"
+            else None
+        )
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
@@ -565,6 +617,11 @@ class AgentLoop:
                 "/new — Start a new conversation",
                 "/stop — Stop the current task",
                 "/restart — Restart the bot",
+                "/provider [list|<provider>] — Show or switch this session's provider",
+                "/model [list|<model-id>] — Show or switch this session's model",
+                "/effort [list|<level>|none] — Show supported levels or set this session's reasoning effort",
+                "/status — Show session, provider, model, effort and endpoint",
+                "/provider reset — Clear session overrides and use startup settings",
                 "/help — Show available commands",
             ]
             return OutboundMessage(
@@ -602,6 +659,7 @@ class AgentLoop:
             initial_messages,
             on_progress=on_progress or _bus_progress,
             experience_session_key=key,
+            runtime=runtime,
         )
 
         if final_content is None:

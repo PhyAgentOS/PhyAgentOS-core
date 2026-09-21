@@ -12,6 +12,7 @@ from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from PhyAgentOS.providers.errors import describe_provider_error
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "PhyAgentOS"
@@ -20,9 +21,11 @@ DEFAULT_ORIGINATOR = "PhyAgentOS"
 class OpenAICodexProvider(LLMProvider):
     """Use Codex OAuth to call the Responses API."""
 
-    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
-        super().__init__(api_key=None, api_base=None)
+    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex",
+                 api_base: str | None = None, extra_headers: dict[str, str] | None = None):
+        super().__init__(api_key=None, api_base=api_base)
         self.default_model = default_model
+        self.extra_headers = extra_headers or {}
 
     async def chat(
         self,
@@ -37,8 +40,11 @@ class OpenAICodexProvider(LLMProvider):
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
 
-        token = await asyncio.to_thread(get_codex_token)
-        headers = _build_headers(token.account_id, token.access)
+        try:
+            token = await asyncio.to_thread(get_codex_token)
+        except Exception:
+            return LLMResponse(content="Authentication failed; run provider login.", finish_reason="error")
+        headers = {**self.extra_headers, **_build_headers(token.account_id, token.access)}
 
         body: dict[str, Any] = {
             "model": _strip_model_prefix(model),
@@ -53,13 +59,13 @@ class OpenAICodexProvider(LLMProvider):
             "parallel_tool_calls": True,
         }
 
-        if reasoning_effort:
+        if reasoning_effort and reasoning_effort != "none":
             body["reasoning"] = {"effort": reasoning_effort}
 
         if tools:
             body["tools"] = _convert_tools(tools)
 
-        url = DEFAULT_CODEX_URL
+        url = self.api_base.rstrip("/") + "/codex/responses" if self.api_base else DEFAULT_CODEX_URL
 
         try:
             try:
@@ -76,7 +82,7 @@ class OpenAICodexProvider(LLMProvider):
             )
         except Exception as e:
             return LLMResponse(
-                content=f"Error calling Codex: {str(e)}",
+                content=describe_provider_error(e),
                 finish_reason="error",
             )
 

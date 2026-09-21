@@ -167,6 +167,17 @@ This creates `~/.PhyAgentOS/config.json` and the default workspace at `~/.PhyAge
 
 ### 3. Configure a provider and Forge
 
+Configure credentials with hidden input, then select the default:
+
+```bash
+paos provider configure openrouter
+paos provider use openrouter --model anthropic/claude-sonnet-4
+```
+
+See the [provider CLI guide](docs/en/02-user-manual.md#2-configure-the-model-and-forge) for
+Docker/secret input, process overrides and session commands (`/provider`, `/model`, `/effort`, `/status`).
+Session switches affect subsequent turns only and leave running tasks and other sessions unchanged.
+
 The configuration file is serialized in camelCase; snake_case keys are also accepted.
 
 ```json

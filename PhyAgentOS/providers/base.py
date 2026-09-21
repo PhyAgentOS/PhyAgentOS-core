@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from PhyAgentOS.providers.errors import describe_provider_error
+
 try:
     from loguru import logger
 except ImportError:  # pragma: no cover - fallback for lightweight test envs
@@ -231,7 +233,7 @@ class LLMProvider(ABC):
                 raise
             except Exception as exc:
                 response = LLMResponse(
-                    content=f"Error calling LLM: {exc}",
+                    content=describe_provider_error(exc),
                     finish_reason="error",
                 )
 
@@ -264,7 +266,7 @@ class LLMProvider(ABC):
             raise
         except Exception as exc:
             return LLMResponse(
-                content=f"Error calling LLM: {exc}",
+                content=describe_provider_error(exc),
                 finish_reason="error",
             )
 

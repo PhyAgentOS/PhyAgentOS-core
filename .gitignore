@@ -24,5 +24,11 @@ SECURITY.md
 .kilo
 test
 tests/*
+!tests/test_provider_management.py
+!tests/test_reasoning_effort.py
+
+*.codegraph
+uv.lock
+
 plan/
 external/

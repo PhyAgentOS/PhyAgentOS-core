@@ -1,6 +1,8 @@
 """Configuration loading utilities."""
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from PhyAgentOS.config.schema import Config
@@ -22,12 +24,13 @@ def get_config_path() -> Path:
     return Path.home() / ".PhyAgentOS" / "config.json"
 
 
-def load_config(config_path: Path | None = None) -> Config:
+def load_config(config_path: Path | None = None, *, strict: bool = False) -> Config:
     """
     Load configuration from file or create default.
 
     Args:
         config_path: Optional path to config file. Uses default if not provided.
+        strict: Reject invalid JSON instead of falling back when editing settings.
 
     Returns:
         Loaded configuration object.
@@ -39,6 +42,8 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
         except json.JSONDecodeError as e:
+            if strict:
+                raise ValueError("Invalid configuration JSON; existing file was not changed.") from None
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
         else:
@@ -61,8 +66,17 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     data = config.model_dump(by_alias=True)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # Readers and running processes must never see a partially written config.
+    fd, temporary = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _migrate_config(data: dict) -> dict:

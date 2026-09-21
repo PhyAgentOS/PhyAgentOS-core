@@ -73,6 +73,102 @@ Python package `dora-rs` 是 Python node/operator API，不能替代 Dora CLI �
 
 ## 2. 配置模型与 Forge
 
+无需编辑 JSON，即可管理已注册的 Provider：
+
+```bash
+paos provider list                    # 普通表格；加 --json 输出机器可读结果
+paos provider configure               # TTY 中打开行内键盘选择器
+paos provider configure openrouter    # 输入密钥和 endpoint，测试后获取并多选模型
+paos provider show                    # 选择供应商，脱敏查看
+paos provider test                    # 选择供应商，发送最小测试请求
+paos provider use                     # 选择供应商及已保存模型，设为默认
+paos provider use openrouter --model anthropic/claude-sonnet-4
+paos provider login                   # 选择 OAuth 供应商并登录
+paos provider remove                  # 选择供应商并清除存储的配置
+```
+
+除 OAuth login 外，以上管理命令都支持 `--config /path/to/config.json`。
+在 TTY 中，`configure`、`show`、`test`、`use`、`remove`、`login` 省略供应商名称时会
+打开相应选择器。也可直接传名称（不区分大小写）；非交互环境必须显式指定名称。
+向导用上下键选择、Enter 确认；Esc 或 Ctrl+C 取消时不保存。仅当 stdin、stdout 均为 TTY 时
+启动，不进入全屏页面。OAuth 状态只代表本地存在凭据，实际有效性请用 `provider test` 验证。
+`remove` 不撤销共享 OAuth token，也不修改已有进程使用的环境变量。
+`remove` 会持久化清空该供应商的 API Key、API Base、Header、默认模型和模型列表，保留
+供应商字段并标记 `enabled: false`，防止环境变量或共享登录凭据将它自动恢复。
+`list` 和 `configure` 中仍可看到该内置供应商，但状态为未配置；`use`、`test` 的选择器不再列出它。
+移除当前默认供应商时也会清空全局供应商、模型和推理设置，请用 `provider use` 重新选择。
+重新执行 `provider configure` 并成功保存后恢复启用。Ollama 的内置地址仅作为配置建议，
+不会使空配置自动变成已配置。
+
+输入 API Key、API Base 和可选 Header 后，向导会询问是否测试连接并获取模型列表。
+确认后用上下键定位、空格多选要添加的模型，再按 Enter 确认并选择默认模型。
+已添加模型保存在该 Provider 的 `models` 列表中，再次配置时可继续添加。
+获取列表不会发送聊天请求；要验证具体模型能否对话，请执行 `provider test`。
+跳过测试或接口不支持模型列表时，可选择已保存模型或手动输入模型 ID；OAuth 和 Azure
+目前使用此方式，Azure 需填写部署名称。认证或网络失败时不保存本次配置。
+`paos provider use <provider>` 在 TTY 中会展示已保存模型供选择，非交互环境仍可用 `--model`。
+`provider show` 展示已保存模型，长 API Key 显示前后各 4 位，中间隐藏；短密钥全部隐藏。
+
+Docker、CI 和远程服务器应明确指定 Provider、模型，并通过 stdin、环境变量或挂载的
+Secret 文件传入密钥。不提供明文 `--api-key` 参数：
+
+```bash
+paos provider configure openrouter --model anthropic/claude-sonnet-4 \
+  --api-key-stdin < /run/secrets/openrouter_api_key
+paos provider configure openrouter --model anthropic/claude-sonnet-4 \
+  --api-key-env OPENROUTER_API_KEY
+paos provider configure custom --api-base http://localhost:8000/v1 --model gpt-5 \
+  --api-key-file /run/secrets/custom_api_key --headers-file /run/secrets/headers.json
+```
+
+`--headers-file` 读取键和值均为字符串的 JSON 对象。向导隐藏 API Key 和 Header 值，错误信息
+不回显服务端响应正文。启动时也可通过 `PAOS_<PROVIDER>_API_KEY` 提供凭据，例如
+`PAOS_OPENROUTER_API_KEY`；支持对应供应商的标准变量，如 `OPENAI_API_KEY`、
+`ANTHROPIC_API_KEY`。网关别名不会借用 OpenAI 的密钥。
+运行时环境凭据不落盘，只有明确配置该 Provider 时才保存。
+
+启动参数只影响新进程：
+
+```bash
+paos agent --provider openai --model gpt-5 --reasoning-effort high
+paos gateway --provider openrouter --model anthropic/claude-sonnet-4
+```
+
+Agent 内 `/help` 列出全部命令。使用 `/provider [list|<provider>]`、
+`/model [list|<编号>|<model-id>]`、`/effort [list|<档位>|none]` 和 `/status` 查看或切换当前会话。
+终端聊天中直接输入 `/model` 会打开模型选择器，展示所有已配置供应商下保存的模型并标注
+供应商。上下键选择、Enter 确认后立即切换当前会话的供应商和模型，下一条消息使用新选择。
+Esc 或 Ctrl+C 取消选择并返回聊天。`/model list` 只查看列表；非终端渠道保留文字列表与编号选择。
+`/model list` 展示当前 Provider 已保存模型及编号，例如 `/model 2` 选择第 2 个模型。
+旧配置中的默认模型也会保留为选项。列表不代表已经验证聊天可用；不兼容的模型路由、
+思考程度会被拒绝，保留原选择。`none` 表示移除显式思考程度，采用模型默认行为。
+Custom endpoint 或 Azure 部署别名的能力未知时应使用 `none`；显式指定思考程度需要可识别的
+推理模型名称。
+
+终端聊天输入 `/effort` 显示行内列表：上下键移动、Enter 确认、Esc / Ctrl+C 取消。
+`/effort list` 查看当前模型可选档位。菜单和启动校验使用同一套供应商及模型能力判断，
+从 `minimal / low / medium / high / xhigh / max` 中仅展示支持的档位。
+额外档位需要本地目录明确支持且适配器可映射；网关可选档位可能与原厂接口不同。
+支持 `max` 的自适应 Claude 使用 `output_config.effort`，传统 Claude 使用思考预算。
+`none` 始终表示模型默认行为，不代表关闭思考。详见[推理强度](reasoning-effort.md)。
+
+优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
+开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
+子 Agent、Forge 任务、verification、evolution、记忆整理、Cron 和 Heartbeat 继续使用启动配置。
+切换不会重启或停止进程，也不会改写全局默认值。`/provider reset` 清除会话覆盖；`/new` 只清理
+会话上下文，保留当前选择。会话覆盖在进程退出后失效。永久默认值请通过 `paos provider use`
+设置，只影响未来启动的进程。
+
+使用现有 Docker CLI service：
+
+```bash
+docker compose run --rm -T phyagentos-cli provider configure openrouter \
+  --model anthropic/claude-sonnet-4 --api-key-stdin < /path/to/secret
+docker compose run --rm -T phyagentos-cli provider use openrouter
+docker compose up -d phyagentos-gateway
+docker compose run --rm phyagentos-cli agent --provider openai --model gpt-5 --reasoning-effort high
+```
+
 先配置一个模型 Provider 和 Forge timeout/evidence policy。Runtime 不是配置开关，而由显式
 启动的 Skill profile 决定。配置以 camelCase 保存，也接受 snake_case。
 
