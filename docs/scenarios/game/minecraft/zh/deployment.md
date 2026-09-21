@@ -135,7 +135,7 @@ $env:MC_HOST="localhost"
 $env:MC_PORT="25565"
 $env:BOT_NAME="paos"
 $env:MC_VERSION="1.20.4"
-$env:API_PORT="3001"
+$env:BRIDGE_PORT="3001"
 $env:VIEWER_PORT="3007"
 node bridge_server.js
 ```
@@ -242,7 +242,7 @@ t.close()
 
 ---
 
-## 四、动作空间（16 种）
+## 四、动作空间（17 种）
 
 所有动作通过 `POST /action` 发给 bridge，bridge 用 mineflayer API 执行。
 
@@ -310,6 +310,9 @@ t.step({"type": "craft",   "params": {"recipe_id": "crafting_table", "count": 1}
 
 # 装备物品
 t.step({"type": "equip",   "params": {"item": "stone_pickaxe", "destination": "hand"}})
+
+# 使用附近熔炉烧炼
+t.step({"type": "smelt",   "params": {"input": "raw_iron", "fuel": "coal", "count": 1}})
 ```
 
 ---

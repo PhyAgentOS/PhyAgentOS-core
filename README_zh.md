@@ -121,6 +121,17 @@
 
 ---
 
+### 独立游戏 Agent
+
+[game_agents 目录](PhyAgentOS/game_agents/README.md) 中分开放置两套实现：
+
+| 模块 | 入口 | 用途 |
+|:-----|:-----|:-----|
+| [星露谷](PhyAgentOS/game_agents/stardew/README.md) | `paos general-game` | 使用 Core Target 执行有限轮次的 Planner–Actor 会话，以观察验证任务完成。 |
+| [Minecraft](PhyAgentOS/game_agents/minecraft/README.md) | `paos minecraft warmup` / `benchmark` | 固定预热、证据驱动的 Skill Graph 和逐回合同步评测沉淀。 |
+
+两者分别保留原有执行流程和记忆规则，复用各自需要的 Core 接口。
+
 ## 🚀 5 分钟快速开始
 
 <table>
@@ -289,6 +300,8 @@ PhyAgentOS-G/
 | [Minecraft 使用指南](docs/scenarios/game/minecraft/1_hello.md) | 使用者 | CLI 控制、动作空间、踩坑记录 |
 | [Minecraft Agent 闭环](docs/scenarios/game/minecraft/2_agent_loop.md) | 开发者 | Agent→Watchdog 完整执行链路 |
 | [Minecraft 自进化](docs/scenarios/game/minecraft/3_self_evo.md) | 开发者 | 三层分层记忆 + 9 步反思闭环 |
+| [Minecraft Benchmark 与 Skill Graph](docs/scenarios/game/minecraft/4_benchmark.md) | 开发者 | warmup、同步 skill 沉淀、CLI/Python API 与结果格式 |
+| [Minecraft Linux 本机部署](docs/scenarios/game/minecraft/01_linux_start.md) | 使用者 | Paper、bridge、PhyAgentOS 本机启动与验收命令 |
 
 ---
 

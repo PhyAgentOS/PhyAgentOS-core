@@ -168,9 +168,8 @@ class StardewValleyTarget(BaseGameTarget):
     def reset(self, session_ctx: dict[str, Any]) -> dict[str, Any]:
         if not self._built:
             raise TargetResetError("target not built")
-        self._step_idx = 0
         time.sleep(self._step_delay)
-        return self.observe()
+        return super().reset(session_ctx)
 
     def observe(self) -> dict[str, Any]:
         client = self._get_http()
@@ -239,6 +238,7 @@ class StardewValleyTarget(BaseGameTarget):
             px_f, py_f = 0.0, 0.0
 
         return {
+            **obs,
             "image": None,
             "state": [px_f, py_f, health, energy, money],
             "inventory": obs.get("inventory", []),
@@ -273,6 +273,8 @@ class StardewValleyTarget(BaseGameTarget):
             raise TargetStepError(f"action must be str or dict, got {type(action).__name__}")
 
         result = self._post_action(action_str)
+        if result.get("fatal") is True:
+            raise TargetStepError("game bridge stopped after an uncertain execution")
         time.sleep(self._step_delay)
         self._step_idx += 1
 

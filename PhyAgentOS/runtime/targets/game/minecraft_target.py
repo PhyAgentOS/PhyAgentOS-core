@@ -18,6 +18,7 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 FALLBACK_ACTION_TYPES = frozenset({
     "move", "look", "jump", "sneak", "sprint", "attack",
     "interact", "place", "dig", "use", "select_slot", "drop",
-    "chat", "collect", "equip", "craft",
+    "chat", "collect", "equip", "craft", "smelt",
 })
 
 
@@ -81,7 +82,15 @@ class MinecraftTarget(BaseGameTarget):
             # Default timeout covers state/health polling; actions override this
             http_timeout = float(self.config.get("http_timeout", 15.0))
             headers = {"ngrok-skip-browser-warning": "true"}
-            self._http = httpx.Client(timeout=http_timeout, verify=verify, headers=headers)
+            host = urlparse(self._bridge_url).hostname
+            local_bridge = host in {"127.0.0.1", "localhost", "::1"}
+            trust_env = bool(self.config.get("trust_env", not local_bridge))
+            self._http = httpx.Client(
+                timeout=http_timeout,
+                verify=verify,
+                headers=headers,
+                trust_env=trust_env,
+            )
         return self._http
 
     def build(self) -> None:
@@ -98,7 +107,7 @@ class MinecraftTarget(BaseGameTarget):
         except Exception as exc:
             raise TargetConnectionError(
                 f"Cannot reach mineflayer bridge at {bridge_url}: {exc}. "
-                "Ensure the bridge is running on Windows and ngrok is active."
+                "Ensure the bridge and Minecraft server are running."
             ) from exc
 
         if not data.get("bot_spawned"):
@@ -119,9 +128,8 @@ class MinecraftTarget(BaseGameTarget):
     def reset(self, session_ctx: dict[str, Any]) -> dict[str, Any]:
         if not self._built:
             raise TargetResetError("target not built")
-        self._step_idx = 0
         time.sleep(self._step_delay)
-        return self.observe()
+        return super().reset(session_ctx)
 
     def observe(self) -> dict[str, Any]:
         client = self._get_http()
@@ -160,6 +168,7 @@ class MinecraftTarget(BaseGameTarget):
             "nearby_entities": data.get("nearby_entities", []),
             "players": data.get("players", []),
             "inventory": data.get("inventory", {}),
+            "inventory_items": data.get("inventory_items", []),
             "last_chats": data.get("last_chats", []),
             "info": {
                 "position": {"x": float(self._position[0]), "y": float(self._position[1]), "z": float(self._position[2])},
@@ -170,6 +179,7 @@ class MinecraftTarget(BaseGameTarget):
                 "hunger": self._hunger,
                 "world": data.get("world", {}),
                 "player_list": data.get("player_list", []),
+                "inventory_items": data.get("inventory_items", []),
             },
         }
 
@@ -185,6 +195,7 @@ class MinecraftTarget(BaseGameTarget):
             "nearby_blocks": [],
             "nearby_entities": [],
             "inventory": {},
+            "inventory_items": [],
             "last_chats": [],
             "info": {
                 "position": {"x": float(self._position[0]), "y": float(self._position[1]), "z": float(self._position[2])},

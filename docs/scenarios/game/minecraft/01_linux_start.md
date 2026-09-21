@@ -30,7 +30,7 @@
 
 | 组件 | 说明 |
 |------|------|
-| Java 17+ | 启动 Paper 服务端 |
+| Java 17 或 21（GA 构建） | 启动 Paper 1.20.4；版本字符串不要带 `-internal` |
 | Node.js 22+ | 启动 mineflayer bridge |
 | Python 3.11+ | 运行 PhyAgentOS |
 | Minecraft 服务端 | 推荐 `Paper 1.20.4` |
@@ -144,10 +144,12 @@ java -jar paper.jar nogui
 grep '^online-mode=' server.properties
 ```
 
-将 `server.properties` 中这一项设置为：
+将 `server.properties` 中这些项设置为：
 
 ```text
 online-mode=false
+enforce-secure-profile=false
+spawn-protection=0
 ```
 
 说明：
@@ -211,11 +213,11 @@ cp /path/to/PhyAgentOS/docs/scenarios/game/minecraft/bridge_server.js .
 }
 ```
 
-安装依赖：
+仓库已经提交 `package-lock.json`，安装依赖时使用锁文件：
 
 ```bash
 cd /home/sicko/mc_bridge
-npm install mineflayer mineflayer-pathfinder mineflayer-collectblock prismarine-viewer express canvas
+npm ci
 ```
 
 如果你只想先确认依赖是否完整，可以单独安装 `canvas` 看是否成功：
@@ -252,6 +254,15 @@ node bridge_server.js
 [bridge] Bot spawned: paos (MC 1.20.4)
 [bridge] 3D viewer (first-person) on http://localhost:3007
 ```
+
+bot 首次加入后，在 Paper 服务端控制台执行：
+
+```text
+op paos
+```
+
+普通动作不一定需要管理员权限，但 benchmark reset 会执行 `/tp`、`/fill`、
+`/give`、`/clear` 和 `/setblock`，缺少 OP 权限时无法可靠初始化 arena。
 
 说明：
 - `3001` 是 HTTP bridge API
@@ -467,3 +478,37 @@ Package 'pangocairo' not found
 4. 用 `POST /action` 做最小动作验证
 5. 打开 `http://localhost:3007` 观察 viewer
 6. 最后再接 `paos minecraft say`
+
+---
+
+## 十二、Skill Graph 预热与 benchmark
+
+这两个入口不需要 LLM provider，默认使用确定性的 Mineflayer baseline：
+
+```bash
+paos minecraft warmup \
+  --url http://127.0.0.1:3001 \
+  --output-dir outputs/minecraft-skill-graph
+
+paos minecraft benchmark \
+  --url http://127.0.0.1:3001 \
+  --graph-dir outputs/minecraft-skill-graph/benchmark_graph \
+  --output-dir outputs/minecraft-benchmark \
+  --tasks wooden.obtain_oak_log \
+  --run-id smoke-001
+```
+
+预热固定执行 W01-W07，每项一次独立 reset/trial。单次无混杂观测即可把对应的
+成功或失败 claim 标记为 `verified`，不会做第二次 seed 验证。完成后生成只读的
+`warmup_frozen/` 和从它派生的 `benchmark_graph/`。benchmark 每个 episode
+结束后同步更新后者，不生成探索任务；Mineflayer 不支持世界 seed 控制，这一点会
+写入所有 manifest 和结果。
+
+完整参数、Python API 和产物结构见 [4_benchmark.md](4_benchmark.md)。可用下面
+三条命令随时查看当前安装版本的帮助：
+
+```bash
+paos minecraft --help
+paos minecraft warmup --help
+paos minecraft benchmark --help
+```

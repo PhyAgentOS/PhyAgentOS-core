@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "case_order": ["W01", "W02", "W03", "W04", "W05", "W06", "W07"],
+  "trials": ["trial-01"],
+  "backend_seed_control": false,
+  "tasks": [
+    {
+      "id": "W01",
+      "tier": "Warmup",
+      "family": "dig_pickup",
+      "title": "Collect birch log",
+      "target_item": "birch_log",
+      "success_criterion": {"type": "inventory_contains", "item": "birch_log", "count": 1},
+      "setup": {"clear_inventory": true, "inventory": [{"item": "wooden_axe", "count": 1}], "blocks": [{"block": "birch_log", "relative": [2, 0, 0]}]}
+    },
+    {
+      "id": "W02",
+      "tier": "Warmup",
+      "family": "crafting_inventory",
+      "title": "Craft birch planks",
+      "target_item": "birch_planks",
+      "success_criterion": {"type": "inventory_contains", "item": "birch_planks", "count": 1},
+      "setup": {"clear_inventory": true, "inventory": [{"item": "birch_log", "count": 1}]}
+    },
+    {
+      "id": "W03",
+      "tier": "Warmup",
+      "family": "crafting_inventory",
+      "title": "Craft birch button",
+      "target_item": "birch_button",
+      "success_criterion": {"type": "inventory_contains", "item": "birch_button", "count": 1},
+      "setup": {"clear_inventory": true, "inventory": [{"item": "birch_planks", "count": 1}]}
+    },
+    {
+      "id": "W04",
+      "tier": "Warmup",
+      "family": "crafting_table",
+      "title": "Craft bowl",
+      "target_item": "bowl",
+      "success_criterion": {"type": "inventory_contains", "item": "bowl", "count": 1},
+      "setup": {"clear_inventory": true, "inventory": [{"item": "oak_planks", "count": 3}, {"item": "crafting_table", "count": 1}]}
+    },
+    {
+      "id": "W05",
+      "tier": "Warmup",
+      "family": "crafting_table",
+      "title": "Craft wooden hoe",
+      "target_item": "wooden_hoe",
+      "success_criterion": {"type": "inventory_contains", "item": "wooden_hoe", "count": 1},
+      "setup": {"clear_inventory": true, "inventory": [{"item": "oak_planks", "count": 2}, {"item": "stick", "count": 2}, {"item": "crafting_table", "count": 1}]}
+    },
+    {
+      "id": "W06",
+      "tier": "Warmup",
+      "family": "smelting",
+      "title": "Bake potato",
+      "target_item": "baked_potato",
+      "success_criterion": {"type": "inventory_contains", "item": "baked_potato", "count": 1},
+      "setup": {"clear_inventory": true, "inventory": [{"item": "potato", "count": 1}, {"item": "coal", "count": 1}, {"item": "furnace", "count": 1}]}
+    },
+    {
+      "id": "W07",
+      "tier": "Warmup",
+      "family": "crafting_table",
+      "title": "Craft iron hoe",
+      "target_item": "iron_hoe",
+      "success_criterion": {"type": "inventory_contains", "item": "iron_hoe", "count": 1},
+      "setup": {"clear_inventory": true, "inventory": [{"item": "iron_ingot", "count": 2}, {"item": "stick", "count": 2}, {"item": "crafting_table", "count": 1}]}
+    }
+  ]
+}

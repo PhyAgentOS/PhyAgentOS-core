@@ -70,6 +70,23 @@ def run_task(
     """
 
     task = load_task(task_id, manifest_path)
+    return run_task_spec(task, agent_fn, world_adapter)
+
+
+def run_task_spec(
+    task: TechTreeTask,
+    agent_fn: AgentFn,
+    world_adapter: WorldAdapter,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> BenchmarkResult:
+    """Run an already loaded task.
+
+    ``run_task`` remains the stable manifest-backed API.  This companion is
+    used by the fixed warm-up curriculum, whose targets deliberately do not
+    appear in the benchmark manifest.
+    """
+
     started = _utc_now()
     initial_observation: Mapping[str, Any] | None = None
     final_observation: Mapping[str, Any] | None = None
@@ -108,7 +125,12 @@ def run_task(
         final_observation=final_observation,
         agent_result=agent_result,
         error=error,
-        metadata={"benchmark": "minecraft_techtree", "tier": task.tier, "family": task.family},
+        metadata={
+            "benchmark": "minecraft_techtree",
+            "tier": task.tier,
+            "family": task.family,
+            **dict(metadata or {}),
+        },
     )
 
 

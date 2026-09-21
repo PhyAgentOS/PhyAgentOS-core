@@ -29,6 +29,7 @@ class BaseGameTarget(BaseLocalTarget):
         return {"configured": True, "session_id": session_ctx.get("session_id")}
 
     def start_session(self, session_ctx: dict[str, Any]) -> dict[str, Any]:
+        self._last_status = {}
         self.reset_step_counter()
         obs = self.observe()
         return obs
@@ -46,6 +47,7 @@ class BaseGameTarget(BaseLocalTarget):
             if last.get("done"):
                 break
         self._last_status = {
+            **last,
             "executed_steps": getattr(self, "_step_idx", 0),
             "success": bool(last.get("info", {}).get("success")),
             "done": bool(last.get("done")),
@@ -56,5 +58,6 @@ class BaseGameTarget(BaseLocalTarget):
         return getattr(self, "_last_status", {"status": "idle"})
 
     def reset(self, session_ctx: dict[str, Any]) -> dict[str, Any]:
+        self._last_status = {}
         self.reset_step_counter()
         return self.observe()

@@ -121,6 +121,17 @@ By moving embodied intelligence learning and validation into game environments, 
 
 ---
 
+### Independent game-agent workflows
+
+The [game_agents directory](PhyAgentOS/game_agents/README.md) contains separate implementations:
+
+| Module | Entry | Purpose |
+|:-------|:------|:--------|
+| [Stardew](PhyAgentOS/game_agents/stardew/README.md) | `paos general-game` | Bounded Planner–Actor sessions using Core targets and observed completion checks. |
+| [Minecraft](PhyAgentOS/game_agents/minecraft/README.md) | `paos minecraft warmup` / `benchmark` | Fixed warm-up, evidence-backed Skill Graph and synchronous benchmark accumulation. |
+
+Each workflow retains its own execution and memory policy and reuses the relevant Core interfaces.
+
 ## 🚀 5-Minute Quick Start
 
 <table>
@@ -289,6 +300,8 @@ PhyAgentOS-G/
 | [Minecraft Usage Guide](docs/scenarios/game/minecraft/1_hello.md) | Users | CLI control, action space, troubleshooting |
 | [Minecraft Agent Loop](docs/scenarios/game/minecraft/2_agent_loop.md) | Developers | Agent→Watchdog execution pipeline |
 | [Minecraft Self-Evolution](docs/scenarios/game/minecraft/3_self_evo.md) | Developers | 3-tier hierarchical memory + 9-step reflection loop |
+| [Minecraft Benchmark and Skill Graph](docs/scenarios/game/minecraft/4_benchmark.md) | Developers | Warm-up, synchronous skill accumulation, CLI/Python API, and result layout |
+| [Minecraft Local Linux Setup](docs/scenarios/game/minecraft/01_linux_start.md) | Users | Local Paper, bridge, PhyAgentOS startup, and smoke-test commands |
 
 ---
 

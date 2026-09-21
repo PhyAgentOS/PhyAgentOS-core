@@ -6,7 +6,11 @@ from PhyAgentOS.benchmarks.minecraft.techtree.evaluator import (
     inventory_count,
     inventory_counts,
 )
-from PhyAgentOS.benchmarks.minecraft.techtree.harness import BenchmarkResult, run_task
+from PhyAgentOS.benchmarks.minecraft.techtree.harness import (
+    BenchmarkResult,
+    run_task,
+    run_task_spec,
+)
 from PhyAgentOS.benchmarks.minecraft.techtree.loader import list_tasks, load_manifest, load_task
 from PhyAgentOS.benchmarks.minecraft.techtree.schema import (
     DEFAULT_ARENA_BOUNDARY_BLOCK,
@@ -41,4 +45,5 @@ __all__ = [
     "load_manifest",
     "load_task",
     "run_task",
+    "run_task_spec",
 ]

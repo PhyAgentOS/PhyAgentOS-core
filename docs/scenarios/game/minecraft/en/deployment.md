@@ -242,7 +242,7 @@ t.close()
 
 ---
 
-## 4. Action Space (16 types)
+## 4. Action Space (17 types)
 
 All actions sent to bridge via `POST /action`; bridge executes via mineflayer API.
 
@@ -310,6 +310,9 @@ t.step({"type": "craft",   "params": {"recipe_id": "crafting_table", "count": 1}
 
 # Equip item
 t.step({"type": "equip",   "params": {"item": "stone_pickaxe", "destination": "hand"}})
+
+# Smelt with a nearby furnace
+t.step({"type": "smelt",   "params": {"input": "raw_iron", "fuel": "coal", "count": 1}})
 ```
 
 ---

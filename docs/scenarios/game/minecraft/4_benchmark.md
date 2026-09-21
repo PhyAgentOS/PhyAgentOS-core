@@ -19,6 +19,90 @@
 
 ---
 
+## CLI：预热、运行和保存结果
+
+本机 Paper 与 bridge 的完整启动命令见 [01_linux_start.md](01_linux_start.md)。
+bridge 启动并在 Paper 控制台执行 `op paos` 后，下面两个命令均不需要 LLM
+provider。
+
+先运行固定预热：
+
+```bash
+paos minecraft warmup \
+  --url http://127.0.0.1:3001 \
+  --output-dir outputs/minecraft-skill-graph
+```
+
+预热按 W01–W07 顺序各执行一次独立 reset。单次无混杂观测即可将成功或失败
+claim 标记为 `verified`，不执行第二次 seed 验证、curriculum 或探索任务。
+Mineflayer 不支持 seed 控制，manifest 会明确记录
+`backend_seed_control=false`。
+
+运行指定 benchmark：
+
+```bash
+paos minecraft benchmark \
+  --url http://127.0.0.1:3001 \
+  --graph-dir outputs/minecraft-skill-graph/benchmark_graph \
+  --output-dir outputs/minecraft-benchmark \
+  --tasks wooden.obtain_oak_log,stone.obtain_cobblestone \
+  --trials 1 \
+  --run-id smoke-001
+```
+
+运行全部 40 个任务时用 `--all` 代替 `--tasks`：
+
+```bash
+paos minecraft benchmark \
+  --url http://127.0.0.1:3001 \
+  --graph-dir outputs/minecraft-skill-graph/benchmark_graph \
+  --output-dir outputs/minecraft-benchmark \
+  --all \
+  --trials 1 \
+  --run-id full-001
+```
+
+参数说明：
+
+| 命令 | 参数 | 说明 |
+|---|---|---|
+| `warmup` | `--output-dir/-o` | 必填；必须是尚未产生图谱的输出根目录 |
+| `warmup` | `--url/-u` | bridge URL，默认 `http://127.0.0.1:3001` |
+| `benchmark` | `--graph-dir` | 必填；预热生成的 `benchmark_graph/` |
+| `benchmark` | `--output-dir/-o` | 必填；episode 结果根目录 |
+| `benchmark` | `--tasks` | 逗号分隔 task id；默认 `wooden.obtain_oak_log` |
+| `benchmark` | `--all` | 忽略 `--tasks`，执行 manifest 中全部任务 |
+| `benchmark` | `--trials` | 每个任务运行次数，默认 1 |
+| `benchmark` | `--run-id` | 批次 ID；省略时自动生成，设置后便于复现 |
+| `benchmark` | `--url/-u` | bridge URL，默认 `http://127.0.0.1:3001` |
+
+查看安装版本的准确帮助：
+
+```bash
+paos minecraft --help
+paos minecraft warmup --help
+paos minecraft benchmark --help
+```
+
+产物结构：
+
+```text
+outputs/minecraft-skill-graph/
+├── warmup_frozen/        # 只读冻结图谱，后续 benchmark 不修改
+└── benchmark_graph/      # 从冻结图谱复制出的同步沉淀图谱
+
+outputs/minecraft-benchmark/
+└── <run-id>/
+    ├── summary.json
+    └── <task-id>/trial-01.json
+```
+
+每个 benchmark episode 结束后，会先把 evidence/claim 写入 SQLite，再原子刷新
+`serving_graph.json`、`evidence.jsonl`、`graph_manifest.json` 和
+`graph.sha256`，然后才开始下一个 episode。
+
+---
+
 ## 这个 Benchmark 测什么
 
 Tech-Tree benchmark 衡量 agent 能否沿着一条进阶路径获取标准 Minecraft 物品：
@@ -103,6 +187,27 @@ def agent_fn(task, world):
 
 result = run_task("wooden.obtain_oak_log", agent_fn, world_adapter)
 print(result.success, result.reward)
+```
+
+Skill Graph 的 Python API：
+
+```python
+from PhyAgentOS.game_agents.minecraft import (
+    build_scripted_agent,
+    run_benchmark_tasks,
+    run_warmup,
+)
+
+warmup = run_warmup(world_adapter, "outputs/minecraft-skill-graph")
+results = run_benchmark_tasks(
+    ["wooden.obtain_oak_log"],
+    build_scripted_agent,
+    world_adapter,
+    graph_dir=warmup["mutable_dir"],
+    results_dir="outputs/minecraft-benchmark",
+    trials=1,
+    run_id="smoke-001",
+)
 ```
 
 world adapter 的接口被刻意保持得很小：

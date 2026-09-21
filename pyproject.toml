@@ -88,6 +88,8 @@ packages = ["PhyAgentOS"]
 [tool.hatch.build]
 include = [
     "PhyAgentOS/**/*.py",
+    "PhyAgentOS/game_agents/**/*.json",
+    "PhyAgentOS/game_agents/**/*.md",
     "PhyAgentOS/benchmarks/**/*.json",
     "PhyAgentOS/benchmarks/**/*.md",
     "PhyAgentOS/templates/**/*.md",

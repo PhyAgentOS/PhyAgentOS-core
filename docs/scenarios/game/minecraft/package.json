@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "canvas": "^3.2.3",
     "express": "^5.2.1",
     "mineflayer": "^4.37.1",
     "mineflayer-collectblock": "^1.6.0",

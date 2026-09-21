@@ -4,7 +4,7 @@
  * Usage:
  *   node bridge_server.js
  *
- * Env vars: MC_HOST, MC_PORT, BOT_NAME, MC_VERSION, API_PORT, VIEWER_PORT
+ * Env vars: MC_HOST, MC_PORT, BOT_NAME, MC_VERSION, BRIDGE_PORT, VIEWER_PORT
  *
  * Endpoints:
  *   GET  /health           → bot status
@@ -34,6 +34,11 @@ const BOT_NAME = process.env.BOT_NAME || 'paos';
 const API_PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
 const VIEWER_PORT = parseInt(process.env.VIEWER_PORT || '3007', 10);
 const STATE_RADIUS = parseInt(process.env.STATE_RADIUS || '5', 10);
+const ACTION_TYPES = [
+    'move', 'look', 'jump', 'sneak', 'sprint', 'attack', 'interact',
+    'place', 'dig', 'use', 'select_slot', 'drop', 'chat', 'collect',
+    'equip', 'craft', 'smelt'
+];
 
 let bot = null, botSpawned = false, spawnTime = 0;
 let viewerStarted = false; // prismarine-viewer binds a port once; spawn fires again on respawn
@@ -427,6 +432,39 @@ function executeAction(action) {
                     })();
                     break;
                 }
+                case 'smelt': {
+                    const input = bot.inventory.items().find(i => i.name === p.input);
+                    const fuel = bot.inventory.items().find(i => i.name === (p.fuel || 'coal'));
+                    const furnaceBlock = bot.findBlock({
+                        matching: require('minecraft-data')(bot.version).blocksByName.furnace.id,
+                        maxDistance: parseInt(p.max_distance || 8, 10)
+                    });
+                    if (!input) return resolve({ ok: false, result: `no ${p.input}` });
+                    if (!fuel) return resolve({ ok: false, result: `no ${p.fuel || 'coal'}` });
+                    if (!furnaceBlock) return resolve({ ok: false, result: 'no nearby furnace' });
+                    (async () => {
+                        let furnace = null;
+                        try {
+                            const count = Math.max(1, parseInt(p.count || 1, 10));
+                            furnace = await bot.openFurnace(furnaceBlock);
+                            await furnace.putInput(input.type, null, count);
+                            await furnace.putFuel(fuel.type, null, 1);
+                            const deadline = Date.now() + Math.max(15000, parseInt(p.timeout_ms || 30000, 10));
+                            while ((!furnace.outputItem() || furnace.outputItem().count < count) && Date.now() < deadline) {
+                                await new Promise(r => setTimeout(r, 500));
+                            }
+                            const output = furnace.outputItem();
+                            if (!output || output.count < count) throw new Error('smelt timeout');
+                            const taken = await furnace.takeOutput();
+                            resolve({ ok: true, result: `smelted ${taken.count}x ${taken.name}` });
+                        } catch (e) {
+                            resolve({ ok: false, result: e?.message || String(e) });
+                        } finally {
+                            try { furnace?.close(); } catch (_) {}
+                        }
+                    })();
+                    break;
+                }
                 default: resolve({ ok: false, result: `unknown type: ${t}` });
             }
         } catch (e) { resolve({ ok: false, result: e.message }); }
@@ -499,6 +537,9 @@ async function benchmarkReset(setup) {
         const R = Math.max(1, parseInt(arena.clear_radius, 10));
         const H = Math.max(1, parseInt(arena.clear_height, 10));
         const fy = y - 1;
+        // Keep the bot alive while a possibly hostile destination chunk is
+        // loaded and replaced by the isolated arena.
+        seq.push('/gamemode creative @s');
         seq.push(`/tp @s ${x} ${y} ${z} 0 0`);
         seq.push(`/fill ${x - R} ${y} ${z - R} ${x + R} ${y + H} ${z + R} air`);
         seq.push(`/fill ${x - R} ${fy} ${z - R} ${x + R} ${fy} ${z + R} ${mcName(arena.floor_block)}`);
@@ -507,6 +548,10 @@ async function benchmarkReset(setup) {
         seq.push(`/fill ${x - R} ${fy} ${z + R} ${x + R} ${fy} ${z + R} ${b}`);
         seq.push(`/fill ${x - R} ${fy} ${z - R} ${x - R} ${fy} ${z + R} ${b}`);
         seq.push(`/fill ${x + R} ${fy} ${z - R} ${x + R} ${fy} ${z + R} ${b}`);
+        // The first teleport loads the destination chunks; return to the
+        // origin after the floor exists so client-side physics cannot leave
+        // the bot below the arena during setup.
+        seq.push(`/tp @s ${x} ${y} ${z} 0 0`);
     }
     if (setup.clear_inventory !== false) seq.push('/clear @s');
     for (const it of (setup.inventory || [])) seq.push(giveCmd(it));
@@ -514,6 +559,9 @@ async function benchmarkReset(setup) {
         const rel = blk.relative || [0, 0, 0];
         seq.push(`/setblock ${x + parseInt(rel[0], 10)} ${y + parseInt(rel[1], 10)} ${z + parseInt(rel[2], 10)} ${mcName(blk.block)}`);
     }
+    seq.push('/gamemode survival @s');
+    seq.push('/effect give @s minecraft:instant_health 1 10 true');
+    seq.push('/effect give @s minecraft:saturation 1 10 true');
 
     currentPhase = 'reset';
     phaseCounters = { resets: phaseCounters.resets + 1, steps: 0 };
@@ -523,7 +571,7 @@ async function benchmarkReset(setup) {
 }
 
 // ── HTTP ────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true, bot_spawned: botSpawned, uptime_seconds: botSpawned ? Math.floor((Date.now() - spawnTime) / 1000) : 0 }));
+app.get('/health', (_req, res) => res.json({ ok: true, bot_spawned: botSpawned, actions: ACTION_TYPES, uptime_seconds: botSpawned ? Math.floor((Date.now() - spawnTime) / 1000) : 0 }));
 app.get('/state', (_req, res) => res.json(getState()));
 app.post('/action', async (req, res) => {
     if (!req.body?.type) return res.status(400).json({ ok: false, error: 'missing type' });

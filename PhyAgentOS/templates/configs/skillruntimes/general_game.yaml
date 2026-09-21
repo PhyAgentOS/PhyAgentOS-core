@@ -1,0 +1,10 @@
+id: general_game
+runtime: GeneralGameSkillRuntime
+runtime_kind: builtin
+loop_mode: builtin_loop
+agent_exposure: none
+supported_target_kinds: [game]
+observation_contract:
+  observation_type: structured
+supports_chunk: false
+default_replan_every: 1

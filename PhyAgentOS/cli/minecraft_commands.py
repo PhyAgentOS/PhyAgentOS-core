@@ -47,6 +47,7 @@ _MC_SYSTEM_PROMPT = (
     "place: {x,y,z,face} 面编号0=下1=上2=北3=南4=西5=东\n"
     "collect: {block_type,count} 自动寻找并采集\n"
     "craft: {recipe_id,count} 合成（需附近有工作台）\n"
+    "smelt: {input,fuel,count} 使用附近熔炉烧炼\n"
     "select_slot: {slot:0-8} 切换快捷键\n"
     "equip: {item,destination:\"hand\"|\"torso\"|...} 装备指定物品（如 {\"item\":\"wooden_shovel\"}）\n"
     "drop: {slot} 丢弃物品\n"
@@ -434,3 +435,75 @@ def minecraft_tp(
     target.step({"type": "move", "params": {"dx": x, "dy": y, "dz": z, "absolute": True}})
     console.print(f"[green]✓[/green] bot 已传送到 ({x}, {y}, {z})")
     target.close()
+
+
+@minecraft_app.command("warmup")
+def minecraft_warmup(
+    output_dir: str = typer.Option(..., "--output-dir", "-o", help="Skill Graph 输出根目录"),
+    bridge_url: str = typer.Option("http://127.0.0.1:3001", "--url", "-u"),
+):
+    """固定运行 W01-W07，每个任务一个 trial，并保存冻结图谱和 benchmark 可写副本。"""
+    from PhyAgentOS.game_agents.minecraft import run_warmup
+    from PhyAgentOS.runtime.benchmark.minecraft_glue import MinecraftTargetWorldAdapter
+    from PhyAgentOS.runtime.targets.game.minecraft_target import MinecraftTarget
+
+    target = MinecraftTarget({"bridge_url": bridge_url, "verify_ssl": False})
+    try:
+        target.build()
+        result = run_warmup(MinecraftTargetWorldAdapter(target), output_dir)
+    except Exception as exc:
+        console.print(f"[red]预热失败: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    finally:
+        target.close()
+    console.print_json(data=result)
+
+
+@minecraft_app.command("benchmark")
+def minecraft_benchmark(
+    output_dir: str = typer.Option(..., "--output-dir", "-o", help="episode 结果目录"),
+    graph_dir: str = typer.Option(..., "--graph-dir", help="预热产生的 benchmark_graph 目录"),
+    tasks: str = typer.Option("wooden.obtain_oak_log", "--tasks", help="逗号分隔 task id"),
+    all_tasks: bool = typer.Option(False, "--all", help="运行 manifest 中全部任务"),
+    trials: int = typer.Option(1, "--trials", min=1),
+    run_id: str | None = typer.Option(None, "--run-id", help="可复现的批次 ID；默认自动生成"),
+    bridge_url: str = typer.Option("http://127.0.0.1:3001", "--url", "-u"),
+):
+    """串行执行 benchmark，并在每个 episode 后同步沉淀 Skill Graph。"""
+    from PhyAgentOS.game_agents.minecraft import (
+        build_scripted_agent,
+        run_benchmark_tasks,
+    )
+    from PhyAgentOS.benchmarks.minecraft.techtree import list_tasks
+    from PhyAgentOS.runtime.benchmark.minecraft_glue import MinecraftTargetWorldAdapter
+    from PhyAgentOS.runtime.targets.game.minecraft_target import MinecraftTarget
+
+    task_ids = (
+        [task.id for task in list_tasks()]
+        if all_tasks
+        else [task.strip() for task in tasks.split(",") if task.strip()]
+    )
+    if not task_ids:
+        raise typer.BadParameter("--tasks must contain at least one task id")
+    target = MinecraftTarget({"bridge_url": bridge_url, "verify_ssl": False})
+    try:
+        target.build()
+        results = run_benchmark_tasks(
+            task_ids,
+            build_scripted_agent,
+            MinecraftTargetWorldAdapter(target),
+            graph_dir=graph_dir,
+            results_dir=output_dir,
+            trials=trials,
+            run_id=run_id,
+        )
+    except Exception as exc:
+        console.print(f"[red]benchmark 失败: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    finally:
+        target.close()
+    passed = sum(result.success for result in results)
+    actual_run_id = results[0].metadata.get("run_id") if results else run_id
+    console.print(
+        f"[green]完成[/green]: {passed}/{len(results)} episodes passed (run_id={actual_run_id})"
+    )

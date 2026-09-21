@@ -1000,6 +1000,10 @@ from PhyAgentOS.cli.stardew_commands import stardew_app
 
 app.add_typer(stardew_app, name="stardew")
 
+from PhyAgentOS.cli.general_game_commands import run_general_game
+
+app.command("general-game")(run_general_game)
+
 
 if __name__ == "__main__":
     app()
