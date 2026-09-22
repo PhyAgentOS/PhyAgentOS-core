@@ -308,6 +308,14 @@ def _make_provider(
             api_base=api_base() or "http://localhost:8000/v1",
             default_model=model,
         )
+    # OpenAI Responses: direct /v1/responses, function tools + reasoning effort together
+    elif provider_name == "openai_responses":
+        from PhyAgentOS.providers.openai_responses_provider import OpenAIResponsesProvider
+        provider = OpenAIResponsesProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=api_base() or "http://localhost:8000/v1",
+            default_model=model,
+        )
     # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
     elif provider_name == "azure_openai":
         if not p or not p.api_key or not p.api_base:

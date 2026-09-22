@@ -215,7 +215,10 @@ class AgentLoop:
             self.tools.register(CronTool(self.cron_service))
         if isinstance(self.provider, ProvidersManager):
             self.tools.register(AgentModeTool(self.provider))
-            self.tools.register(ImageTool(self.provider, send_callback=self.bus.publish_outbound))
+        # ImageTool works with any provider: leaf providers ignore the mode
+        # hint (single-model deployments serve multimodal with the same
+        # model), ProvidersManager routes it to a mode-specific provider.
+        self.tools.register(ImageTool(self.provider, send_callback=self.bus.publish_outbound))
 
         self.tools.register(SceneGraphQueryTool(workspace=self.workspace))
         from PhyAgentOS.agent.tools.skill_activation import ActivateSkillTool

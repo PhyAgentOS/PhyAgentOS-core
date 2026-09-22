@@ -1,6 +1,7 @@
 """Image tools for analyzing and displaying images."""
 
 import base64
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -8,7 +9,7 @@ from loguru import logger
 
 from PhyAgentOS.agent.tools.base import Tool
 from PhyAgentOS.bus.events import OutboundMessage
-from PhyAgentOS.providers.providers_manager import ProvidersManager
+from PhyAgentOS.providers.base import LLMProvider
 
 
 class ImageTool(Tool):
@@ -23,7 +24,7 @@ class ImageTool(Tool):
 
     def __init__(
         self,
-        provider: ProvidersManager,
+        provider: LLMProvider,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         default_channel: str = "",
         default_chat_id: str = "",
@@ -231,6 +232,31 @@ class ImageTool(Tool):
         else:
             return f"Error: Invalid mode '{mode}'. Must be 'vision', 'display', or 'generate'."
 
+    @staticmethod
+    def _clean_image_path(image_path: str) -> str:
+        """Tolerate leaked reasoning debris around the path.
+
+        Models occasionally emit chain-of-thought fragments inside the
+        argument value (e.g. ``"/path/frame.jpg conventionaloops"``) or wrap
+        it in quotes. Strip wrapping punctuation, and if the resulting path
+        does not exist fall back to the whitespace-free prefix — file paths
+        from tool results never contain spaces in these flows.
+        """
+        cleaned = image_path.strip()
+        if " " in cleaned and not Path(cleaned).exists():
+            cleaned = cleaned.split()[0]
+        cleaned = cleaned.strip("\"'`").strip()
+        if cleaned and not Path(cleaned).exists():
+            # debris glued on WITHOUT whitespace (e.g. "/path/frame.jpgjunk"):
+            # keep the prefix ending at the last image extension, but only
+            # when that candidate actually exists on disk
+            match = re.match(r"^(.*\.(?:jpe?g|png|gif|webp|bmp))", cleaned, re.IGNORECASE)
+            if match:
+                candidate = match.group(1)
+                if candidate != cleaned and Path(candidate).exists():
+                    cleaned = candidate
+        return cleaned
+
     async def _execute_vision(self, text: str, image_path: str, **kwargs: Any) -> str:
         """
         Execute image vision analysis.
@@ -245,6 +271,7 @@ class ImageTool(Tool):
         if not image_path:
             return "Error: No image provided. Please provide at least one image path."
 
+        image_path = self._clean_image_path(image_path)
         content: list[dict[str, Any]] = [{"type": "text", "text": text}]
 
         # Process image

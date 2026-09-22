@@ -23,6 +23,9 @@ class CustomProvider(LLMProvider):
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        # Reasoning-model endpoints (GPT-5/6, o-series) reject legacy max_tokens;
+        # adopted from the server error and remembered for later calls.
+        self._max_tokens_param = "max_tokens"
         # Use httpx client with trust_env=False to avoid picking up system SOCKS proxy
         # that uses the unsupported 'socks://' scheme (httpx only supports socks5://).
         http_client = httpx.AsyncClient(
@@ -44,7 +47,7 @@ class CustomProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": self._sanitize_empty_content(messages),
-            "max_tokens": max(1, max_tokens),
+            self._max_tokens_param: max(1, max_tokens),
             "temperature": temperature,
         }
         if reasoning_effort:
@@ -54,6 +57,13 @@ class CustomProvider(LLMProvider):
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
+            if self._max_tokens_param == "max_tokens" and "max_completion_tokens" in str(e):
+                self._max_tokens_param = "max_completion_tokens"
+                kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                try:
+                    return self._parse(await self._client.chat.completions.create(**kwargs))
+                except Exception as e2:
+                    return LLMResponse(content=f"Error: {e2}", finish_reason="error")
             return LLMResponse(content=f"Error: {e}", finish_reason="error")
 
     def _parse(self, response: Any) -> LLMResponse:
