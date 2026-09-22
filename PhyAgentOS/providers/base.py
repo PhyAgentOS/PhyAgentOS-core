@@ -202,12 +202,17 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
+        mode: str | None = None,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
         Parameters default to ``self.generation`` when not explicitly passed,
         so callers no longer need to thread temperature / max_tokens /
         reasoning_effort through every layer.
+
+        ``mode`` is accepted and ignored: single-model deployments serve
+        every mode (main / multimodal / ...) with the same model. Only
+        ProvidersManager routes it to a mode-specific provider.
         """
         if max_tokens is self._SENTINEL:
             max_tokens = self.generation.max_tokens

@@ -89,6 +89,15 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         litellm_prefix="",
         is_direct=True,
     ),
+    # === OpenAI Responses API (direct /v1/responses, tools + reasoning together)
+    ProviderSpec(
+        name="openai_responses",
+        keywords=("openai-responses",),
+        env_key="",
+        display_name="OpenAI Responses",
+        litellm_prefix="",
+        is_direct=True,
+    ),
     # === Gateways (detected by api_key / api_base, not model name) =========
     # Gateways can route any model, so they win in fallback.
     # OpenRouter: global gateway, keys start with "sk-or-"
