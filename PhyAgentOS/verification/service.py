@@ -270,6 +270,17 @@ def _provider(spec: dict[str, Any], timeout_s: float):
             default_model=model,
             timeout_s=timeout_s,
         )
+    elif name == "openai_responses":
+        # Direct /v1/responses — reasoning models reject tools+reasoning on
+        # /v1/chat/completions, so the LiteLLM fallback cannot serve them.
+        from PhyAgentOS.providers.openai_responses_provider import OpenAIResponsesProvider
+
+        provider = OpenAIResponsesProvider(
+            api_key=spec.get("api_key") or "no-key",
+            api_base=spec.get("api_base") or "http://localhost:8000/v1",
+            default_model=model,
+            timeout_s=timeout_s,
+        )
     elif name == "azure_openai":
         from PhyAgentOS.providers.azure_openai_provider import AzureOpenAIProvider
 

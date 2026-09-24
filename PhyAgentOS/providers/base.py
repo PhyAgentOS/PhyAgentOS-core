@@ -55,6 +55,33 @@ class LLMResponse:
         return len(self.tool_calls) > 0
 
 
+class LLMCallError(RuntimeError):
+    """A completion could not be obtained from the provider.
+
+    Providers report transport and API failures as an ``LLMResponse`` with
+    ``finish_reason="error"`` instead of raising, because most call sites want
+    to inspect the failure and carry on (verification, memory consolidation,
+    the experience analyzer). The agent loop is not one of those: a failed call
+    is not an answer, and treating it as one ended the turn with the provider's
+    error text as the assistant's reply — a reply the session and the caller
+    could not tell apart from a real one.
+
+    Raised by the agent loop when a completion comes back with
+    ``finish_reason="error"``. Transient failures (timeouts included) reach it
+    only after ``chat_with_retry`` has spent its retries; permanent ones — a
+    400 the endpoint will reject again — are returned unretried on the first
+    attempt, so the error is not necessarily an availability problem.
+    ``detail`` carries the provider's own error text; ``messages`` carries the
+    partial conversation so the caller can persist the user's message and any
+    completed tool exchanges before replying.
+    """
+
+    def __init__(self, detail: str, messages: list[dict[str, Any]] | None = None) -> None:
+        self.detail = detail
+        self.messages: list[dict[str, Any]] = list(messages) if messages is not None else []
+        super().__init__(detail)
+
+
 @dataclass(frozen=True)
 class GenerationSettings:
     """Default generation parameters for LLM calls.

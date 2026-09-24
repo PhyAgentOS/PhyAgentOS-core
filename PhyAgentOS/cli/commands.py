@@ -307,6 +307,8 @@ def _make_provider(
             api_key=p.api_key if p else "no-key",
             api_base=api_base() or "http://localhost:8000/v1",
             default_model=model,
+            timeout_s=p.timeout_s if p else None,
+            max_retries=p.max_retries if p else None,
         )
     # OpenAI Responses: direct /v1/responses, function tools + reasoning effort together
     elif provider_name == "openai_responses":
@@ -315,6 +317,8 @@ def _make_provider(
             api_key=p.api_key if p else "no-key",
             api_base=api_base() or "http://localhost:8000/v1",
             default_model=model,
+            timeout_s=p.timeout_s if p else None,
+            max_retries=p.max_retries if p else None,
         )
     # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
     elif provider_name == "azure_openai":

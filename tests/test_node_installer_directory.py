@@ -228,13 +228,39 @@ def test_directory_archive_rejects_symlinked_entrypoint(tmp_path: Path) -> None:
 
 
 def test_directory_archive_rejects_escaping_symlink(tmp_path: Path) -> None:
+    # Three levels up from a depth-2 member resolves above the archive root;
+    # two levels (../../outside) only reach the root and are caught later by
+    # the dangling-target check instead.
     def build(path: Path) -> None:
         with tarfile.open(path, "w:gz") as archive:
             _dir_member(archive, "lerobot_infer")
             _file_member(archive, "lerobot_infer/lerobot_infer", b"#!/bin/sh\nexit 0\n")
-            _link_member(archive, "lerobot_infer/_internal/escape", "../../outside")
+            _link_member(archive, "lerobot_infer/_internal/escape", "../../../outside")
 
     _rejects(tmp_path, _lock("0" * 64), match="inside the archive", build=build)
+
+
+def test_directory_archive_accepts_dotdot_symlink_staying_inside(tmp_path: Path) -> None:
+    # `libs/x.so -> ../libx.so` is a common layout in real runtime trees and
+    # resolves inside the archive; containment is judged on the resolved
+    # target, not on the mere presence of "..".
+    archive_path = tmp_path / "node.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        _dir_member(archive, "lerobot_infer")
+        _dir_member(archive, "lerobot_infer/_internal")
+        _dir_member(archive, "lerobot_infer/_internal/libs")
+        _file_member(archive, "lerobot_infer/lerobot_infer", b"#!/bin/sh\nexit 0\n")
+        _file_member(archive, "lerobot_infer/_internal/libx.so", b"lib-bytes", mode=0o644)
+        _link_member(archive, "lerobot_infer/_internal/libs/libx.so", "../libx.so")
+    lock = _lock(hashlib.sha256(archive_path.read_bytes()).hexdigest())
+    installer = _installer(tmp_path)
+
+    installed = installer.install(archive_path, lock)
+
+    link = _version_dir(installer, lock) / "lerobot_infer/_internal/libs/libx.so"
+    assert link.is_symlink()
+    assert link.resolve().name == "libx.so"
+    assert installed.is_file()
 
 
 def test_directory_archive_rejects_absolute_symlink(tmp_path: Path) -> None:

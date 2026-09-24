@@ -382,6 +382,16 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    # One HTTP attempt's read timeout for the direct providers (custom / openai_responses).
+    # Left at None, those providers use their 180s default, which assumes a model that answers
+    # in seconds. A reasoning model can need minutes on a long turn, and the SDK retries a call
+    # that exceeds the timeout, so a ceiling below the model's real latency turns slow turns
+    # into failed ones.
+    timeout_s: float | None = None
+    # SDK-level retries per chat call; None keeps the SDK default (2). 0 leaves retrying to the
+    # framework's chat_with_retry, which makes one logical call's worst case a known multiple of
+    # timeout_s instead of the SDK's own multiplication on top of it.
+    max_retries: int | None = None
 
 
 class ProvidersConfig(Base):

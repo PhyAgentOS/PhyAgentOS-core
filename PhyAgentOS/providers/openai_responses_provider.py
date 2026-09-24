@@ -9,13 +9,11 @@ output items back, so no server-side response state is used.
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
-import httpx
 import json_repair
-from openai import AsyncOpenAI
 
+from PhyAgentOS.providers._openai_client import build_async_openai_client
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
@@ -26,26 +24,18 @@ class OpenAIResponsesProvider(LLMProvider):
         api_key: str = "no-key",
         api_base: str = "http://localhost:8000/v1",
         default_model: str = "default",
-        timeout_s: float = 180.0,
+        timeout_s: float | None = None,
+        max_retries: int | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        # Timeout / retry reasoning lives with the shared client builder
+        # (`providers/_openai_client.py`); configure as
+        # `providers.<name>.timeoutS` / `providers.<name>.maxRetries`.
+        self._client = build_async_openai_client(api_key, api_base, timeout_s, max_retries)
         # Reasoning models (GPT-5/6, o-series) reject sampling temperature;
         # dropped from requests once the server says so and remembered after.
         self._temperature_supported = True
-        # Use httpx client with trust_env=False to avoid picking up system SOCKS proxy
-        # that uses the unsupported 'socks://' scheme (httpx only supports socks5://).
-        http_client = httpx.AsyncClient(
-            trust_env=False,
-            timeout=httpx.Timeout(float(timeout_s), connect=15.0),
-            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
-        )
-        self._client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=api_base,
-            default_headers={"x-session-affinity": uuid.uuid4().hex},
-            http_client=http_client,
-        )
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
@@ -164,16 +154,26 @@ class OpenAIResponsesProvider(LLMProvider):
                     text = getattr(summary, "text", None)
                     if text:
                         reasoning_parts.append(text)
-        status = getattr(response, "status", "completed")
+        status = getattr(response, "status", None) or "completed"
+        content = getattr(response, "output_text", "") or ""
         if status == "completed":
             finish_reason = "stop"
         elif status == "incomplete":
             finish_reason = "length"
         else:
-            finish_reason = status or "stop"
+            # 'failed' / 'cancelled' / anything unexpected: no completion was
+            # obtained. Surface it on the error channel callers check (the
+            # agent loop raises LLMCallError on it) with the server's own
+            # error text — output_text is empty on these statuses anyway.
+            finish_reason = "error"
+            error = getattr(response, "error", None)
+            detail = getattr(error, "message", None) or (
+                str(error) if error is not None else None
+            )
+            content = detail or f"responses API returned status {status!r}"
         u = getattr(response, "usage", None)
         return LLMResponse(
-            content=getattr(response, "output_text", "") or "",
+            content=content,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage={

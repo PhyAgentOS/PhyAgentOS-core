@@ -22,7 +22,5 @@ botpy.log
 nano.*.save
 SECURITY.md
 .kilo
-test
-tests/*
 plan/
 external/

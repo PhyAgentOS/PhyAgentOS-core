@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import tarfile
 import unicodedata
 from dataclasses import dataclass
@@ -150,19 +151,16 @@ class ArchiveValidator:
                             raise ArchiveError(
                                 f"symbolic link must be relative: {path} -> {target!r}"
                             )
-                        if ".." in PurePosixPath(target).parts:
-                            raise ArchiveError(
-                                f"symbolic link must stay inside the archive: {path} -> {target!r}"
-                            )
-                        resolved = PurePosixPath(path).parent.joinpath(target)
-                        normalized = PurePosixPath(
-                            *(
-                                part
-                                for part in resolved.parts
-                                if part not in {"", "."}
-                            )
+                        # Containment judged on the lexically resolved target, not on
+                        # the mere presence of "..": `lib/x.so -> ../libx.so` resolves
+                        # inside the archive and is a common layout in real runtime
+                        # trees, while `lib/x.so -> ../../etc/passwd` must be refused.
+                        # posixpath.normpath, not os.path: member names are POSIX
+                        # regardless of the host running the check.
+                        resolved = posixpath.normpath(
+                            str(PurePosixPath(path).parent / target)
                         )
-                        if ".." in normalized.parts:
+                        if resolved.startswith("/") or ".." in PurePosixPath(resolved).parts:
                             raise ArchiveError(
                                 f"symbolic link must stay inside the archive: {path} -> {target!r}"
                             )
@@ -175,6 +173,19 @@ class ArchiveValidator:
                             raise ArchiveError(f"archive member exceeds size limit: {path}")
                         total_size += member.size
                         files[path] = member
+                # Never materialize members through a symlink parent. Check the
+                # complete member set so archive ordering cannot bypass this,
+                # including aliases on case-insensitive/normalizing filesystems.
+                link_keys = {
+                    unicodedata.normalize("NFC", path).casefold() for path in links
+                }
+                for path in seen:
+                    for parent in PurePosixPath(path).parents:
+                        parent_key = unicodedata.normalize("NFC", parent.as_posix()).casefold()
+                        if parent_key in link_keys:
+                            raise ArchiveError(
+                                f"archive member has a symbolic link parent: {path}"
+                            )
                 if total_size > self.limits.max_total_size:
                     raise ArchiveError("archive exceeds total extracted size limit")
                 if total_size / compressed_size > self.limits.max_compression_ratio:
@@ -243,8 +254,17 @@ class ArchiveValidator:
                         raise ArchiveError(f"file sha256 mismatch: {path.as_posix()}")
                     safe_mode = member.mode & 0o755
                     os.chmod(target, safe_mode or 0o600, follow_symlinks=False)
+                resolved_root = os.path.realpath(destination)
                 for path, target_name in sorted(links.items()):
                     link_path = destination.joinpath(*PurePosixPath(path).parts)
+                    resolved_parent = os.path.realpath(link_path.parent)
+                    if (
+                        resolved_parent != resolved_root
+                        and not resolved_parent.startswith(resolved_root + os.sep)
+                    ):
+                        raise ArchiveError(
+                            f"symbolic link parent resolves outside the archive: {path}"
+                        )
                     link_path.parent.mkdir(parents=True, exist_ok=True)
                     try:
                         os.symlink(target_name, link_path)
@@ -257,7 +277,6 @@ class ArchiveValidator:
                         raise ArchiveError(
                             f"symbolic link is dangling or cyclic: {path} -> {links[path]!r}"
                         )
-                resolved_root = os.path.realpath(destination)
                 for path in sorted(links):
                     link_path = destination.joinpath(*PurePosixPath(path).parts)
                     if not os.path.realpath(link_path).startswith(resolved_root + os.sep):
