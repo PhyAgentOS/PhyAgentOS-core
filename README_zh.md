@@ -218,6 +218,11 @@ paos onboard
 或显式静态 index 安装时可留空。PAOS 只连接到已显式启动且健康的 Skill Runtime manifest
 所声明的 Gateway URL；启动 Agent 不会隐式启动或下载某个具体 Skill。
 
+其他网关的配置方式相同。使用 [Requesty](https://docs.requesty.ai) 时，设置 `"provider": "requesty"`，
+将 https://app.requesty.ai/api-keys 获取的 key 填入 `providers.requesty.apiKey`，模型 id 直接写
+`openai/gpt-4o-mini` 这类格式，无需 `requesty/` 前缀。将 `providers.requesty.apiBase` 设为
+`https://router.eu.requesty.ai/v1` 即可使用欧盟节点。
+
 ### 4. 启动 Agent
 
 先启动所需的已安装 Skill Runtime，再选择一种 PAOS 入口：

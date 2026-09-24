@@ -162,6 +162,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # Requesty: global gateway, OpenAI-compatible, model ids like "openai/gpt-4o-mini".
+    # "custom_openai" keeps the vendor prefix: openai/gpt-4o-mini → custom_openai/openai/gpt-4o-mini
+    # (a plain "openai" prefix would send bare "gpt-4o-mini" upstream).
+    ProviderSpec(
+        name="requesty",
+        keywords=("requesty",),
+        env_key="REQUESTY_API_KEY",
+        display_name="Requesty",
+        litellm_prefix="custom_openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="requesty",
+        default_api_base="https://router.requesty.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(
