@@ -251,6 +251,8 @@ class ImageTool(Tool):
         returned unchanged.
         """
         cleaned = image_path.strip()
+        if not cleaned:
+            return ""
 
         candidates: list[str] = []
         # Quote-wrapped path (possibly followed by debris): the closing quote ends it.
@@ -341,6 +343,9 @@ class ImageTool(Tool):
         Returns:
             Status message indicating success or error.
         """
+
+        if not image_path:
+            return "Error: No image provided. Please provide at least one image path."
 
         if not self._send_callback:
             return "Error: Message sending not configured"

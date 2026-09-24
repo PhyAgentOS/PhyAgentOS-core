@@ -10,7 +10,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from PhyAgentOS.agent.tools.image import ImageTool
+
+
+@pytest.mark.parametrize("image_path", ["", "   ", "\t\n"])
+def test_clean_empty_path(image_path: str) -> None:
+    assert ImageTool._clean_image_path(image_path) == ""
+
+
+@pytest.mark.parametrize("mode", ["vision", "display"])
+@pytest.mark.parametrize("kwargs", [{}, {"image_path": ""}, {"image_path": "   "}])
+async def test_execute_without_image_returns_parameter_error(mode: str, kwargs: dict) -> None:
+    tool = ImageTool(provider=None)
+    result = await tool.execute(mode=mode, **kwargs)
+    assert result.startswith("Error: No image provided.")
 
 
 def test_clean_path_keeps_quoted_path_containing_spaces(tmp_path: Path) -> None:

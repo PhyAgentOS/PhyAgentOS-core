@@ -482,6 +482,7 @@ class AgentLoop:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content=f"LLM call failed: {exc.detail}",
+                    metadata=dict(msg.metadata or {}),
                 ))
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
@@ -552,7 +553,9 @@ class AgentLoop:
                     messages, experience_session_key=key
                 )
             except LLMCallError as exc:
-                return self._abort_turn(session, history, exc, channel, chat_id)
+                return self._abort_turn(
+                    session, history, exc, channel, chat_id, metadata=msg.metadata
+                )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
@@ -635,7 +638,9 @@ class AgentLoop:
                 experience_session_key=key,
             )
         except LLMCallError as exc:
-            return self._abort_turn(session, history, exc, msg.channel, msg.chat_id)
+            return self._abort_turn(
+                session, history, exc, msg.channel, msg.chat_id, metadata=msg.metadata
+            )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -661,6 +666,8 @@ class AgentLoop:
         exc: LLMCallError,
         channel: str,
         chat_id: str,
+        *,
+        metadata: dict | None = None,
     ) -> OutboundMessage:
         """Persist the partial turn and reply with the failure.
 
@@ -676,7 +683,8 @@ class AgentLoop:
         self._save_turn(session, exc.messages, 1 + len(history))
         self.sessions.save(session)
         return OutboundMessage(
-            channel=channel, chat_id=chat_id, content=f"LLM call failed: {exc.detail}"
+            channel=channel, chat_id=chat_id, content=f"LLM call failed: {exc.detail}",
+            metadata=dict(metadata or {}),
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:

@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest
+from PhyAgentOS.bus.events import InboundMessage
+from PhyAgentOS.providers.base import LLMCallError, LLMResponse, ToolCallRequest
 
 
 class _ScriptedProvider:
@@ -98,3 +101,53 @@ async def test_failed_completion_after_tool_round_persists_exchanges(
     session = loop.sessions.get_or_create("cli:test")
     roles = [m.get("role") for m in session.messages]
     assert "tool" in roles  # the completed tool exchange survived the abort
+
+
+@pytest.mark.parametrize("system_message", [False, True])
+@pytest.mark.parametrize("channel,metadata", [
+    ("telegram", {"message_id": 42, "message_thread_id": 7}),
+    ("slack", {"slack": {"thread_ts": "123.456", "channel_type": "channel"}}),
+])
+async def test_failed_completion_preserves_thread_metadata(
+    tmp_path: Path, channel: str, metadata: dict, system_message: bool,
+) -> None:
+    loop = _loop(tmp_path, [_error_response()])
+    message = InboundMessage(
+        channel="system" if system_message else channel,
+        sender_id="test",
+        chat_id=f"{channel}:chat" if system_message else "chat",
+        content="hello", metadata=metadata,
+    )
+
+    reply = await loop._process_message(message)
+
+    assert reply is not None
+    assert reply.content.startswith("LLM call failed:")
+    assert (reply.channel, reply.chat_id) == (channel, "chat")
+    assert reply.metadata == metadata
+    assert reply.metadata is not metadata
+    session = loop.sessions.get_or_create(f"{channel}:chat")
+    assert any(m.get("role") == "user" and "hello" in str(m.get("content"))
+               for m in session.messages)
+    assert all("boom" not in str(m.get("content")) for m in session.messages)
+
+
+async def test_dispatch_defensive_llm_handler_preserves_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _loop(tmp_path, [])
+    message = InboundMessage(
+        channel="telegram", sender_id="test", chat_id="chat", content="hello",
+        metadata={"message_id": 42, "message_thread_id": 7},
+    )
+
+    async def fail(_message: InboundMessage):
+        raise LLMCallError("boom")
+
+    monkeypatch.setattr(loop, "_process_message", fail)
+    await loop._dispatch(message)
+
+    reply = loop.bus.outbound[-1]
+    assert reply.content == "LLM call failed: boom"
+    assert reply.metadata == message.metadata
+    assert reply.metadata is not message.metadata
