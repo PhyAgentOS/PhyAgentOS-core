@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import tarfile
 import unicodedata
 from dataclasses import dataclass
@@ -150,19 +151,16 @@ class ArchiveValidator:
                             raise ArchiveError(
                                 f"symbolic link must be relative: {path} -> {target!r}"
                             )
-                        if ".." in PurePosixPath(target).parts:
-                            raise ArchiveError(
-                                f"symbolic link must stay inside the archive: {path} -> {target!r}"
-                            )
-                        resolved = PurePosixPath(path).parent.joinpath(target)
-                        normalized = PurePosixPath(
-                            *(
-                                part
-                                for part in resolved.parts
-                                if part not in {"", "."}
-                            )
+                        # Containment judged on the lexically resolved target, not on
+                        # the mere presence of "..": `lib/x.so -> ../libx.so` resolves
+                        # inside the archive and is a common layout in real runtime
+                        # trees, while `lib/x.so -> ../../etc/passwd` must be refused.
+                        # posixpath.normpath, not os.path: member names are POSIX
+                        # regardless of the host running the check.
+                        resolved = posixpath.normpath(
+                            str(PurePosixPath(path).parent / target)
                         )
-                        if ".." in normalized.parts:
+                        if resolved.startswith("/") or ".." in PurePosixPath(resolved).parts:
                             raise ArchiveError(
                                 f"symbolic link must stay inside the archive: {path} -> {target!r}"
                             )

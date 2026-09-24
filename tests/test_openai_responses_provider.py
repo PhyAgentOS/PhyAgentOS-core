@@ -169,6 +169,25 @@ def test_parse_maps_incomplete_status_to_length() -> None:
     assert parsed.finish_reason == "length"
 
 
+def test_parse_maps_failed_status_to_error_with_server_detail() -> None:
+    response = _fake_response(status="failed")
+    response.error = SimpleNamespace(message="content policy violation")
+
+    parsed = _provider()._parse(response)
+
+    assert parsed.finish_reason == "error"
+    assert "content policy violation" in parsed.content
+
+
+def test_parse_maps_cancelled_status_to_error_without_error_object() -> None:
+    # A cancelled response may carry no error object at all; the status
+    # itself is the only detail available.
+    parsed = _provider()._parse(_fake_response(status="cancelled"))
+
+    assert parsed.finish_reason == "error"
+    assert "cancelled" in (parsed.content or "")
+
+
 # ---------------------------------------------------------------------------
 # chat() assembly and error path
 # ---------------------------------------------------------------------------
@@ -239,6 +258,20 @@ async def test_chat_drops_temperature_after_server_rejection() -> None:
     assert "temperature" not in stub.captured[1]
     # the adaptation is remembered: the second chat call never sends it
     assert len(stub.captured) == 3 and "temperature" not in stub.captured[2]
+
+
+# ---------------------------------------------------------------------------
+# shared direct-client configuration
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_and_retry_resolution_honors_zero() -> None:
+    from PhyAgentOS.providers._openai_client import resolve_max_retries, resolve_timeout_s
+
+    assert resolve_timeout_s(None) == 180.0
+    assert resolve_timeout_s(0) == 0.0  # 0 is a deliberate choice, not "unset"
+    assert resolve_max_retries(None) == 2
+    assert resolve_max_retries(0) == 0
 
 
 # ---------------------------------------------------------------------------

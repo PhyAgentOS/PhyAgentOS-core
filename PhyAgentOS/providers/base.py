@@ -55,8 +55,8 @@ class LLMResponse:
         return len(self.tool_calls) > 0
 
 
-class LLMUnavailableError(RuntimeError):
-    """A completion could not be obtained, and no retry is left.
+class LLMCallError(RuntimeError):
+    """A completion could not be obtained from the provider.
 
     Providers report transport and API failures as an ``LLMResponse`` with
     ``finish_reason="error"`` instead of raising, because most call sites want
@@ -67,14 +67,18 @@ class LLMUnavailableError(RuntimeError):
     could not tell apart from a real one.
 
     Raised by the agent loop when a completion comes back with
-    ``finish_reason="error"``, which is only ever reached after
-    ``chat_with_retry`` has spent its retries (transient failures, timeouts
-    included, are retried inside it). ``detail`` carries the provider's own
-    error text.
+    ``finish_reason="error"``. Transient failures (timeouts included) reach it
+    only after ``chat_with_retry`` has spent its retries; permanent ones — a
+    400 the endpoint will reject again — are returned unretried on the first
+    attempt, so the error is not necessarily an availability problem.
+    ``detail`` carries the provider's own error text; ``messages`` carries the
+    partial conversation so the caller can persist the user's message and any
+    completed tool exchanges before replying.
     """
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, messages: list[dict[str, Any]] | None = None) -> None:
         self.detail = detail
+        self.messages: list[dict[str, Any]] = list(messages) if messages is not None else []
         super().__init__(detail)
 
 

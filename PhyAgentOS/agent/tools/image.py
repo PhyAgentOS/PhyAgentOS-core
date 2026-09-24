@@ -214,6 +214,11 @@ class ImageTool(Tool):
         Returns:
             Analysis result (vision mode), status message (display mode), or generation result (generate mode).
         """
+        if mode in ("vision", "display"):
+            # Model-supplied read paths get debris tolerance (see _clean_image_path).
+            # generate's image_path is an output filename, not an existing file,
+            # so it is left untouched.
+            image_path = self._clean_image_path(image_path)
         if mode == "vision":
             return await self._execute_vision(text=text, image_path=image_path, **kwargs)
         elif mode == "display":
@@ -238,24 +243,43 @@ class ImageTool(Tool):
 
         Models occasionally emit chain-of-thought fragments inside the
         argument value (e.g. ``"/path/frame.jpg conventionaloops"``) or wrap
-        it in quotes. Strip wrapping punctuation, and if the resulting path
-        does not exist fall back to the whitespace-free prefix — file paths
-        from tool results never contain spaces in these flows.
+        it in quotes. Quotes are honoured first — a quoted path may itself
+        contain spaces, so the closing quote, not whitespace, ends it —
+        then a whitespace-free prefix is tried: file paths from tool
+        results never contain spaces in these flows. Every rewrite is
+        gated on the candidate existing, so an already-valid path is
+        returned unchanged.
         """
         cleaned = image_path.strip()
-        if " " in cleaned and not Path(cleaned).exists():
-            cleaned = cleaned.split()[0]
-        cleaned = cleaned.strip("\"'`").strip()
-        if cleaned and not Path(cleaned).exists():
-            # debris glued on WITHOUT whitespace (e.g. "/path/frame.jpgjunk"):
-            # keep the prefix ending at the last image extension, but only
-            # when that candidate actually exists on disk
-            match = re.match(r"^(.*\.(?:jpe?g|png|gif|webp|bmp))", cleaned, re.IGNORECASE)
+
+        candidates: list[str] = []
+        # Quote-wrapped path (possibly followed by debris): the closing quote ends it.
+        if cleaned[:1] in "\"'`":
+            end = cleaned.find(cleaned[0], 1)
+            if end > 0:
+                candidates.append(cleaned[1:end].strip())
+        # Wrapping punctuation stripped from the edges only.
+        base = cleaned.strip("\"'`").strip()
+        candidates.append(base)
+        # Debris separated by whitespace after the path.
+        if " " in base and not Path(base).exists():
+            candidates.append(base.split()[0].strip("\"'`").strip())
+
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+
+        # Debris glued on WITHOUT whitespace (e.g. "/path/frame.jpgjunk"):
+        # keep the prefix ending at the last image extension, but only when
+        # that candidate actually exists on disk.
+        last = candidates[-1]
+        if last:
+            match = re.match(r"^(.*\.(?:jpe?g|png|gif|webp|bmp))", last, re.IGNORECASE)
             if match:
                 candidate = match.group(1)
-                if candidate != cleaned and Path(candidate).exists():
-                    cleaned = candidate
-        return cleaned
+                if candidate != last and Path(candidate).exists():
+                    return candidate
+        return last
 
     async def _execute_vision(self, text: str, image_path: str, **kwargs: Any) -> str:
         """
@@ -271,7 +295,6 @@ class ImageTool(Tool):
         if not image_path:
             return "Error: No image provided. Please provide at least one image path."
 
-        image_path = self._clean_image_path(image_path)
         content: list[dict[str, Any]] = [{"type": "text", "text": text}]
 
         # Process image

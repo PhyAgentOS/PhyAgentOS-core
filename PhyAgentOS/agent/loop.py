@@ -30,7 +30,7 @@ from PhyAgentOS.agent.tools.web import WebFetchTool, WebSearchTool
 from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.embodiment_registry import EmbodimentRegistry
-from PhyAgentOS.providers.base import LLMProvider, LLMUnavailableError
+from PhyAgentOS.providers.base import LLMProvider, LLMCallError
 from PhyAgentOS.providers.providers_manager import ProvidersManager
 from PhyAgentOS.session.manager import Session, SessionManager
 
@@ -325,17 +325,21 @@ class AgentLoop:
             )
 
             if response.finish_reason == "error":
-                # A failed call is not an answer. `chat_with_retry` has already spent its
-                # retries -- it retries transient failures, timeouts included -- so reaching
-                # this point means the provider is genuinely unavailable, not briefly slow.
-                # Surfacing it beats the alternative this branch used to take: ending the
-                # turn with the provider's error text as the assistant's reply, which the
-                # session, the transcript and the caller all read as a real completion.
+                # A failed call is not an answer. Transient failures have already spent
+                # `chat_with_retry`'s retries here; permanent ones (a 400 the endpoint will
+                # reject again) arrive unretried on the first attempt. Either way, surfacing
+                # it beats the alternative this branch used to take: ending the turn with
+                # the provider's error text as the assistant's reply, which the session, the
+                # transcript and the caller all read as a real completion. The partial
+                # conversation rides on the exception so callers can persist what the turn
+                # did manage to do before replying.
                 logger.error(
                     "LLM call failed, abandoning turn: {}",
                     (response.content or "no detail")[:200],
                 )
-                raise LLMUnavailableError(response.content or "provider returned no detail")
+                raise LLMCallError(
+                    response.content or "provider returned no detail", messages=messages
+                )
 
             if response.has_tool_calls:
                 if on_progress:
@@ -469,14 +473,15 @@ class AgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
-            except LLMUnavailableError as exc:
-                # Name the failure in the reply: a caller that only sees the outbound message
-                # (the CLI, a bench harness reading the session log) has no other way to tell
-                # a provider outage apart from the agent having answered.
-                logger.error("LLM unavailable for session {}: {}", msg.session_key, exc.detail)
+            except LLMCallError as exc:
+                # Defensive net: _process_message normally absorbs these into a
+                # failure reply (persisting the partial turn first). If a future
+                # path lets one escape, still answer instead of crashing the
+                # dispatcher — callers like cron and heartbeat have no handler.
+                logger.error("LLM call failed for session {}: {}", msg.session_key, exc.detail)
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content=f"LLM unavailable: {exc.detail}",
+                    content=f"LLM call failed: {exc.detail}",
                 ))
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
@@ -542,9 +547,12 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
-                messages, experience_session_key=key
-            )
+            try:
+                final_content, _, all_msgs = await self._run_agent_loop(
+                    messages, experience_session_key=key
+                )
+            except LLMCallError as exc:
+                return self._abort_turn(session, history, exc, channel, chat_id)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
@@ -620,11 +628,14 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            experience_session_key=key,
-        )
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                experience_session_key=key,
+            )
+        except LLMCallError as exc:
+            return self._abort_turn(session, history, exc, msg.channel, msg.chat_id)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -641,6 +652,31 @@ class AgentLoop:
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
+        )
+
+    def _abort_turn(
+        self,
+        session: Session,
+        history: list[dict],
+        exc: LLMCallError,
+        channel: str,
+        chat_id: str,
+    ) -> OutboundMessage:
+        """Persist the partial turn and reply with the failure.
+
+        Used when the agent loop cannot obtain a completion. The user's
+        message and any completed tool exchanges still belong in the session
+        (a retry must not start from scratch), while the failure itself is
+        kept out of the history. The reply names the failure so a caller
+        that only sees the outbound message (the CLI, a bench harness
+        reading the session log) can tell a provider error apart from the
+        agent having answered.
+        """
+        logger.error("LLM call failed for session {}: {}", session.key, exc.detail[:200])
+        self._save_turn(session, exc.messages, 1 + len(history))
+        self.sessions.save(session)
+        return OutboundMessage(
+            channel=channel, chat_id=chat_id, content=f"LLM call failed: {exc.detail}"
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
