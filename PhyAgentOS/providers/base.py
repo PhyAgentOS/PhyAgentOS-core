@@ -55,6 +55,29 @@ class LLMResponse:
         return len(self.tool_calls) > 0
 
 
+class LLMUnavailableError(RuntimeError):
+    """A completion could not be obtained, and no retry is left.
+
+    Providers report transport and API failures as an ``LLMResponse`` with
+    ``finish_reason="error"`` instead of raising, because most call sites want
+    to inspect the failure and carry on (verification, memory consolidation,
+    the experience analyzer). The agent loop is not one of those: a failed call
+    is not an answer, and treating it as one ended the turn with the provider's
+    error text as the assistant's reply — a reply the session and the caller
+    could not tell apart from a real one.
+
+    Raised by the agent loop when a completion comes back with
+    ``finish_reason="error"``, which is only ever reached after
+    ``chat_with_retry`` has spent its retries (transient failures, timeouts
+    included, are retried inside it). ``detail`` carries the provider's own
+    error text.
+    """
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
 @dataclass(frozen=True)
 class GenerationSettings:
     """Default generation parameters for LLM calls.

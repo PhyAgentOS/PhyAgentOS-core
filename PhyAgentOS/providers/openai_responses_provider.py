@@ -26,10 +26,22 @@ class OpenAIResponsesProvider(LLMProvider):
         api_key: str = "no-key",
         api_base: str = "http://localhost:8000/v1",
         default_model: str = "default",
-        timeout_s: float = 180.0,
+        timeout_s: float | None = None,
+        max_retries: int | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        # One HTTP attempt's read timeout. The 180s default assumes a model that answers in
+        # seconds; a reasoning model on a long turn can legitimately need minutes, and a call
+        # that exceeds this is retried by the SDK before it ever returns, so a ceiling below the
+        # model's real latency converts every slow turn into several failed attempts (measured
+        # 2026-09-24: qwen3.8-max-0902, 3 x 180s = 540s, matching the run's recurring 541-543s
+        # gaps). Configure it per provider as `providers.<name>.timeoutS`.
+        self._timeout_s = float(timeout_s) if timeout_s else 180.0
+        # SDK-level retries per chat call. 0 leaves retrying to the framework's own
+        # chat_with_retry, so the worst case for one logical call is a known multiple of the
+        # timeout instead of the SDK's own multiplication on top of it.
+        self._max_retries = 2 if max_retries is None else int(max_retries)
         # Reasoning models (GPT-5/6, o-series) reject sampling temperature;
         # dropped from requests once the server says so and remembered after.
         self._temperature_supported = True
@@ -37,13 +49,14 @@ class OpenAIResponsesProvider(LLMProvider):
         # that uses the unsupported 'socks://' scheme (httpx only supports socks5://).
         http_client = httpx.AsyncClient(
             trust_env=False,
-            timeout=httpx.Timeout(float(timeout_s), connect=15.0),
+            timeout=httpx.Timeout(self._timeout_s, connect=15.0),
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=api_base,
             default_headers={"x-session-affinity": uuid.uuid4().hex},
+            max_retries=self._max_retries,
             http_client=http_client,
         )
 

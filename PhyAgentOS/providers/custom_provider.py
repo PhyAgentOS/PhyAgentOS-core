@@ -19,10 +19,16 @@ class CustomProvider(LLMProvider):
         api_key: str = "no-key",
         api_base: str = "http://localhost:8000/v1",
         default_model: str = "default",
-        timeout_s: float = 180.0,
+        timeout_s: float | None = None,
+        max_retries: int | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        # Same reasoning as OpenAIResponsesProvider: a read timeout below the endpoint's real
+        # latency makes every slow call a retried failure rather than a slow success. Configure
+        # it per provider as `providers.<name>.timeoutS`.
+        self._timeout_s = float(timeout_s) if timeout_s else 180.0
+        self._max_retries = 2 if max_retries is None else int(max_retries)
         # Reasoning-model endpoints (GPT-5/6, o-series) reject legacy max_tokens;
         # adopted from the server error and remembered for later calls.
         self._max_tokens_param = "max_tokens"
@@ -30,13 +36,14 @@ class CustomProvider(LLMProvider):
         # that uses the unsupported 'socks://' scheme (httpx only supports socks5://).
         http_client = httpx.AsyncClient(
             trust_env=False,
-            timeout=httpx.Timeout(float(timeout_s), connect=15.0),
+            timeout=httpx.Timeout(self._timeout_s, connect=15.0),
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=api_base,
             default_headers={"x-session-affinity": uuid.uuid4().hex},
+            max_retries=self._max_retries,
             http_client=http_client,
         )
 

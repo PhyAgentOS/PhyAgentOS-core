@@ -30,7 +30,7 @@ from PhyAgentOS.agent.tools.web import WebFetchTool, WebSearchTool
 from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.embodiment_registry import EmbodimentRegistry
-from PhyAgentOS.providers.base import LLMProvider
+from PhyAgentOS.providers.base import LLMProvider, LLMUnavailableError
 from PhyAgentOS.providers.providers_manager import ProvidersManager
 from PhyAgentOS.session.manager import Session, SessionManager
 
@@ -324,6 +324,19 @@ class AgentLoop:
                 model=self.model,
             )
 
+            if response.finish_reason == "error":
+                # A failed call is not an answer. `chat_with_retry` has already spent its
+                # retries -- it retries transient failures, timeouts included -- so reaching
+                # this point means the provider is genuinely unavailable, not briefly slow.
+                # Surfacing it beats the alternative this branch used to take: ending the
+                # turn with the provider's error text as the assistant's reply, which the
+                # session, the transcript and the caller all read as a real completion.
+                logger.error(
+                    "LLM call failed, abandoning turn: {}",
+                    (response.content or "no detail")[:200],
+                )
+                raise LLMUnavailableError(response.content or "provider returned no detail")
+
             if response.has_tool_calls:
                 if on_progress:
                     thought = self._strip_think(response.content)
@@ -355,12 +368,9 @@ class AgentLoop:
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
-                # poison the context and cause permanent 400 loops (#1303).
-                if response.finish_reason == "error":
-                    logger.error("LLM returned error: {}", (clean or "")[:200])
-                    final_content = clean or "Sorry, I encountered an error calling the AI model."
-                    break
+                # Error responses never reach here: they raise above, before anything is
+                # appended or persisted. That keeps them out of session history, which is
+                # what the previous handling in this branch was protecting against (#1303).
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
@@ -459,6 +469,15 @@ class AgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
+            except LLMUnavailableError as exc:
+                # Name the failure in the reply: a caller that only sees the outbound message
+                # (the CLI, a bench harness reading the session log) has no other way to tell
+                # a provider outage apart from the agent having answered.
+                logger.error("LLM unavailable for session {}: {}", msg.session_key, exc.detail)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"LLM unavailable: {exc.detail}",
+                ))
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 await self.bus.publish_outbound(OutboundMessage(
