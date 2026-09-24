@@ -222,6 +222,11 @@ it may be empty when all artifacts are installed from local bundles or a supplie
 PAOS connects only to the Gateway URL in the manifest of the explicitly started, healthy Skill
 Runtime. It never starts or downloads a concrete Skill merely because the Agent starts.
 
+Other gateways are configured the same way. For [Requesty](https://docs.requesty.ai), set
+`"provider": "requesty"`, put a key from https://app.requesty.ai/api-keys in
+`providers.requesty.apiKey`, and use model ids such as `openai/gpt-4o-mini` without a `requesty/`
+prefix. Set `providers.requesty.apiBase` to `https://router.eu.requesty.ai/v1` to use the EU router.
+
 ### 4. Start the Agent
 
 Start the required installed Skill Runtime first, then choose one of the PAOS entry points:

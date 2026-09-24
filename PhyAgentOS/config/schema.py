@@ -404,6 +404,7 @@ class ProvidersConfig(Base):
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
+    requesty: ProviderConfig = Field(default_factory=ProviderConfig)  # Requesty API gateway
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
