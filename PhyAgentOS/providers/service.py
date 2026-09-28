@@ -122,6 +122,10 @@ class ProviderService:
             return False
         if spec.is_oauth:
             return oauth_configured(spec.name)
+        if spec.uses_aws_credentials:
+            # IAM roles, profiles and environment credentials are resolved by
+            # the AWS SDK at request time, not by inspecting or exporting keys.
+            return True
         if spec.is_local:
             return bool(cfg.api_base or (
                 spec.default_api_base and (cfg.api_key or cfg.default_model or cfg.models)
@@ -138,6 +142,8 @@ class ProviderService:
         for spec in PROVIDERS:
             if spec.is_oauth:
                 auth = "oauth"
+            elif spec.uses_aws_credentials:
+                auth = "aws"
             elif spec.is_local or spec.name in {"custom", "openai_responses"}:
                 auth = "optional key"
             else:
@@ -213,6 +219,10 @@ class ProviderService:
             return True
         if bare and find_by_name(normalized):
             return False
+        if spec.uses_aws_credentials:
+            # Bedrock also accepts inference-profile IDs and ARNs that are not
+            # present in the local foundation-model catalog.
+            return True
         lower = model.lower()
         if spec.name in {"openai", "openai_codex"}:
             matches = bool(re.match(r"(?:gpt-|o[134](?:-|$)|chatgpt-)", lower))
@@ -430,12 +440,15 @@ class ProviderService:
             save_config(config, path)
 
     @staticmethod
-    def use(path: Path | None, name: str, model: str | None) -> ProviderSelection:
+    def use(
+        path: Path | None, name: str, model: str | None, effort: str | None = None,
+    ) -> ProviderSelection:
         with config_write_lock(path) as path:
             config = load_config(path, strict=True)
-            runtime = ProviderService(config).selection(name, model)
+            runtime = ProviderService(config).selection(name, model, effort)
             config.agents.defaults.provider = runtime.name
             config.agents.defaults.model = runtime.model
+            config.agents.defaults.reasoning_effort = runtime.effort
             save_config(config, path)
         return runtime
 
@@ -541,6 +554,7 @@ class SessionRuntimes:
                     s.name
                     for s in PROVIDERS
                     if not (s.is_gateway or s.is_local or s.is_direct)
+                    and (not s.uses_aws_credentials or model.startswith(s.name + "/"))
                     and self.service.routes(s, model)
                     and self.service.configured(s)
                 ]

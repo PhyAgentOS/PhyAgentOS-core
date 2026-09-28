@@ -54,6 +54,9 @@ class ProviderSpec:
     # OAuth-based providers (e.g., OpenAI Codex) don't use API keys
     is_oauth: bool = False  # if True, uses OAuth flow instead of API key
 
+    # AWS SDK credential chain (environment, profiles, IAM roles); no API key required.
+    uses_aws_credentials: bool = False
+
     # Direct providers bypass LiteLLM entirely (e.g., CustomProvider)
     is_direct: bool = False
 
@@ -170,6 +173,16 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.cn-beijing.volces.com/api/v3",
         strip_model_prefix=False,
         model_overrides=(),
+    ),
+    # Bedrock delegates authentication and region resolution to the AWS SDK.
+    ProviderSpec(
+        name="bedrock",
+        keywords=("bedrock",),
+        env_key="",
+        display_name="Amazon Bedrock",
+        litellm_prefix="bedrock",
+        skip_prefixes=("bedrock/",),
+        uses_aws_credentials=True,
     ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.

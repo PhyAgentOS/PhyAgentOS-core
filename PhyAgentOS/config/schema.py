@@ -403,6 +403,7 @@ class ProvidersConfig(Base):
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     openai_responses: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI /v1/responses (tools + reasoning together)
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
+    bedrock: ProviderConfig = Field(default_factory=ProviderConfig)  # AWS SDK credential chain
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -548,7 +549,7 @@ class Config(BaseSettings):
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and p.enabled and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or p.api_key or (
+                if spec.is_oauth or spec.uses_aws_credentials or p.api_key or (
                     spec.is_local and (p.api_base or p.default_model or p.models)
                 ):
                     return p, spec.name
@@ -557,7 +558,7 @@ class Config(BaseSettings):
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
             if p and p.enabled and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or p.api_key or (
+                if spec.is_oauth or spec.uses_aws_credentials or p.api_key or (
                     spec.is_local and (p.api_base or p.default_model or p.models)
                 ):
                     return p, spec.name

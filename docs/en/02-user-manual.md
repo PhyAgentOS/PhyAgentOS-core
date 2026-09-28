@@ -112,6 +112,10 @@ If you skip discovery or the endpoint does not support it, select a saved model 
 manually. OAuth and Azure currently use this fallback; Azure requires a deployment name.
 Authentication or network failures leave configuration unchanged.
 `paos provider use <provider>` offers saved models in a TTY; `--model` remains available for scripts.
+Use `--reasoning-effort <level>` to save a compatible effort together with the default provider/model,
+or `--reasoning-effort none` to clear the saved override. Omitting the option retains the saved effort;
+an incompatible selection leaves the configuration unchanged. For example, when switching from a
+reasoning model to DeepSeek: `paos provider use deepseek --reasoning-effort none`.
 `provider show` includes saved models and displays the first and last four characters of long API
 keys with the middle masked. Short keys are fully masked.
 
@@ -133,6 +137,19 @@ can also be provided at startup as `PAOS_<PROVIDER>_API_KEY` (for example,
 `PAOS_OPENROUTER_API_KEY`). Standard matching provider variables such as `OPENAI_API_KEY` and
 `ANTHROPIC_API_KEY` are accepted too. Gateway aliases do not borrow `OPENAI_API_KEY`.
 Runtime environment values are not written to configuration unless explicitly configuring that provider.
+
+Amazon Bedrock uses the AWS SDK credential chain (environment credentials, AWS profiles or IAM roles)
+and AWS region settings. No provider API key is required. Existing `provider: auto` configurations with
+a `bedrock/...` model continue to work. You can also save a default explicitly:
+
+```bash
+paos provider use bedrock --model bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0 --reasoning-effort none
+```
+
+The provider list labels AWS credentials as not tested; they are resolved by the SDK when a request is
+sent. Bedrock model discovery is unavailable, so enter a model or inference-profile ID manually.
+AWS credentials are not copied into the PAOS configuration. Removing Bedrock disables it until it is
+enabled again with `paos provider configure bedrock --model <model-id>`.
 
 `custom` (Chat Completions) and `openai_responses` (Responses) both require an explicit
 `--api-base`. API keys are optional for unauthenticated local services; use the secure input

@@ -107,6 +107,9 @@ paos provider remove                  # 选择供应商并清除存储的配置
 跳过测试或接口不支持模型列表时，可选择已保存模型或手动输入模型 ID；OAuth 和 Azure
 目前使用此方式，Azure 需填写部署名称。认证或网络失败时不保存本次配置。
 `paos provider use <provider>` 在 TTY 中会展示已保存模型供选择，非交互环境仍可用 `--model`。
+使用 `--reasoning-effort <档位>` 可同时保存兼容的默认推理强度，使用 `--reasoning-effort none`
+可清除已保存的覆盖值。省略此选项时保留原值；不兼容的选择不会修改配置。例如，从推理模型
+切换到 DeepSeek：`paos provider use deepseek --reasoning-effort none`。
 `provider show` 展示已保存模型，长 API Key 显示前后各 4 位，中间隐藏；短密钥全部隐藏。
 
 Docker、CI 和远程服务器应明确指定 Provider、模型，并通过 stdin、环境变量或挂载的
@@ -126,6 +129,18 @@ paos provider configure custom --api-base http://localhost:8000/v1 --model gpt-5
 `PAOS_OPENROUTER_API_KEY`；支持对应供应商的标准变量，如 `OPENAI_API_KEY`、
 `ANTHROPIC_API_KEY`。网关别名不会借用 OpenAI 的密钥。
 运行时环境凭据不落盘，只有明确配置该 Provider 时才保存。
+
+Amazon Bedrock 使用 AWS SDK 凭证链（环境凭据、AWS profile 或 IAM 角色）及 AWS 区域配置，
+无需提供 Provider API Key。已有 `provider: auto` 配合 `bedrock/...` 模型的配置可继续使用，
+也可以显式保存默认选择：
+
+```bash
+paos provider use bedrock --model bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0 --reasoning-effort none
+```
+
+供应商列表将 AWS 凭据标为未测试，SDK 在实际请求时解析凭据。Bedrock 暂不支持模型发现，
+需手动输入模型或推理配置文件 ID。AWS 凭据不会复制到 PAOS 配置中。移除 Bedrock 后，
+需通过 `paos provider configure bedrock --model <model-id>` 重新启用。
 
 `custom`（Chat Completions）与 `openai_responses`（Responses）均要求显式配置
 `--api-base`；API Key 可省略以连接无鉴权的本地服务。使用需要鉴权的服务时，通过上述

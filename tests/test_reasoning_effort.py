@@ -32,16 +32,39 @@ def test_toggle_only_model_does_not_claim_effort_support():
 @pytest.mark.parametrize("provider,model,expected", [
     ("anthropic", "claude-opus-4-6", ("low", "medium", "high", "max")),
     ("anthropic", "anthropic/claude-sonnet-4-5", ("low", "medium", "high")),
-    ("openai", "gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
     ("openai", "gpt-5.5-pro", ("medium", "high", "xhigh")),
-    ("openai_codex", "openai-codex/gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
-    ("custom", "gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
-    ("openai_responses", "gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
-    ("azure_openai", "gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
     ("openai", "gpt-4o", ()),
     ("deepseek", "deepseek-reasoner", ()),
 ])
 def test_effort_choices_follow_model_and_route(provider, model, expected):
+    assert supported_efforts(provider_spec(provider), model) == expected
+
+
+@pytest.mark.parametrize("provider,model", [
+    ("openai", "gpt-5.2"),
+    ("openai_codex", "openai-codex/gpt-5.2"),
+    ("custom", "gpt-5.2"),
+    ("openai_responses", "gpt-5.2"),
+    ("azure_openai", "gpt-5.2"),
+])
+@pytest.mark.parametrize("minimal_supported", [False, True])
+def test_effort_choices_respect_catalog_changes(monkeypatch, provider, model, minimal_supported):
+    import litellm
+
+    # Catalog entries may change independently of this project. Exercise both
+    # an explicit exclusion and an opt-in while retaining the real adapters.
+    info = {
+        "mode": "chat",
+        "supports_reasoning": True,
+        "supports_minimal_reasoning_effort": minimal_supported,
+        "supports_xhigh_reasoning_effort": True,
+        "supports_max_reasoning_effort": False,
+    }
+    for key in ("gpt-5.2", "openai/gpt-5.2"):
+        monkeypatch.setitem(litellm.model_cost, key, info)
+    expected = ("low", "medium", "high", "xhigh")
+    if minimal_supported:
+        expected = ("minimal", *expected)
     assert supported_efforts(provider_spec(provider), model) == expected
 
 

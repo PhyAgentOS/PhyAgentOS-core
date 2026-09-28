@@ -28,7 +28,7 @@ class ModelDiscoveryUnavailableError(ProviderError):
 
 
 async def fetch_models(spec: ProviderSpec, cfg: ProviderConfig) -> list[str]:
-    if spec.is_oauth or spec.name == "azure_openai":
+    if spec.is_oauth or spec.uses_aws_credentials or spec.name == "azure_openai":
         raise ModelDiscoveryUnavailableError(
             "Model discovery is unavailable for this provider; select a saved model or enter "
             "a model ID (Azure requires a deployment name)."

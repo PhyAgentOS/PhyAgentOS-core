@@ -102,6 +102,8 @@ def _select_provider(service: ProviderService, *, action: str = "Configure") -> 
             status = "configured" if row["configured"] else "not configured"
             if row["auth"] == "oauth" and row["configured"]:
                 status = "OAuth logged in (local credentials; not tested)"
+            elif row["auth"] == "aws" and row["configured"]:
+                status = "AWS credential chain (not tested)"
             if row["default"]:
                 status += " · default"
             lines.append(f"  {'●' if index == selected else '○'} {row['label']}  {status}\n")
@@ -291,6 +293,8 @@ def provider_list(
             status = "configured" if row["configured"] else "not configured"
             if row["configured"] and row["auth"] == "oauth":
                 status = "local credentials (not tested)"
+            elif row["configured"] and row["auth"] == "aws":
+                status = "AWS credential chain (not tested)"
             table.add_row(row["name"], "yes", status, "yes" if row["default"] else "—", row["auth"])
         console.print(table)
 
@@ -351,6 +355,8 @@ def provider_configure(
             )
         if sources and spec.is_oauth:
             raise ProviderError("This provider uses OAuth. Run 'paos provider login <provider>'.")
+        if sources and spec.uses_aws_credentials:
+            raise ProviderError("This provider uses the AWS credential chain; configure AWS credentials separately.")
         if api_key_stdin:
             key = sys.stdin.read().strip()
         elif api_key_env:
@@ -375,7 +381,7 @@ def provider_configure(
             candidate.extra_headers = headers
         if interactive:
             console.print(f"Configure {spec.label}", markup=False)
-            if not spec.is_oauth and not sources:
+            if not (spec.is_oauth or spec.uses_aws_credentials) and not sources:
                 candidate.api_key = _prompt("API Key", default=key, secret=True)
             candidate.api_base = (
                 _prompt(
@@ -487,6 +493,9 @@ def provider_remove(
 def provider_use(
     provider: str | None = typer.Argument(None),
     model: str | None = typer.Option(None, "--model"),
+    reasoning_effort: str | None = typer.Option(
+        None, "--reasoning-effort", help="Save a supported reasoning effort; none clears the saved override",
+    ),
     config: Path | None = typer.Option(None, "--config", "-c"),
 ):
     """Set the default provider/model for future processes."""
@@ -500,7 +509,8 @@ def provider_use(
                 model = _select_models(
                     choices, selected=[cfg.default_model] if cfg.default_model else None,
                 )[0]
-        runtime = ProviderService.use(config, provider, model)
+        runtime = ProviderService.use(config, provider, model, reasoning_effort)
         console.print(
-            f"Default: {runtime.name} / {runtime.model}. Running processes are unchanged."
+            f"Default: {runtime.name} / {runtime.model}, effort={runtime.effort or 'none'}. "
+            "Running processes are unchanged."
         )
