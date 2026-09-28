@@ -222,6 +222,25 @@ it may be empty when all artifacts are installed from local bundles or a supplie
 PAOS connects only to the Gateway URL in the manifest of the explicitly started, healthy Skill
 Runtime. It never starts or downloads a concrete Skill merely because the Agent starts.
 
+Atlas Cloud can be selected as an optional OpenAI-compatible provider without changing the
+default configuration. Use a model ID from the live Atlas Cloud catalog:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+      "provider": "atlas"
+    }
+  },
+  "providers": {
+    "atlas": {
+      "apiKey": "YOUR_ATLASCLOUD_API_KEY"
+    }
+  }
+}
+```
+
 ### 4. Start the Agent
 
 Start the required installed Skill Runtime first, then choose one of the PAOS entry points:

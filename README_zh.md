@@ -218,6 +218,25 @@ paos onboard
 或显式静态 index 安装时可留空。PAOS 只连接到已显式启动且健康的 Skill Runtime manifest
 所声明的 Gateway URL；启动 Agent 不会隐式启动或下载某个具体 Skill。
 
+Atlas Cloud 可作为 OpenAI 兼容的可选 Provider 使用，不会改变默认配置。请使用 Atlas Cloud
+实时模型目录中的模型 ID：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+      "provider": "atlas"
+    }
+  },
+  "providers": {
+    "atlas": {
+      "apiKey": "YOUR_ATLASCLOUD_API_KEY"
+    }
+  }
+}
+```
+
 ### 4. 启动 Agent
 
 先启动所需的已安装 Skill Runtime，再选择一种 PAOS 入口：

@@ -109,6 +109,23 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
         supports_prompt_caching=True,
     ),
+    # Atlas Cloud: OpenAI-compatible gateway using catalog model IDs directly.
+    ProviderSpec(
+        name="atlas",
+        keywords=("atlas", "atlascloud"),
+        env_key="OPENAI_API_KEY",
+        display_name="Atlas Cloud",
+        litellm_prefix="openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="atlascloud.ai",
+        default_api_base="https://api.atlascloud.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # AiHubMix: global gateway, OpenAI-compatible interface.
     # strip_model_prefix=True: it doesn't understand "anthropic/claude-3",
     # so we strip to bare "claude-3" then re-prefix as "openai/claude-3".
