@@ -346,7 +346,7 @@ def _make_forge_verifier(config: Config, provider):
     if not config.agents.verification.service_enabled:
         return None
     from PhyAgentOS.agent.session_verifier import ForgeTaskVerifier
-    from PhyAgentOS.providers.service import ProviderService, provider_spec
+    from PhyAgentOS.providers.service import ProviderService
 
     settings = config.agents.verification
     model = settings.model or config.agents.defaults.model
@@ -354,26 +354,20 @@ def _make_forge_verifier(config: Config, provider):
     provider_name = service.background_provider_name(settings.provider, settings.model)
     if not provider_name:
         raise RuntimeError(f"cannot resolve verification provider for model {model!r}")
-    provider_name = provider_name.replace("-", "_")
-    provider_config = getattr(service.config.providers, provider_name, None)
-    if settings.provider is not None and provider_config is None:
-        raise RuntimeError(f"unknown verification provider {settings.provider!r}")
-    provider_meta = provider_spec(provider_name)
+    selection = service.selection(
+        provider_name, model, service.background_effort(provider_name, model) or "none",
+    )
+    provider_config = getattr(service.config.providers, selection.name)
     child_provider_spec = {
-        "provider_name": provider_name,
-        "model": model,
-        "api_key": provider_config.api_key if provider_config is not None else None,
-        "api_base": (
-            provider_config.api_base
-            if provider_config is not None and provider_config.api_base
-            else provider_meta.default_api_base or None
-        ),
-        "extra_headers": (
-            provider_config.extra_headers if provider_config is not None else None
-        ),
+        "provider_name": selection.name,
+        "model": selection.model,
+        "api_key": provider_config.api_key,
+        "api_base": selection.endpoint,
+        "extra_headers": provider_config.extra_headers,
+        "max_retries": provider_config.max_retries,
         "temperature": 0.0,
         "max_tokens": min(4096, config.agents.defaults.max_tokens),
-        "reasoning_effort": service.background_effort(provider_name, model),
+        "reasoning_effort": selection.effort,
     }
     return ForgeTaskVerifier(
         workspace=config.workspace_path,
@@ -1422,7 +1416,7 @@ def forge_node_install(
         help="Independently obtained local Node .tar.gz instead of a Registry download",
     ),
 ):
-    """Download the exact single-executable archive pinned by a Skill lock."""
+    """Download the exact node archive pinned by a Skill lock."""
     from PhyAgentOS.skill_runtime.catalog import SkillCatalog
     from PhyAgentOS.skill_runtime.installer import NodeInstaller
     from PhyAgentOS.skill_runtime.registry import DownloadCache, RegistryClient

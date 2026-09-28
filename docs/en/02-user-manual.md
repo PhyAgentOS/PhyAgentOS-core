@@ -134,6 +134,15 @@ can also be provided at startup as `PAOS_<PROVIDER>_API_KEY` (for example,
 `ANTHROPIC_API_KEY` are accepted too. Gateway aliases do not borrow `OPENAI_API_KEY`.
 Runtime environment values are not written to configuration unless explicitly configuring that provider.
 
+`custom` (Chat Completions) and `openai_responses` (Responses) both require an explicit
+`--api-base`. API keys are optional for unauthenticated local services; use the secure input
+methods above when the endpoint requires authentication. A missing endpoint never falls back
+to the SDK default. For example:
+
+```bash
+paos provider configure openai_responses --api-base http://localhost:8000/v1 --model local-model
+```
+
 Startup overrides apply only to the new process:
 
 ```bash
@@ -170,6 +179,20 @@ memory consolidation, Cron and Heartbeat continue using startup settings. Change
 stop processes and never save global defaults. `/provider reset` clears session overrides;
 `/new` only clears conversation history and keeps the session selection. Overrides expire when the
 process exits. Use `paos provider use` to set persistent defaults for future processes.
+
+Security boundaries:
+
+- `configure`, `use`, and `remove` serialize configuration read-modify-write operations with a
+  cross-process lock. A competing operation makes no changes and asks you to retry. Do not delete
+  the `.lock` file to unlock it; ownership is released when the operation or process ends.
+- `remove` neither revokes credentials nor stops running tasks. Existing processes retain their
+  own configuration snapshots, and shared OAuth logins remain intact. For immediate revocation,
+  revoke credentials with the provider and use the existing lifecycle controls to stop affected
+  processes and tasks. A local process exiting does not prove that a physical robot has stopped.
+- Switching keeps conversation history, so subsequent requests may send existing context to the
+  newly selected provider. Configure only trusted endpoints and restrict authorized channel users.
+  The verifier subprocess is a trusted local process, not a sandbox for untrusted code. Session
+  switching does not expand Forge permissions or change task ownership.
 
 Docker examples using the existing CLI service:
 

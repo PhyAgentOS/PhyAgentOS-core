@@ -130,8 +130,10 @@ artifacts:
       sha256: <64-character-sha256>
 ```
 
-所有路径必须相对并包含在 Bundle 内。每个 Node archive 具有 lock 指定的 SHA-256，并且只包含
-一个 lock 指定文件名的根目录 executable；installer 在 receipt 中另行记录解包后 binary hash。
+所有路径必须相对并包含在 Bundle 内。每个 Node archive 具有 lock 指定的 SHA-256。
+`executable_tar_gz` 只包含一个 lock 指定文件名的根目录 executable；`directory_tar_gz`
+只包含一个以 `entrypoint` 命名的根目录，同名 executable 及其运行时树置于其中（仅允许
+解析不出树的相对符号链接）。installer 在 receipt 中另行记录解包后 binary hash。
 Bundle archive inventory 需要覆盖每个文件及 SHA-256；links、路径穿越、冲突、过度展开和未列出
 内容会被拒绝。
 
@@ -173,8 +175,10 @@ rollback。不得要求调用方关闭摘要校验。
 
 ### 5.2 不可变发布顺序
 
-1. 先发布并登记所有 Node artifacts。每个 `executable_tar_gz` 归档根目录只能包含一个与
-   `entrypoint` 同名的 executable，最终归档 SHA-256 必须写入 Skill lock。
+1. 先发布并登记所有 Node artifacts。`executable_tar_gz` 归档根目录只能包含一个与
+   `entrypoint` 同名的 executable；`directory_tar_gz` 归档根目录只能包含一个与
+   `entrypoint` 同名的目录（内含同名 executable 与运行时树）。最终归档 SHA-256 必须写入
+   Skill lock。
 2. 固定 `skill.yaml` 的 name/version、profiles 与 Node locks，执行打包，并保存输出的 Bundle
    SHA-256 与 `size_bytes`。
 3. 将 Bundle 上传到不可覆盖、长期有效的 HTTPS 对象键。上传后从最终 URL 回读并重新校验

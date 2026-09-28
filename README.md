@@ -323,7 +323,9 @@ paos forge-node verify <skill-name> <node-id>
 
 Each Forge Skill bundle declares its workflow document, required Tool IDs, named runtime profiles,
 and exact platform/architecture Node locks. Each locked archive has an exact SHA-256 and contains
-one named root-level executable. For Registry Node downloads, the verified Skill lock supplies the
+either one named root-level executable (`executable_tar_gz`) or one root directory named after the
+entrypoint that holds the executable and its runtime tree (`directory_tar_gz`). For Registry Node
+downloads, the verified Skill lock supplies the
 digest when the Registry omits that duplicate field, and the exact size is resolved before the
 download begins; installation records and verifies the extracted binary hash.
 `python scripts/package_skill.py <bundle-dir> --output-dir <directory>` creates a deterministic

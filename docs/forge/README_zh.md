@@ -171,7 +171,8 @@ AgentTask terminal state 或 verification attempt。
 
 Skill Runtime 安装并管理 manifest v2 Bundle。安装要求安全 contained path、有界解包、SHA-256
 文件清单、严格 manifest、staging、原子替换与 rollback。每个 Node lock 固定 artifact ID、版本、
-平台、架构、归档类型、根目录可执行文件名与 SHA-256。静态 index 下载条目包含 size 与 digest；
+平台、架构、归档类型（`executable_tar_gz`：单个根目录 executable；`directory_tar_gz`：仅含一个
+以 entrypoint 命名的根目录，内放可执行文件及其运行时树）、entrypoint 与 SHA-256。静态 index 下载条目包含 size 与 digest；
 Registry Node 下载以已验证的 Skill lock 为摘要权威，并在进入 cache 前从 Registry 元数据或直接
 下载端点解析精确大小。安装始终显式触发，默认还需确认。
 

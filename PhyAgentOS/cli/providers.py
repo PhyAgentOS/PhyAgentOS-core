@@ -37,6 +37,9 @@ def _provider_errors():
     except (KeyboardInterrupt, EOFError, typer.Abort):
         console.print("Cancelled; configuration unchanged.")
         raise typer.Exit(1) from None
+    except BlockingIOError:
+        console.print("Provider configuration is being updated by another process; retry shortly.")
+        raise typer.Exit(1) from None
     except (ValueError, OSError):
         console.print(
             "Cannot read or save provider configuration; check format and file permissions."

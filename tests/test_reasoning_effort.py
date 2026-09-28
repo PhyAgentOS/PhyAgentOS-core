@@ -36,6 +36,7 @@ def test_toggle_only_model_does_not_claim_effort_support():
     ("openai", "gpt-5.5-pro", ("medium", "high", "xhigh")),
     ("openai_codex", "openai-codex/gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
     ("custom", "gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
+    ("openai_responses", "gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
     ("azure_openai", "gpt-5.2", ("minimal", "low", "medium", "high", "xhigh")),
     ("openai", "gpt-4o", ()),
     ("deepseek", "deepseek-reasoner", ()),
@@ -187,6 +188,42 @@ async def test_custom_openai_effort_payload(monkeypatch, effort):
         assert "temperature" not in transport.call_args.kwargs
         await provider.chat([], reasoning_effort="none")
         assert "reasoning_effort" not in transport.call_args.kwargs
+    finally:
+        await provider._client.close()
+
+
+async def test_custom_adaptive_token_parameter_survives_second_call(monkeypatch):
+    from PhyAgentOS.providers.custom_provider import CustomProvider
+
+    provider = CustomProvider(api_key="test", default_model="gpt-4o")
+    transport = AsyncMock(side_effect=[ValueError("requires max_completion_tokens"), object(), object()])
+    monkeypatch.setattr(provider._client.chat.completions, "create", transport)
+    monkeypatch.setattr(provider, "_parse", lambda response: LLMResponse("ok"))
+    try:
+        assert (await provider.chat([])).content == "ok"
+        assert (await provider.chat([])).content == "ok"
+        assert transport.await_count == 3
+        assert "max_completion_tokens" in transport.call_args.kwargs
+        assert "max_tokens" not in transport.call_args.kwargs
+    finally:
+        await provider._client.close()
+
+
+@pytest.mark.parametrize("model,effort", [("gpt-5.2", None), ("custom-model", "high")])
+async def test_custom_completion_token_rejection_does_not_retry_converted_payload(
+    monkeypatch, model, effort,
+):
+    from PhyAgentOS.providers.custom_provider import CustomProvider
+
+    provider = CustomProvider(api_key="test", default_model=model)
+    transport = AsyncMock(side_effect=ValueError("max_completion_tokens is too large"))
+    monkeypatch.setattr(provider._client.chat.completions, "create", transport)
+    try:
+        response = await provider.chat([], reasoning_effort=effort)
+        assert response.finish_reason == "error"
+        assert transport.await_count == 1
+        assert "max_completion_tokens" in transport.call_args.kwargs
+        assert "max_tokens" not in transport.call_args.kwargs
     finally:
         await provider._client.close()
 

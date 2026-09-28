@@ -131,9 +131,13 @@ execution references, bundle metadata, and tombstone information required for au
 A `skill.yaml` manifest must use `manifest_version: 2`, a directory-safe name/version, a relative
 Skill document, an HTTP(S) `gateway_url`, non-empty required Tools, at least one profile, and strict
 known fields. Registry-resolved nodes require artifact identity, version, platform, architecture,
-archive type, one root executable entrypoint, and SHA-256.
+archive type (`executable_tar_gz` or `directory_tar_gz`), the entrypoint, and SHA-256. An
+`executable_tar_gz` archive contains one root-level executable named by the entrypoint; a
+`directory_tar_gz` archive contains one root directory named after the entrypoint that holds the
+same-named executable plus its runtime tree (tree-internal relative symlinks are allowed).
 
-Archive validation rejects absolute/traversing paths, links, duplicate/colliding paths, oversized
+Archive validation rejects absolute/traversing paths, links outside the node-tree cases above,
+duplicate/colliding paths, oversized
 files, expansion-limit violations, missing inventory entries, and digest mismatches. Skill and Node
 installers stage content, validate it, then atomically replace the target with rollback support.
 

@@ -316,8 +316,9 @@ paos forge-node verify <skill-name> <node-id>
 ```
 
 每个 Forge Skill Bundle 声明工作流文档、所需 Tool ID、命名 Runtime profile，以及精确的
-平台/架构 Node lock。每个锁定归档具有精确 SHA-256，并且只包含一个指定文件名的根目录
-可执行文件；安装时另行记录并校验解包后的 binary hash。
+平台/架构 Node lock。每个锁定归档具有精确 SHA-256；`executable_tar_gz` 只包含一个指定文件名的
+根目录可执行文件，`directory_tar_gz` 则只包含一个以 entrypoint 命名的根目录（同名可执行文件及
+其运行时树置于其中）。安装时另行记录并校验解包后的 binary hash。
 `python scripts/package_skill.py <bundle-dir> --output-dir <directory>` 可生成确定性发布 Bundle。
 PhyAgentOS 源码与发布包不内置具体 Forge Skill、Forge node、模型或仿真资源；
 部署者只需独立获取实际需要的 Skill 并显式安装。

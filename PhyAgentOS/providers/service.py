@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from PhyAgentOS.config.loader import load_config, save_config
+from PhyAgentOS.config.loader import config_write_lock, load_config, save_config
 from PhyAgentOS.config.schema import Config, ProviderConfig
 from PhyAgentOS.providers.base import GenerationSettings, LLMProvider
 from PhyAgentOS.providers.errors import describe_provider_error
@@ -126,7 +126,9 @@ class ProviderService:
             return bool(cfg.api_base or (
                 spec.default_api_base and (cfg.api_key or cfg.default_model or cfg.models)
             ))
-        if spec.name == "custom":
+        if spec.name in {"custom", "openai_responses"}:
+            # Direct compatible endpoints need an explicit destination, not a key.
+            # Never send their credentials to the SDK default by accident.
             return bool(cfg.api_base)
         return bool(cfg.api_key and (spec.name != "azure_openai" or cfg.api_base))
 
@@ -136,7 +138,7 @@ class ProviderService:
         for spec in PROVIDERS:
             if spec.is_oauth:
                 auth = "oauth"
-            elif spec.is_local or spec.name == "custom":
+            elif spec.is_local or spec.name in {"custom", "openai_responses"}:
                 auth = "optional key"
             else:
                 auth = "api key"
@@ -203,7 +205,7 @@ class ProviderService:
             return False
         prefix, _, bare = model.partition("/")
         normalized = prefix.lower().replace("-", "_")
-        if spec.is_gateway or spec.is_local or spec.name in {"custom", "azure_openai"}:
+        if spec.is_gateway or spec.is_local or spec.name in {"custom", "azure_openai", "openai_responses"}:
             return True
         if bare and normalized == spec.name:
             return ProviderService.routes(spec, bare)
@@ -364,6 +366,19 @@ class ProviderService:
                 api_key=cfg.api_key or "no-key",
                 api_base=endpoint,
                 default_model=model,
+                timeout_s=cfg.timeout_s,
+                max_retries=cfg.max_retries,
+                extra_headers=cfg.extra_headers,
+            )
+        if spec.name == "openai_responses":
+            from PhyAgentOS.providers.openai_responses_provider import OpenAIResponsesProvider
+
+            return OpenAIResponsesProvider(
+                api_key=cfg.api_key or "no-key",
+                api_base=endpoint,
+                default_model=model,
+                timeout_s=cfg.timeout_s,
+                max_retries=cfg.max_retries,
                 extra_headers=cfg.extra_headers,
             )
         if spec.name == "azure_openai":
@@ -394,31 +409,34 @@ class ProviderService:
             raise ProviderError("Model cannot be routed by this provider.")
         cfg = cfg.model_copy(update={"models": list(dict.fromkeys(values))})
         ProviderService.validate_headers(cfg.extra_headers)
-        config = load_config(path, strict=True)
-        setattr(config.providers, spec.name, cfg)
-        save_config(config, path)
+        with config_write_lock(path) as path:
+            config = load_config(path, strict=True)
+            setattr(config.providers, spec.name, cfg)
+            save_config(config, path)
 
     @staticmethod
     def remove(path: Path | None, name: str) -> None:
         # OAuth stores are shared with external tools and running jobs; never revoke them here.
         spec = provider_spec(name)
-        config = load_config(path, strict=True)
-        current = ProviderService(config).config.get_provider_name()
-        if config.agents.defaults.provider == spec.name or current == spec.name:
-            # An empty selection requires an explicit 'use'; do not silently select another account.
-            config.agents.defaults.provider = ""
-            config.agents.defaults.model = ""
-            config.agents.defaults.reasoning_effort = None
-        setattr(config.providers, spec.name, ProviderConfig(enabled=False))
-        save_config(config, path)
+        with config_write_lock(path) as path:
+            config = load_config(path, strict=True)
+            current = ProviderService(config).config.get_provider_name()
+            if config.agents.defaults.provider == spec.name or current == spec.name:
+                # An empty selection requires an explicit 'use'; do not silently select another account.
+                config.agents.defaults.provider = ""
+                config.agents.defaults.model = ""
+                config.agents.defaults.reasoning_effort = None
+            setattr(config.providers, spec.name, ProviderConfig(enabled=False))
+            save_config(config, path)
 
     @staticmethod
     def use(path: Path | None, name: str, model: str | None) -> ProviderSelection:
-        config = load_config(path, strict=True)
-        runtime = ProviderService(config).selection(name, model)
-        config.agents.defaults.provider = runtime.name
-        config.agents.defaults.model = runtime.model
-        save_config(config, path)
+        with config_write_lock(path) as path:
+            config = load_config(path, strict=True)
+            runtime = ProviderService(config).selection(name, model)
+            config.agents.defaults.provider = runtime.name
+            config.agents.defaults.model = runtime.model
+            save_config(config, path)
         return runtime
 
     async def test(self, name: str, model: str | None = None) -> str:

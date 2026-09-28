@@ -14,7 +14,12 @@ from pathlib import Path
 import yaml
 
 from PhyAgentOS.config.paths import get_forge_runtime_root, get_skill_bundle_root
-from PhyAgentOS.skill_runtime.archive import ArchiveValidator, sha256_file
+from PhyAgentOS.skill_runtime.archive import (
+    ArchiveError,
+    ArchiveLimits,
+    ArchiveValidator,
+    sha256_file,
+)
 from PhyAgentOS.skill_runtime.locking import SkillOperationBusyError, SkillOperationLock
 from PhyAgentOS.skill_runtime.manifest import NodeLock, SkillManifest, load_manifest
 from PhyAgentOS.skill_runtime.runtime_manifest import normalize_arch, normalize_platform
@@ -25,10 +30,26 @@ class InstallerError(RuntimeError):
     """Raised when an installation cannot be safely committed."""
 
 
+# Forge nodes carry their own runtime tree (for example PyInstaller onedir
+# bundles), so directory archives need room beyond the Skill bundle defaults.
+_NODE_ARCHIVE_LIMITS = ArchiveLimits(
+    max_files=100_000,
+    max_file_size=2 * 1024 * 1024 * 1024,
+    max_total_size=32 * 1024 * 1024 * 1024,
+)
+
+
 def _payload_root(extracted: Path, required: str) -> Path:
     if (extracted / required).is_file():
         return extracted
     raise InstallerError(f"archive root must contain {required}")
+
+
+def _entrypoint_path(lock: NodeLock, install_root: Path) -> Path:
+    """Resolve the executable inside an installed node version directory."""
+    if lock.artifact_type == "directory_tar_gz":
+        return install_root / lock.entrypoint / lock.entrypoint
+    return install_root / lock.entrypoint
 
 
 def _active_skills(store: RuntimeStateStore) -> list[str]:
@@ -171,9 +192,15 @@ class SkillInstaller:
 
 
 class NodeInstaller:
-    """Install SHA-256-pinned ``tar.gz`` assets containing one executable."""
+    """Install SHA-256-pinned node ``tar.gz`` assets.
+
+    ``executable_tar_gz`` archives hold a single root-level executable;
+    ``directory_tar_gz`` archives hold one root directory named after the
+    entrypoint that contains the executable and its runtime tree.
+    """
 
     receipt_name = ".paos-node.json"
+    artifact_types = ("executable_tar_gz", "directory_tar_gz")
 
     def __init__(
         self,
@@ -202,13 +229,17 @@ class NodeInstaller:
         target = versions / lock.artifact_id
         if target.exists():
             if self.satisfies(lock):
-                return target / lock.entrypoint
+                return _entrypoint_path(lock, target)
             raise InstallerError("installed node artifact ID has different contents")
 
         temporary = Path(tempfile.mkdtemp(prefix=".node-install-", dir=versions))
         try:
-            staged = temporary / lock.entrypoint
-            self._extract_executable(archive, staged, lock)
+            if lock.artifact_type == "directory_tar_gz":
+                self._extract_directory(archive, temporary, lock)
+            else:
+                staged = temporary / lock.entrypoint
+                self._extract_executable(archive, staged, lock)
+            staged = _entrypoint_path(lock, temporary)
             staged.chmod(0o755)
             receipt = {
                 "schema_version": 1,
@@ -224,7 +255,7 @@ class NodeInstaller:
                 encoding="utf-8",
             )
             os.replace(temporary, target)
-            return target / lock.entrypoint
+            return _entrypoint_path(lock, target)
         except InstallerError:
             raise
         except Exception as exc:
@@ -234,8 +265,9 @@ class NodeInstaller:
 
     def load(self, lock: NodeLock) -> Path:
         self._verify_lock_host(lock)
-        path = self.root / lock.node_id / "versions" / lock.artifact_id / lock.entrypoint
-        receipt_path = path.parent / self.receipt_name
+        install_root = self.root / lock.node_id / "versions" / lock.artifact_id
+        path = _entrypoint_path(lock, install_root)
+        receipt_path = install_root / self.receipt_name
         if not path.is_file() or path.is_symlink():
             raise InstallerError("installed Forge node executable is missing")
         if path.stat().st_mode & 0o111 == 0:
@@ -274,7 +306,7 @@ class NodeInstaller:
 
     @staticmethod
     def _verify_lock_host(lock: NodeLock) -> None:
-        if lock.artifact_type != "executable_tar_gz":
+        if lock.artifact_type not in NodeInstaller.artifact_types:
             raise InstallerError(f"unsupported Forge node artifact type: {lock.artifact_type}")
         if lock.platform != normalize_platform() or lock.arch != normalize_arch():
             raise InstallerError(
@@ -316,6 +348,42 @@ class NodeInstaller:
             raise
         except (OSError, tarfile.TarError) as exc:
             raise InstallerError(f"invalid Forge node tar.gz archive: {exc}") from exc
+
+    @staticmethod
+    def _extract_directory(archive: Path, staging: Path, lock: NodeLock) -> None:
+        """Extract a ``directory_tar_gz`` tree into ``staging``.
+
+        The archive must contain exactly one root directory named after the
+        lock entrypoint; the executable lives at
+        ``<entrypoint>/<entrypoint>`` inside that tree.
+        """
+        payload = staging / ".payload"
+        validator = ArchiveValidator(_NODE_ARCHIVE_LIMITS, allow_internal_links=True)
+        try:
+            validator.extract(archive, payload, verify_manifest=False)
+        except ArchiveError as exc:
+            raise InstallerError(f"invalid Forge node tar.gz archive: {exc}") from exc
+        root = payload / lock.entrypoint
+        try:
+            entries = [entry.name for entry in payload.iterdir()]
+            if entries != [lock.entrypoint]:
+                raise InstallerError(
+                    "Forge node directory archive must contain exactly one root "
+                    f"directory named after the entrypoint: {', '.join(sorted(entries))}"
+                )
+            if not root.is_dir() or root.is_symlink():
+                raise InstallerError(
+                    "Forge node directory archive root must be a real directory"
+                )
+            executable = root / lock.entrypoint
+            if executable.is_symlink() or not executable.is_file():
+                raise InstallerError(
+                    f"Forge node directory archive must contain executable "
+                    f"'{lock.entrypoint}/{lock.entrypoint}'"
+                )
+            os.replace(root, staging / lock.entrypoint)
+        finally:
+            shutil.rmtree(payload, ignore_errors=True)
 
 
 def _inject_node_environment(

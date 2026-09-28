@@ -127,6 +127,14 @@ paos provider configure custom --api-base http://localhost:8000/v1 --model gpt-5
 `ANTHROPIC_API_KEY`。网关别名不会借用 OpenAI 的密钥。
 运行时环境凭据不落盘，只有明确配置该 Provider 时才保存。
 
+`custom`（Chat Completions）与 `openai_responses`（Responses）均要求显式配置
+`--api-base`；API Key 可省略以连接无鉴权的本地服务。使用需要鉴权的服务时，通过上述
+安全输入方式提供密钥。未配置地址时不会回退到 SDK 默认地址。例如：
+
+```bash
+paos provider configure openai_responses --api-base http://localhost:8000/v1 --model local-model
+```
+
 启动参数只影响新进程：
 
 ```bash
@@ -158,6 +166,17 @@ Custom endpoint 或 Azure 部署别名的能力未知时应使用 `none`；显�
 切换不会重启或停止进程，也不会改写全局默认值。`/provider reset` 清除会话覆盖；`/new` 只清理
 会话上下文，保留当前选择。会话覆盖在进程退出后失效。永久默认值请通过 `paos provider use`
 设置，只影响未来启动的进程。
+
+安全边界：
+
+- `configure`、`use`、`remove` 的配置读—改—写使用跨进程锁；竞争时本次操作不写入，提示稍后
+  重试。不要删除 `.lock` 文件来解锁；锁会在操作结束或进程退出时自动释放。
+- `remove` 不是凭据撤销或运行任务停止操作：已运行进程仍持有自己的配置快照，OAuth 共享
+  登录也不会被删除。需要立即撤销访问时，应在供应商端撤销凭据，并通过现有生命周期流程
+  停止相关进程与任务；不能把本地进程退出视为物理机器人已经停止。
+- 切换不会清空会话历史，后续请求可能把已有上下文发送给新选择的供应商。只配置可信的
+  endpoint，并限制聊天渠道的授权用户。验证子进程是受信任的本地进程，不是隔离不可信代码
+  的安全沙箱；会话切换不扩大 Forge 权限或改变任务 ownership。
 
 使用现有 Docker CLI service：
 

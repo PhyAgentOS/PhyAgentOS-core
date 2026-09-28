@@ -15,6 +15,7 @@ from PhyAgentOS.cli.commands import (
     _apply_startup_overrides,
     _make_evolution_provider,
     _make_forge_verifier,
+    _make_provider,
     app,
 )
 from PhyAgentOS.config.loader import load_config, save_config
@@ -74,6 +75,35 @@ def config_path(tmp_path, config):
     path = tmp_path / "config.json"
     save_config(config, path)
     return path
+
+
+@pytest.mark.parametrize("name", ["custom", "openai_responses"])
+@pytest.mark.parametrize("entrypoint", ["service", "cli"])
+async def test_direct_provider_factory_keeps_dev_client_options(config, name, entrypoint):
+    from PhyAgentOS.providers.custom_provider import CustomProvider
+    from PhyAgentOS.providers.openai_responses_provider import OpenAIResponsesProvider
+
+    cfg = getattr(config.providers, name)
+    cfg.api_key = "test-key"
+    cfg.api_base = "http://localhost:9/v1"
+    cfg.timeout_s = 30.0
+    cfg.max_retries = 0
+    cfg.extra_headers = {"X-Account": "test"}
+    config.agents.defaults.reasoning_effort = "high"
+    # Both the saved config schema and the CLI factory must preserve dev's options.
+    config = Config.model_validate(config.model_dump(by_alias=True))
+    provider = (
+        _make_provider(config, provider_name_override=name, model_override="gpt-5.2")
+        if entrypoint == "cli"
+        else ProviderService(config).resolve(name, "gpt-5.2").provider
+    )
+    try:
+        assert isinstance(provider, CustomProvider if name == "custom" else OpenAIResponsesProvider)
+        assert provider._client.timeout.read == 30.0
+        assert provider._client.max_retries == 0
+        assert provider._client.default_headers["X-Account"] == "test"
+    finally:
+        await provider._client.close()
 
 
 def test_startup_overrides_are_atomic_and_do_not_write(config, config_path):
@@ -1276,3 +1306,192 @@ def test_remove_save_failure_preserves_provider_and_default(config, config_path,
     result = CliRunner().invoke(app, ["provider", "remove", "openai", "-c", str(config_path)])
     assert result.exit_code == 1
     assert config_path.read_bytes() == before
+
+
+async def test_selected_session_provider_failure_keeps_dev_abort_semantics(
+    config, tmp_path, monkeypatch,
+):
+    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.bus.events import InboundMessage
+    from PhyAgentOS.bus.queue import MessageBus
+
+    original = RecordingProvider()
+    selected = RecordingProvider("gpt-5.2")
+    selected.chat = AsyncMock(return_value=LLMResponse(
+        "400: selected provider rejected request", finish_reason="error",
+    ))
+    monkeypatch.setattr(
+        ProviderService, "create_provider",
+        staticmethod(lambda *_args: selected),
+    )
+    agent = AgentLoop(MessageBus(), original, tmp_path, provider_config=config)
+    agent.memory_consolidator.maybe_consolidate_by_tokens = AsyncMock()
+    agent.session_runtimes.command("test:alice", "/provider custom")
+    message = InboundMessage(
+        channel="test", chat_id="alice", sender_id="alice", content="hello",
+        metadata={"message_id": 42},
+    )
+
+    reply = await agent._process_message(message)
+
+    assert reply.content.startswith("LLM call failed:")
+    assert reply.metadata == message.metadata
+    selected.chat.assert_awaited_once()
+    assert selected.chat.call_args.kwargs["model"] == "gpt-5.2"
+    assert original.calls == []
+    session = agent.sessions.get_or_create("test:alice")
+    assert any(m["role"] == "user" and "hello" in str(m["content"]) for m in session.messages)
+    assert all("selected provider rejected" not in str(m.get("content")) for m in session.messages)
+    assert agent.provider is original
+    assert agent.subagents.provider is original
+    assert agent.memory_consolidator.provider is original
+
+
+async def test_responses_provider_accepts_keyless_endpoint(config):
+    cfg = config.providers.openai_responses
+    cfg.api_key = ""
+    cfg.api_base = "http://localhost:9/v1"
+    cfg.default_model = "local-model"
+    service = ProviderService(config)
+    row = next(row for row in service.list() if row["name"] == "openai_responses")
+    assert row["configured"]
+    assert row["auth"] == "optional key"
+    runtime = service.resolve("openai_responses")
+    try:
+        assert runtime.endpoint == cfg.api_base
+        assert runtime.provider.api_key == "no-key"
+        assert str(runtime.provider._client.base_url) == cfg.api_base + "/"
+    finally:
+        await runtime.provider._client.close()
+
+
+def test_responses_provider_requires_explicit_endpoint(config):
+    config.providers.openai_responses.api_key = "endpoint-specific-secret"
+    service = ProviderService(config)
+    assert not service.configured(provider_spec("openai_responses"))
+    with pytest.raises(ProviderError, match="not configured"):
+        service.selection("openai_responses", "gpt-5.2")
+
+
+@pytest.mark.parametrize("command", ["/status", "/provider unknown-provider"])
+async def test_runtime_command_preserves_reply_routing(config, tmp_path, command):
+    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.bus.events import InboundMessage
+    from PhyAgentOS.bus.queue import MessageBus
+
+    agent = AgentLoop(MessageBus(), RecordingProvider(), tmp_path, provider_config=config)
+    message = InboundMessage(
+        channel="telegram", chat_id="chat", sender_id="alice", content=command,
+        metadata={"message_id": 42, "message_thread_id": 7},
+    )
+    reply = await agent._process_message(message)
+    assert reply.channel == message.channel
+    assert reply.chat_id == message.chat_id
+    assert reply.metadata == message.metadata
+    assert reply.metadata is not message.metadata
+
+
+@pytest.mark.parametrize("name", ["custom", "openai_responses"])
+async def test_verifier_child_keeps_its_own_credentials_and_options(config, name, monkeypatch):
+    from PhyAgentOS.verification.service import _provider
+
+    cfg = getattr(config.providers, name)
+    cfg.api_key = "verifier-only-key"
+    cfg.api_base = "http://localhost:9/v1"
+    cfg.extra_headers = {"X-Account": "verifier-only-account"}
+    cfg.max_retries = 0
+    config.agents.verification.provider = name
+    config.agents.verification.model = "gpt-5.2"
+    config.agents.verification.service_enabled = True
+    verifier = _make_forge_verifier(config, RecordingProvider())
+    spec = verifier.service.provider_spec
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ProviderService, "create_provider",
+            staticmethod(lambda _s, _c, model, _e: RecordingProvider(model)),
+        )
+        service = ProviderService(config)
+        sessions = SessionRuntimes(service, service.resolve())
+        sessions.command("alice", "/provider anthropic")
+    child = _provider(spec, timeout_s=12.0)
+    try:
+        assert child.api_key == "verifier-only-key"
+        assert child.api_base == "http://localhost:9/v1"
+        assert child._client.default_headers["X-Account"] == "verifier-only-account"
+        assert child._client.max_retries == 0
+        assert child._client.timeout.read == 12.0
+        assert child.generation.reasoning_effort is None
+        assert spec["provider_name"] == name
+    finally:
+        await child._client.close()
+
+
+def test_verifier_rejects_removed_provider_before_starting_child(config):
+    config.agents.verification.service_enabled = True
+    config.agents.verification.provider = "custom"
+    config.agents.verification.model = "gpt-5.2"
+    config.providers.custom.enabled = False
+    with pytest.raises(ProviderError, match="not configured"):
+        _make_forge_verifier(config, RecordingProvider())
+
+
+async def test_switch_during_transient_failure_keeps_retry_on_original_provider(
+    config, tmp_path, monkeypatch,
+):
+    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.bus.events import InboundMessage
+    from PhyAgentOS.bus.queue import MessageBus
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = RecordingProvider()
+    original._CHAT_RETRY_DELAYS = (0,)
+
+    async def chat(**kwargs):
+        original.calls.append(kwargs)
+        if len(original.calls) == 1:
+            entered.set()
+            await release.wait()
+            return LLMResponse("Provider server error (503)", finish_reason="error")
+        return LLMResponse("done")
+
+    original.chat = chat
+    selected = RecordingProvider("gpt-5.2")
+    monkeypatch.setattr(ProviderService, "create_provider", staticmethod(lambda *_: selected))
+    agent = AgentLoop(MessageBus(), original, tmp_path, provider_config=config)
+    agent.memory_consolidator.maybe_consolidate_by_tokens = AsyncMock()
+    turn = asyncio.create_task(agent._process_message(InboundMessage(
+        channel="test", chat_id="alice", sender_id="alice", content="hello",
+    )))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        agent.session_runtimes.command("test:alice", "/provider custom")
+        assert agent.session_runtimes.get("test:alice").provider is selected
+        release.set()
+        reply = await asyncio.wait_for(turn, timeout=5)
+        assert reply.content == "done"
+        assert len(original.calls) == 2
+        assert all(call["model"] == "gpt-5" for call in original.calls)
+        assert selected.calls == []
+    finally:
+        release.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+
+
+def test_failed_provider_initialization_keeps_session_and_hides_error(config, monkeypatch):
+    service = ProviderService(config)
+    from PhyAgentOS.providers.service import RuntimeSelection
+
+    startup = RuntimeSelection("openai", "gpt-5", None, None, RecordingProvider())
+    sessions = SessionRuntimes(service, startup)
+
+    def fail(*_args):
+        raise RuntimeError("Bearer sk-private-key https://host.test/?token=private-token")
+
+    monkeypatch.setattr(ProviderService, "create_provider", staticmethod(fail))
+    with pytest.raises(ProviderError) as caught:
+        sessions.command("alice", "/provider custom")
+    assert "private" not in str(caught.value)
+    assert sessions.get("alice") is startup
+    assert sessions.get("bob") is startup

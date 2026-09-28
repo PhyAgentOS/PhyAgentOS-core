@@ -59,7 +59,7 @@ def _catalog_levels(info: dict) -> tuple[str, ...]:
 def supported_efforts(spec: ProviderSpec, model: str) -> tuple[str, ...]:
     """Selectable overrides, excluding the application's 'none' reset option."""
     bare = model.split("/")[-1].lower()
-    if spec.name in {"openai_codex", "azure_openai", "custom"}:
+    if spec.name in {"openai_codex", "azure_openai", "custom", "openai_responses"}:
         import litellm
 
         # Direct OpenAI-compatible adapters pass effort through unchanged. Unknown

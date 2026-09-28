@@ -139,7 +139,8 @@ fail-open.
 ## 11. Skill Runtime and Registry boundary
 
 Registry/index clients return artifact metadata and downloads. Cache and installers require size
-and SHA-256, then validate archive inventories and exact single-executable Node locks before atomic installation.
+and SHA-256, then validate archive inventories and the Node archive contract (single root
+executable, or a single root directory tree for `directory_tar_gz`) before atomic installation.
 RuntimeManager starts a named Dora flow and observes Gateway `/tools`; it never calls an alternate
 Gateway Agent API.
 

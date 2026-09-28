@@ -40,6 +40,7 @@ _NODE_LOCK_FIELDS = {
     "entrypoint",
     "sha256",
 }
+_NODE_ARTIFACT_TYPES = {"executable_tar_gz", "directory_tar_gz"}
 
 
 class ManifestError(ValueError):
@@ -146,7 +147,12 @@ class RuntimeProfile:
 
 @dataclass(frozen=True)
 class NodeLock:
-    """Immutable reference to one single-executable ``tar.gz`` release asset."""
+    """Immutable reference to a pinned ``tar.gz`` node release asset.
+
+    ``executable_tar_gz`` archives contain a single root-level executable;
+    ``directory_tar_gz`` archives contain one root directory named after the
+    entrypoint that holds the executable and its runtime tree.
+    """
 
     node_id: str
     artifact_id: str
@@ -171,9 +177,10 @@ class NodeLock:
         artifact_type = _string(
             data.get("artifact_type"), f"{label}.artifact_type"
         ).lower()
-        if artifact_type != "executable_tar_gz":
+        if artifact_type not in _NODE_ARTIFACT_TYPES:
             raise ManifestError(
-                f"{label}.artifact_type must be 'executable_tar_gz'; "
+                f"{label}.artifact_type must be one of "
+                f"{', '.join(sorted(_NODE_ARTIFACT_TYPES))}; "
                 "additional artifact types are reserved for future installers"
             )
         entrypoint = _string(data.get("entrypoint"), f"{label}.entrypoint")

@@ -127,9 +127,12 @@ metadata 和审计所需 tombstone。
 `skill.yaml` 必须使用 `manifest_version: 2`，包含目录安全的 name/version、相对 Skill
 document、HTTP(S) `gateway_url`、非空 required Tools、至少一个 profile，并拒绝未知字段。
 Registry resolver 的 Node 必须包含 artifact identity、version、platform、architecture、
-archive type、单一根目录 executable entrypoint 与 SHA-256。
+archive type（`executable_tar_gz` 或 `directory_tar_gz`）、entrypoint 与 SHA-256。
+`executable_tar_gz` 归档只含一个由 entrypoint 命名的根目录 executable；`directory_tar_gz`
+归档只含一个以 entrypoint 命名的根目录，内放同名 executable 及其运行时树（允许树内相对
+符号链接）。
 
-归档校验拒绝绝对/穿越路径、links、重复或冲突路径、超大文件、展开限制违规、清单缺项与摘要
+归档校验拒绝绝对/穿越路径、links（上述节点树内相对链接除外）、重复或冲突路径、超大文件、展开限制违规、清单缺项与摘要
 不一致。Skill/Node installer 先 staging 与校验，再原子替换目标，并支持 rollback。
 
 RuntimeManager：
