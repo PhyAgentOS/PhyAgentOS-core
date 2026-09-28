@@ -257,52 +257,27 @@ def _normalize(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _provider(spec: dict[str, Any], timeout_s: float):
+    from PhyAgentOS.config.schema import ProviderConfig
     from PhyAgentOS.providers.base import GenerationSettings
+    from PhyAgentOS.providers.service import ProviderService, provider_spec
 
-    name = str(spec["provider_name"])
+    metadata = provider_spec(str(spec["provider_name"]))
     model = str(spec["model"])
-    if name == "custom":
-        from PhyAgentOS.providers.custom_provider import CustomProvider
-
-        provider = CustomProvider(
-            api_key=spec.get("api_key") or "no-key",
-            api_base=spec.get("api_base") or "http://localhost:8000/v1",
-            default_model=model,
-            timeout_s=timeout_s,
-        )
-    elif name == "openai_responses":
-        # Direct /v1/responses — reasoning models reject tools+reasoning on
-        # /v1/chat/completions, so the LiteLLM fallback cannot serve them.
-        from PhyAgentOS.providers.openai_responses_provider import OpenAIResponsesProvider
-
-        provider = OpenAIResponsesProvider(
-            api_key=spec.get("api_key") or "no-key",
-            api_base=spec.get("api_base") or "http://localhost:8000/v1",
-            default_model=model,
-            timeout_s=timeout_s,
-        )
-    elif name == "azure_openai":
-        from PhyAgentOS.providers.azure_openai_provider import AzureOpenAIProvider
-
-        provider = AzureOpenAIProvider(
-            api_key=spec.get("api_key"),
-            api_base=spec.get("api_base"),
-            default_model=model,
-        )
-    elif name == "openai_codex":
-        from PhyAgentOS.providers.openai_codex_provider import OpenAICodexProvider
-
-        provider = OpenAICodexProvider(default_model=model)
-    else:
-        from PhyAgentOS.providers.litellm_provider import LiteLLMProvider
-
-        provider = LiteLLMProvider(
-            api_key=spec.get("api_key"),
-            api_base=spec.get("api_base"),
-            default_model=model,
-            extra_headers=spec.get("extra_headers"),
-            provider_name=name,
-        )
+    endpoint = spec.get("api_base") or metadata.default_api_base or None
+    # Keep the standalone child's legacy local default; the parent resolver
+    # requires an explicit endpoint for managed direct-provider selections.
+    if endpoint is None and metadata.name in {"custom", "openai_responses"}:
+        endpoint = "http://localhost:8000/v1"
+    cfg = ProviderConfig(
+        api_key=spec.get("api_key") or "",
+        api_base=endpoint,
+        extra_headers=spec.get("extra_headers"),
+        timeout_s=timeout_s,
+        max_retries=spec.get("max_retries"),
+    )
+    ProviderService.validate_endpoint(endpoint)
+    ProviderService.validate_headers(cfg.extra_headers)
+    provider = ProviderService.create_provider(metadata, cfg, model, endpoint)
     provider.generation = GenerationSettings(
         temperature=float(spec.get("temperature", 0.0)),
         max_tokens=int(spec.get("max_tokens", 2048)),

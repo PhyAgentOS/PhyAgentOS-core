@@ -15,6 +15,7 @@ import json_repair
 
 from PhyAgentOS.providers._openai_client import build_async_openai_client
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from PhyAgentOS.providers.errors import describe_provider_error
 
 
 class OpenAIResponsesProvider(LLMProvider):
@@ -26,13 +27,16 @@ class OpenAIResponsesProvider(LLMProvider):
         default_model: str = "default",
         timeout_s: float | None = None,
         max_retries: int | None = None,
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         # Timeout / retry reasoning lives with the shared client builder
         # (`providers/_openai_client.py`); configure as
         # `providers.<name>.timeoutS` / `providers.<name>.maxRetries`.
-        self._client = build_async_openai_client(api_key, api_base, timeout_s, max_retries)
+        self._client = build_async_openai_client(
+            api_key, api_base, timeout_s, max_retries, extra_headers=extra_headers
+        )
         # Reasoning models (GPT-5/6, o-series) reject sampling temperature;
         # dropped from requests once the server says so and remembered after.
         self._temperature_supported = True
@@ -49,8 +53,8 @@ class OpenAIResponsesProvider(LLMProvider):
         if self._temperature_supported:
             kwargs["temperature"] = temperature
         if reasoning_effort and reasoning_effort != "none":
-            # 'none' is a chat-completions-only value; the Responses API takes
-            # low/medium/high inside a reasoning object and has no 'none'.
+            # The application uses 'none' to clear the override and restore
+            # model defaults, rather than sending it as an API effort value.
             kwargs["reasoning"] = {"effort": reasoning_effort}
         if tools:
             kwargs["tools"] = [self._to_tool(t) for t in tools]
@@ -64,8 +68,8 @@ class OpenAIResponsesProvider(LLMProvider):
                 try:
                     return self._parse(await self._client.responses.create(**kwargs))
                 except Exception as e2:
-                    return LLMResponse(content=f"Error: {e2}", finish_reason="error")
-            return LLMResponse(content=f"Error: {e}", finish_reason="error")
+                    return LLMResponse(content=describe_provider_error(e2), finish_reason="error")
+            return LLMResponse(content=describe_provider_error(e), finish_reason="error")
 
     # -- request translation -------------------------------------------------
 
@@ -163,14 +167,18 @@ class OpenAIResponsesProvider(LLMProvider):
         else:
             # 'failed' / 'cancelled' / anything unexpected: no completion was
             # obtained. Surface it on the error channel callers check (the
-            # agent loop raises LLMCallError on it) with the server's own
-            # error text — output_text is empty on these statuses anyway.
+            # agent loop raises LLMCallError on it), without exposing remote
+            # error text in replies, logs or background verification records.
             finish_reason = "error"
             error = getattr(response, "error", None)
             detail = getattr(error, "message", None) or (
                 str(error) if error is not None else None
             )
-            content = detail or f"responses API returned status {status!r}"
+            content = (
+                "Responses API request cancelled."
+                if status == "cancelled"
+                else describe_provider_error(detail or "Responses API request failed")
+            )
         u = getattr(response, "usage", None)
         return LLMResponse(
             content=content,

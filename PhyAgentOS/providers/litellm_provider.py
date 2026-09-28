@@ -1,18 +1,18 @@
 """LiteLLM provider implementation for multi-provider support."""
 
 import hashlib
-import os
 import secrets
 import string
 from typing import Any
 
 import json_repair
-import litellm
 from litellm import acompletion
 from loguru import logger
 
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from PhyAgentOS.providers.registry import find_by_model, find_gateway
+from PhyAgentOS.providers.effort import EffortError, apply_litellm_effort
+from PhyAgentOS.providers.errors import describe_provider_error
+from PhyAgentOS.providers.registry import find_by_model, find_by_name, find_gateway
 
 # Standard chat-completion message keys.
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
@@ -44,53 +44,30 @@ class LiteLLMProvider(LLMProvider):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self._spec = find_by_name(provider_name) if provider_name else None
 
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
         # api_key / api_base are fallback for auto-detection.
-        self._gateway = find_gateway(provider_name, api_key, api_base)
+        self._gateway = (
+            find_gateway(provider_name)
+            if self._spec is not None
+            else find_gateway(provider_name, api_key, api_base)
+        )
 
-        # Configure environment variables
-        if api_key:
-            self._setup_env(api_key, api_base, default_model)
-
-        if api_base:
-            litellm.api_base = api_base
-
-        # Disable LiteLLM logging noise
-        litellm.suppress_debug_info = True
-        # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
-        litellm.drop_params = True
-
-    def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
-        """Set environment variables based on detected provider."""
-        spec = self._gateway or find_by_model(model)
-        if not spec:
-            return
-        if not spec.env_key:
-            # OAuth/provider-only specs (for example: openai_codex)
-            return
-
-        # Gateway/local overrides existing env; standard provider doesn't
-        if self._gateway:
-            os.environ[spec.env_key] = api_key
-        else:
-            os.environ.setdefault(spec.env_key, api_key)
-
-        # Resolve env_extras placeholders:
-        #   {api_key}  → user's API key
-        #   {api_base} → user's api_base, falling back to spec.default_api_base
-        effective_base = api_base or spec.default_api_base
-        for env_name, env_val in spec.env_extras:
-            resolved = env_val.replace("{api_key}", api_key)
-            resolved = resolved.replace("{api_base}", effective_base)
-            os.environ.setdefault(env_name, resolved)
+        # Never mutate environment variables or LiteLLM globals: other sessions,
+        # background jobs and already running requests own their configuration.
+        spec = self._spec or self._gateway or find_by_model(default_model)
+        if not self.api_base and spec and spec.default_api_base:
+            self.api_base = spec.default_api_base
 
     def _resolve_model(self, model: str) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
         if self._gateway:
             # Gateway mode: apply gateway prefix, skip provider-specific prefixes
             prefix = self._gateway.litellm_prefix
+            if prefix:
+                model = self._canonicalize_explicit_prefix(model, self._gateway.name, prefix)
             if self._gateway.strip_model_prefix:
                 model = model.split("/")[-1]
             if prefix and not model.startswith(f"{prefix}/"):
@@ -98,7 +75,7 @@ class LiteLLMProvider(LLMProvider):
             return model
 
         # Standard mode: auto-prefix for known providers
-        spec = find_by_model(model)
+        spec = self._spec or find_by_model(model)
         if spec and spec.litellm_prefix:
             model = self._canonicalize_explicit_prefix(model, spec.name, spec.litellm_prefix)
             if not any(model.startswith(s) for s in spec.skip_prefixes):
@@ -245,6 +222,7 @@ class LiteLLMProvider(LLMProvider):
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "drop_params": True,
         }
 
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
@@ -262,21 +240,20 @@ class LiteLLMProvider(LLMProvider):
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
 
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-            kwargs["drop_params"] = True
-
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
         try:
+            apply_litellm_effort(kwargs, reasoning_effort)
             response = await acompletion(**kwargs)
             return self._parse_response(response)
+        except EffortError as e:
+            return LLMResponse(content=str(e), finish_reason="error")
         except Exception as e:
             # Return error as content for graceful handling
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=describe_provider_error(e),
                 finish_reason="error",
             )
 

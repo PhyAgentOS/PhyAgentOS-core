@@ -169,14 +169,15 @@ def test_parse_maps_incomplete_status_to_length() -> None:
     assert parsed.finish_reason == "length"
 
 
-def test_parse_maps_failed_status_to_error_with_server_detail() -> None:
+def test_parse_maps_failed_status_to_safe_error() -> None:
     response = _fake_response(status="failed")
     response.error = SimpleNamespace(message="content policy violation")
 
     parsed = _provider()._parse(response)
 
     assert parsed.finish_reason == "error"
-    assert "content policy violation" in parsed.content
+    assert "Provider request failed" in parsed.content
+    assert "content policy violation" not in parsed.content
 
 
 def test_parse_maps_cancelled_status_to_error_without_error_object() -> None:
@@ -238,7 +239,8 @@ async def test_chat_wraps_errors_as_error_response() -> None:
     response = await provider.chat(messages=[{"role": "user", "content": "hi"}])
 
     assert response.finish_reason == "error"
-    assert "boom" in (response.content or "")
+    assert "Provider request failed" in (response.content or "")
+    assert "boom" not in (response.content or "")
 
 
 async def test_chat_drops_temperature_after_server_rejection() -> None:
@@ -288,3 +290,46 @@ def test_forced_provider_routes_to_openai_responses(tmp_path) -> None:
 
     assert config.get_provider_name(config.agents.defaults.model) == "openai_responses"
     assert config.get_provider(config.agents.defaults.model).api_base == "http://localhost:9/v1"
+
+
+async def test_chat_does_not_echo_remote_credentials() -> None:
+    provider = _provider()
+    await provider._client.close()
+    provider._client = _StubClient(RuntimeError(
+        "401 unauthorized: Bearer sk-private-key https://host.test/?token=private-token"
+    ))
+    response = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+    assert response.finish_reason == "error"
+    assert "Authentication failed" in response.content
+    assert "private" not in response.content
+    assert "host.test" not in response.content
+
+
+async def test_temperature_retry_does_not_echo_remote_credentials() -> None:
+    from unittest.mock import AsyncMock
+
+    provider = _provider()
+    await provider._client.close()
+    create = AsyncMock(side_effect=[
+        RuntimeError("'temperature' is not supported"),
+        RuntimeError("503 server error: sk-private-key"),
+    ])
+    provider._client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    response = await provider.chat(messages=[{"role": "user", "content": "hi"}])
+    assert create.await_count == 2
+    assert response.finish_reason == "error"
+    assert "private" not in response.content
+    assert provider._is_transient_error(response.content)
+
+
+async def test_failed_response_does_not_echo_remote_credentials() -> None:
+    response = _fake_response(status="failed")
+    response.error = SimpleNamespace(message="503 server error: sk-private-key")
+    provider = _provider()
+    try:
+        parsed = provider._parse(response)
+    finally:
+        await provider._client.close()
+    assert parsed.finish_reason == "error"
+    assert "private" not in parsed.content
+    assert OpenAIResponsesProvider._is_transient_error(parsed.content)

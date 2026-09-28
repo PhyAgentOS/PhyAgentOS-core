@@ -46,6 +46,7 @@ def build_async_openai_client(
     api_base: str,
     timeout_s: float | None,
     max_retries: int | None,
+    extra_headers: dict[str, str] | None = None,
 ) -> AsyncOpenAI:
     """Build the shared SDK client for direct OpenAI-compatible providers."""
     # trust_env=False avoids picking up a system SOCKS proxy that uses the
@@ -58,7 +59,7 @@ def build_async_openai_client(
     return AsyncOpenAI(
         api_key=api_key,
         base_url=api_base,
-        default_headers={"x-session-affinity": uuid.uuid4().hex},
+        default_headers={"x-session-affinity": uuid.uuid4().hex, **(extra_headers or {})},
         max_retries=resolve_max_retries(max_retries),
         http_client=http_client,
     )

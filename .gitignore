@@ -22,5 +22,7 @@ botpy.log
 nano.*.save
 SECURITY.md
 .kilo
+*.codegraph
+uv.lock
 plan/
 external/

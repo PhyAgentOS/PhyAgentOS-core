@@ -20,7 +20,7 @@ from typing import Any
 class ProviderSpec:
     """One LLM provider's metadata. See PROVIDERS below for real examples.
 
-    Placeholders in env_extras values:
+    Read-only environment aliases in env_extras values (never exported):
       {api_key}  — the user's API key
       {api_base} — api_base from config, or this spec's default_api_base
     """
@@ -35,7 +35,7 @@ class ProviderSpec:
     litellm_prefix: str = ""  # "dashscope" → model becomes "dashscope/{model}"
     skip_prefixes: tuple[str, ...] = ()  # don't prefix if model already starts with these
 
-    # extra env vars, e.g. (("ZHIPUAI_API_KEY", "{api_key}"),)
+    # Environment input aliases, e.g. (("ZHIPUAI_API_KEY", "{api_key}"),)
     env_extras: tuple[tuple[str, str], ...] = ()
 
     # gateway / local detection
@@ -53,6 +53,9 @@ class ProviderSpec:
 
     # OAuth-based providers (e.g., OpenAI Codex) don't use API keys
     is_oauth: bool = False  # if True, uses OAuth flow instead of API key
+
+    # AWS SDK credential chain (environment, profiles, IAM roles); no API key required.
+    uses_aws_credentials: bool = False
 
     # Direct providers bypass LiteLLM entirely (e.g., CustomProvider)
     is_direct: bool = False
@@ -171,6 +174,16 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # Bedrock delegates authentication and region resolution to the AWS SDK.
+    ProviderSpec(
+        name="bedrock",
+        keywords=("bedrock",),
+        env_key="",
+        display_name="Amazon Bedrock",
+        litellm_prefix="bedrock",
+        skip_prefixes=("bedrock/",),
+        uses_aws_credentials=True,
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(
@@ -278,7 +291,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
     # Zhipu: LiteLLM uses "zai/" prefix.
-    # Also mirrors key to ZHIPUAI_API_KEY (some LiteLLM paths check that).
+    # Also accepts ZHIPUAI_API_KEY as an input alias.
     # skip_prefixes: don't add "zai/" when already routed via gateway.
     ProviderSpec(
         name="zhipu",
@@ -314,7 +327,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
     # Moonshot: Kimi models, needs "moonshot/" prefix.
-    # LiteLLM requires MOONSHOT_API_BASE env var to find the endpoint.
+    # Accepts MOONSHOT_API_BASE as an endpoint input alias.
     # Kimi K2.5 API enforces temperature >= 1.0.
     ProviderSpec(
         name="moonshot",
