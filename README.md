@@ -30,13 +30,9 @@
 <a id="what"></a>
 ## What is PhyAgentOS?
 
-**PhyAgentOS is a Recursive Self-Improvement (RSI) framework for embodied agents.** It connects cognitive planning, physical execution, and experience-driven skill improvement, so agents can use models and tools to act in the world, verify task outcomes, and reuse what they learn in future tasks.
+**PhyAgentOS is a Recursive Self-Improvement (RSI) framework for embodied agents.** It connects cognitive planning, Physical Execution, and task verification in a runtime-wide feedback loop, improving Skills and Lessons from verified experience for future tasks.
 
 ![PhyAgentOS architecture: cognitive planning, physical execution, and the recursive self-improvement loop](docs/imgs/runtime-control-modes.png)
-
-**RSI spans the entire PhyAgentOS Runtime:** planning, physical execution, observation, verification, reflection, and reuse form one feedback loop. The **Cognitive Agent** plans and orchestrates Skills; **Physical Execution** connects those decisions to robots and simulators. Environment observations and execution outcomes support verification and reflection, while guarded Skill updates and scoped Lessons guide future tasks. The **Skill Ecosystem** supplies versioned bundles for explicit installation and deployment.
-
-The diagram shows control relationships, not model-process placement; action models are integrated through the corresponding Skill Runtime. Runtime-wide RSI is a task-level feedback loop coordinated by Agent-side verification and experience services. Skill updates require verification and promotion criteria; they do not occur after every action and do not retrain model weights. See the [architecture](docs/en/01-framework-introduction.md) and [experience & evolution guide](docs/en/05-agent-experience-and-skill-evolution.md) for implementation details.
 
 <a id="why"></a>
 ## Why PhyAgentOS?
@@ -264,7 +260,7 @@ documents Bundle layout, local validation, immutable publication order, and Regi
 | Inspect benchmark values and provenance | [Benchmark](docs/benchmarks.md) |
 | Browse all documentation | [Documentation index](docs/README.md) |
 
-## Changelog · Latest updates
+## News
 
 | Version | Date | Update |
 | --- | --- | --- |

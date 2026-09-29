@@ -30,13 +30,9 @@
 <a id="what"></a>
 ## What · PhyAgentOS 是什么？
 
-**PhyAgentOS 是面向具身智能体的递归自进化（RSI）框架。** 它连接认知规划、物理执行与经验驱动的技能改进，让智能体通过模型和工具与环境交互、验证任务结果，并将积累的经验用于后续任务。
+**PhyAgentOS 是面向具身智能体的递归自进化（RSI）框架。** 它将认知规划、Physical Execution 与任务验证连接为跨 Runtime 的反馈闭环，从经过验证的经验中改进 Skill 与 Lesson，并用于后续任务。
 
 ![PhyAgentOS 宏观架构：认知规划、物理执行与递归自进化闭环](docs/imgs/runtime-control-modes.png)
-
-**RSI 贯穿整个 PhyAgentOS Runtime**：规划、物理执行、观测、验证、反思与经验复用构成统一反馈闭环。**认知 Agent** 负责规划与技能编排，**Physical Execution** 将决策连接到机器人和仿真环境；环境观测与执行结果支撑验证和反思，受控 Skill 更新与作用域 Lesson 再指导后续任务。**技能生态**通过版本化 Bundle 支持显式安装与部署。
-
-图中展示控制关系，不表示模型进程的部署位置；动作模型由对应 Skill Runtime 接入。Runtime-wide RSI 表示跨运行流程的任务级反馈闭环，验证与经验改进由 Agent 侧服务协调；Skill 更新需经过验证和晋升条件，不是每次动作后立即发生，也不涉及模型权重自训练。具体实现见[框架介绍](docs/zh/01-framework-introduction.md)与[经验和自进化指南](docs/zh/05-agent-experience-and-skill-evolution.md)。
 
 <a id="why"></a>
 ## Why · 为什么选择 PhyAgentOS？
@@ -259,7 +255,7 @@ PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical
 | 查看测评数值与来源 | [Benchmark](docs/benchmarks.md) |
 | 浏览全部文档 | [文档索引](docs/README.md) |
 
-## Changelog · 最近更新
+## News · 最新动态
 
 | 版本 | 日期 | 更新 |
 | --- | --- | --- |
