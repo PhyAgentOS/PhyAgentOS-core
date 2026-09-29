@@ -112,7 +112,7 @@ facts but do not fabricate an Action capture window.
 ## 8. Skill Runtime
 
 Skill Runtime manages installed manifest-v2 bundles and explicit named Dora profiles. Bundles use
-safe archive extraction, SHA-256 inventories, exact single-executable node locks, transactional replacement,
+safe archive extraction, SHA-256 inventories, exact single-entrypoint node locks, transactional replacement,
 persistent state, lifecycle logs, and Gateway `/tools` health checks.
 
 Skill discovery priority is workspace override, installed Skill, then built-in Skill. A healthy

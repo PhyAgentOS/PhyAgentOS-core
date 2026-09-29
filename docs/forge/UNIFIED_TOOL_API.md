@@ -55,7 +55,8 @@ PlanRevision to the same task; it does not create another execution plane.
 
 `paos skill` discovers and installs manifest-v2 bundles, verifies SHA-256 inventories, and manages
 an explicit named Dora profile. Installation uses safe extraction and atomic replacement. Each Node
-lock fixes platform, architecture, root executable name, and archive SHA-256; the installer also
+lock fixes platform, architecture, archive type (`executable_tar_gz` or `directory_tar_gz`), the
+entrypoint, and archive SHA-256; the installer also
 records the extracted binary hash. Downloads require
 either `resourceRegistry.url`, `PAOS_RESOURCE_REGISTRY_URL`, or an explicit static index.
 

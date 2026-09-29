@@ -133,8 +133,11 @@ artifacts:
       sha256: <64-character-sha256>
 ```
 
-All paths are relative and contained by the Bundle. Each Node archive has the locked SHA-256 and
-contains exactly one root-level executable with the locked filename; the installer records the
+All paths are relative and contained by the Bundle. Each Node archive has the locked SHA-256.
+An `executable_tar_gz` archive contains exactly one root-level executable with the locked
+filename; a `directory_tar_gz` archive contains exactly one root directory named after the
+entrypoint that holds the same-named executable and its runtime tree (tree-internal relative
+symlinks only). The installer records the
 extracted binary hash in its receipt. The Bundle archive inventory must
 cover every file with SHA-256. Links, path traversal, collisions, oversized expansion, and unlisted
 content are rejected.
@@ -181,8 +184,10 @@ verification.
 
 ### 5.2 Immutable publication order
 
-1. Publish and register every Node artifact first. Each `executable_tar_gz` archive contains only
-   one root-level executable named by `entrypoint`; put the final archive SHA-256 in the Skill lock.
+1. Publish and register every Node artifact first. An `executable_tar_gz` archive contains only
+   one root-level executable named by `entrypoint`; a `directory_tar_gz` archive contains only one
+   root directory named by `entrypoint` (holding the same-named executable and its runtime tree).
+   Put the final archive SHA-256 in the Skill lock.
 2. Freeze the `skill.yaml` name/version, profiles, and Node locks, package the Bundle, and retain the
    printed Bundle SHA-256 and `size_bytes`.
 3. Upload the Bundle to a non-overwritable, long-lived HTTPS object key. Read it back from the final

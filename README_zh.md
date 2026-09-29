@@ -68,21 +68,14 @@ Windows PowerShell 请将激活命令替换为 `.venv\Scripts\Activate.ps1`。
 
 ### 2. 配置模型
 
-在 `~/.PhyAgentOS/config.json` 中修改以下字段，保留其他生成的配置。此例使用 OpenRouter：将 `YOUR_API_KEY` 替换为你的密钥，并选择账号可用的模型。
+通过交互向导输入密钥并选择账号可用的模型，再设置默认 Provider：
 
-```json
-{
-  "agents": {
-    "defaults": {
-      "model": "openrouter/openai/gpt-4o-mini",
-      "provider": "openrouter"
-    }
-  },
-  "providers": {
-    "openrouter": {"apiKey": "YOUR_API_KEY"}
-  }
-}
+```bash
+paos provider configure openrouter
+paos provider use openrouter
 ```
+
+[Provider CLI 指南](docs/zh/02-user-manual.md#2-配置模型与-forge)说明 Docker/Secret 输入、进程覆盖，以及 `/provider`、`/model`、`/effort`、`/status` 会话命令。会话切换只影响后续请求，不改变正在执行的任务或其他会话。
 
 ### 3. 运行第一条请求
 
@@ -179,6 +172,8 @@ paos gateway
 ```
 
 `paos gateway` 运行已配置的消息渠道与后台服务。就绪检查与排障见 [运行手册](docs/user_manual/README.md).
+
+执行节点支持 `executable_tar_gz`（根目录单个可执行文件）和 `directory_tar_gz`（以 entrypoint 命名的根目录及其运行时树）两种归档格式，安装时校验摘要。打包、Node lock 与发布流程见[集成开发指南](docs/user_development_guide/README.md#5-打包发布与本地闭环)。
 
 </details>
 

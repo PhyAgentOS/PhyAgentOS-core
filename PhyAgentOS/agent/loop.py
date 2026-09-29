@@ -30,12 +30,23 @@ from PhyAgentOS.agent.tools.web import WebFetchTool, WebSearchTool
 from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.embodiment_registry import EmbodimentRegistry
-from PhyAgentOS.providers.base import LLMProvider
+from PhyAgentOS.providers.base import LLMCallError, LLMProvider
 from PhyAgentOS.providers.providers_manager import ProvidersManager
+from PhyAgentOS.providers.service import (
+    ProviderError,
+    ProviderService,
+    RuntimeSelection,
+    SessionRuntimes,
+)
 from PhyAgentOS.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from PhyAgentOS.config.schema import AgentEvolutionConfig, ChannelsConfig, ExecToolConfig
+    from PhyAgentOS.config.schema import (
+        AgentEvolutionConfig,
+        ChannelsConfig,
+        Config,
+        ExecToolConfig,
+    )
     from PhyAgentOS.cron.service import CronService
     from PhyAgentOS.forge.task import AgentTaskCoordinator
     from PhyAgentOS.forge.tool_client import ForgeToolClient
@@ -79,6 +90,7 @@ class AgentLoop:
         evolution_config: AgentEvolutionConfig | None = None,
         evolution_provider: LLMProvider | None = None,
         evolution_model: str | None = None,
+        provider_config: Config | None = None,
     ):
         from PhyAgentOS.config.schema import ExecToolConfig
         self.bus = bus
@@ -86,6 +98,16 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.session_runtimes: SessionRuntimes | None = None
+        if provider_config is not None:
+            service = ProviderService(provider_config)
+            self.session_runtimes = SessionRuntimes(service, RuntimeSelection(
+                name=provider_config.get_provider_name(self.model) or "custom",
+                model=self.model,
+                effort=provider.generation.reasoning_effort,
+                endpoint=provider.api_base,
+                provider=provider,
+            ))
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
         self.brave_api_key = brave_api_key
@@ -215,7 +237,10 @@ class AgentLoop:
             self.tools.register(CronTool(self.cron_service))
         if isinstance(self.provider, ProvidersManager):
             self.tools.register(AgentModeTool(self.provider))
-            self.tools.register(ImageTool(self.provider, send_callback=self.bus.publish_outbound))
+        # ImageTool works with any provider: leaf providers ignore the mode
+        # hint (single-model deployments serve multimodal with the same
+        # model), ProvidersManager routes it to a mode-specific provider.
+        self.tools.register(ImageTool(self.provider, send_callback=self.bus.publish_outbound))
 
         self.tools.register(SceneGraphQueryTool(workspace=self.workspace))
         from PhyAgentOS.agent.tools.skill_activation import ActivateSkillTool
@@ -303,23 +328,45 @@ class AgentLoop:
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
         experience_session_key: str | None = None,
+        runtime: RuntimeSelection | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        # Pin the entire turn, including retries and tool iterations, to one
+        # selection. Session commands only replace the next turn's selection.
+        provider = runtime.provider if runtime else self.provider
+        model = runtime.model if runtime else self.model
 
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
 
-            response = await self.provider.chat_with_retry(
+            response = await provider.chat_with_retry(
                 messages=messages,
                 tools=tool_defs,
-                model=self.model,
+                model=model,
             )
+
+            if response.finish_reason == "error":
+                # A failed call is not an answer. Transient failures have already spent
+                # `chat_with_retry`'s retries here; permanent ones (a 400 the endpoint will
+                # reject again) arrive unretried on the first attempt. Either way, surfacing
+                # it beats the alternative this branch used to take: ending the turn with
+                # the provider's error text as the assistant's reply, which the session, the
+                # transcript and the caller all read as a real completion. The partial
+                # conversation rides on the exception so callers can persist what the turn
+                # did manage to do before replying.
+                logger.error(
+                    "LLM call failed, abandoning turn: {}",
+                    (response.content or "no detail")[:200],
+                )
+                raise LLMCallError(
+                    response.content or "provider returned no detail", messages=messages
+                )
 
             if response.has_tool_calls:
                 if on_progress:
@@ -352,12 +399,9 @@ class AgentLoop:
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
-                # poison the context and cause permanent 400 loops (#1303).
-                if response.finish_reason == "error":
-                    logger.error("LLM returned error: {}", (clean or "")[:200])
-                    final_content = clean or "Sorry, I encountered an error calling the AI model."
-                    break
+                # Error responses never reach here: they raise above, before anything is
+                # appended or persisted. That keeps them out of session history, which is
+                # what the previous handling in this branch was protecting against (#1303).
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
@@ -391,6 +435,8 @@ class AgentLoop:
                 await self._handle_stop(msg)
             elif cmd == "/restart":
                 await self._handle_restart(msg)
+            elif response := self._runtime_command(msg):
+                await self.bus.publish_outbound(response)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -456,12 +502,40 @@ class AgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
+            except LLMCallError as exc:
+                # Defensive net: _process_message normally absorbs these into a
+                # failure reply (persisting the partial turn first). If a future
+                # path lets one escape, still answer instead of crashing the
+                # dispatcher — callers like cron and heartbeat have no handler.
+                logger.error("LLM call failed for session {}: {}", msg.session_key, exc.detail)
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"LLM call failed: {exc.detail}",
+                    metadata=dict(msg.metadata or {}),
+                ))
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
                 ))
+
+    def _runtime_command(
+        self, msg: InboundMessage, session_key: str | None = None,
+    ) -> OutboundMessage | None:
+        """Handle session settings without interrupting or waiting for active tasks."""
+        if msg.channel == "system" or self.session_runtimes is None:
+            return None
+        try:
+            content = self.session_runtimes.command(session_key or msg.session_key, msg.content)
+        except ProviderError as exc:
+            content = str(exc)
+        if content is None:
+            return None
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+            metadata=dict(msg.metadata or {}),
+        )
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""
@@ -493,6 +567,15 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
+        command_response = self._runtime_command(msg, session_key)
+        if command_response is not None:
+            return command_response
+        key = session_key or msg.session_key
+        runtime = (
+            self.session_runtimes.get(key)
+            if self.session_runtimes is not None and msg.channel != "system"
+            else None
+        )
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
@@ -520,9 +603,14 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
-                messages, experience_session_key=key
-            )
+            try:
+                final_content, _, all_msgs = await self._run_agent_loop(
+                    messages, experience_session_key=key
+                )
+            except LLMCallError as exc:
+                return self._abort_turn(
+                    session, history, exc, channel, chat_id, metadata=msg.metadata
+                )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
@@ -565,6 +653,11 @@ class AgentLoop:
                 "/new — Start a new conversation",
                 "/stop — Stop the current task",
                 "/restart — Restart the bot",
+                "/provider [list|<provider>] — Show or switch this session's provider",
+                "/model [list|<model-id>] — Show or switch this session's model",
+                "/effort [list|<level>|none] — Show supported levels or set this session's reasoning effort",
+                "/status — Show session, provider, model, effort and endpoint",
+                "/provider reset — Clear session overrides and use startup settings",
                 "/help — Show available commands",
             ]
             return OutboundMessage(
@@ -598,11 +691,17 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            experience_session_key=key,
-        )
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                experience_session_key=key,
+                runtime=runtime,
+            )
+        except LLMCallError as exc:
+            return self._abort_turn(
+                session, history, exc, msg.channel, msg.chat_id, metadata=msg.metadata
+            )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -619,6 +718,34 @@ class AgentLoop:
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
+        )
+
+    def _abort_turn(
+        self,
+        session: Session,
+        history: list[dict],
+        exc: LLMCallError,
+        channel: str,
+        chat_id: str,
+        *,
+        metadata: dict | None = None,
+    ) -> OutboundMessage:
+        """Persist the partial turn and reply with the failure.
+
+        Used when the agent loop cannot obtain a completion. The user's
+        message and any completed tool exchanges still belong in the session
+        (a retry must not start from scratch), while the failure itself is
+        kept out of the history. The reply names the failure so a caller
+        that only sees the outbound message (the CLI, a bench harness
+        reading the session log) can tell a provider error apart from the
+        agent having answered.
+        """
+        logger.error("LLM call failed for session {}: {}", session.key, exc.detail[:200])
+        self._save_turn(session, exc.messages, 1 + len(history))
+        self.sessions.save(session)
+        return OutboundMessage(
+            channel=channel, chat_id=chat_id, content=f"LLM call failed: {exc.detail}",
+            metadata=dict(metadata or {}),
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:

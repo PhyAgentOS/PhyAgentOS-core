@@ -68,21 +68,14 @@ On Windows PowerShell, replace the activation command with `.venv\Scripts\Activa
 
 ### 2. Connect a model
 
-In `~/.PhyAgentOS/config.json`, update the following fields. This example uses OpenRouter; replace `YOUR_API_KEY` with your key and choose a model available to your account. Keep the other generated settings.
+Use the interactive wizard to enter credentials and select a model available to your account, then set the default provider:
 
-```json
-{
-  "agents": {
-    "defaults": {
-      "model": "openrouter/openai/gpt-4o-mini",
-      "provider": "openrouter"
-    }
-  },
-  "providers": {
-    "openrouter": {"apiKey": "YOUR_API_KEY"}
-  }
-}
+```bash
+paos provider configure openrouter
+paos provider use openrouter
 ```
+
+See the [provider CLI guide](docs/en/02-user-manual.md#2-configure-the-model-and-forge) for Docker/secret input, process overrides, and `/provider`, `/model`, `/effort`, `/status` session commands. Session switches affect subsequent turns only, leaving running tasks and other sessions unchanged.
 
 ### 3. Run your first request
 
@@ -179,6 +172,8 @@ paos gateway
 ```
 
 `paos gateway` runs configured message channels and background services. For readiness checks and troubleshooting, see the [operations guide](docs/user_manual/README_en.md).
+
+Execution nodes support `executable_tar_gz` (one root-level executable) and `directory_tar_gz` (an entrypoint-named root directory with its runtime tree), with digest validation at installation. See the [integration guide](docs/user_development_guide/README_en.md#5-package-publish-and-close-the-local-loop) for packaging, Node locks, and publication.
 
 </details>
 

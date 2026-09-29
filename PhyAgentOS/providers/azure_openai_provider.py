@@ -10,6 +10,7 @@ import httpx
 import json_repair
 
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from PhyAgentOS.providers.errors import describe_provider_error
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 
@@ -31,10 +32,12 @@ class AzureOpenAIProvider(LLMProvider):
         api_key: str = "",
         api_base: str = "",
         default_model: str = "gpt-5.2-chat",
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.api_version = "2024-10-21"
+        self.extra_headers = extra_headers or {}
 
         # Validate required parameters
         if not api_key:
@@ -64,6 +67,7 @@ class AzureOpenAIProvider(LLMProvider):
     def _build_headers(self) -> dict[str, str]:
         """Build headers for Azure OpenAI API with api-key header."""
         return {
+            **self.extra_headers,
             "Content-Type": "application/json",
             "api-key": self.api_key,  # Azure OpenAI uses api-key header, not Authorization
             "x-session-affinity": uuid.uuid4().hex,  # For cache locality
@@ -91,6 +95,8 @@ class AzureOpenAIProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Prepare the request payload with Azure OpenAI 2024-10-21 compliance."""
+        if reasoning_effort == "none":
+            reasoning_effort = None
         payload: dict[str, Any] = {
             "messages": self._sanitize_request_messages(
                 self._sanitize_empty_content(messages),
@@ -148,7 +154,7 @@ class AzureOpenAIProvider(LLMProvider):
                 response = await client.post(url, headers=headers, json=payload)
                 if response.status_code != 200:
                     return LLMResponse(
-                        content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
+                        content=describe_provider_error(f"{response.status_code}: {response.text}"),
                         finish_reason="error",
                     )
 
@@ -157,7 +163,7 @@ class AzureOpenAIProvider(LLMProvider):
 
         except Exception as e:
             return LLMResponse(
-                content=f"Error calling Azure OpenAI: {repr(e)}",
+                content=describe_provider_error(e),
                 finish_reason="error",
             )
 

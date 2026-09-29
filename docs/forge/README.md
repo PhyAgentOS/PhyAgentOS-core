@@ -177,7 +177,9 @@ never alters Gateway facts, AgentTask terminal state, or verification attempts.
 Skill Runtime installs and manages manifest-v2 Bundles. Installation requires safe contained
 paths, bounded extraction, SHA-256 file inventory, strict manifest validation, staging, atomic
 replacement, and rollback. Each Node lock fixes artifact ID, version, platform, architecture,
-archive type, root executable name, and SHA-256. Static-index downloads carry size and digest.
+archive type (`executable_tar_gz`: one root-level executable; `directory_tar_gz`: one root
+directory named after the entrypoint holding the executable and its runtime tree), the entrypoint,
+and SHA-256. Static-index downloads carry size and digest.
 Registry Node downloads use the verified Skill lock as the digest authority and resolve an exact
 size from Registry metadata or the direct-download endpoint before entering the cache. Installation
 is explicit and confirmed by default.
