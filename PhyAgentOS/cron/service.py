@@ -88,8 +88,16 @@ class CronService:
         if self.store_path.exists():
             try:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
-                jobs = []
-                for j in data.get("jobs", []):
+            except Exception as e:
+                # Do not let start()'s following _save_store() overwrite the
+                # only copy of the file; move it aside so it stays recoverable.
+                logger.warning("Failed to parse cron store: {}", e)
+                self._quarantine_store()
+                self._store = CronStore()
+                return self._store
+            jobs: list[CronJob] = []
+            for j in data.get("jobs", []):
+                try:
                     jobs.append(CronJob(
                         id=j["id"],
                         name=j["name"],
@@ -118,14 +126,28 @@ class CronService:
                         updated_at_ms=j.get("updatedAtMs", 0),
                         delete_after_run=j.get("deleteAfterRun", False),
                     ))
-                self._store = CronStore(jobs=jobs)
-            except Exception as e:
-                logger.warning("Failed to load cron store: {}", e)
-                self._store = CronStore()
+                except Exception as e:
+                    # One unreadable job must not cost the user the others.
+                    logger.warning("Skipping unreadable cron job {}: {}", j.get("id", "<unknown>"), e)
+            self._store = CronStore(jobs=jobs)
         else:
             self._store = CronStore()
 
         return self._store
+
+    def _quarantine_store(self) -> None:
+        """Move an unreadable store aside so its contents survive."""
+        for n in range(1, 1000):
+            candidate = self.store_path.with_name(f"{self.store_path.name}.corrupt{n}")
+            if not candidate.exists():
+                try:
+                    self.store_path.replace(candidate)
+                except OSError as e:
+                    logger.warning("Could not set the unreadable cron store aside: {}", e)
+                    return
+                logger.warning("Moved the unreadable cron store to {}", candidate.name)
+                return
+        logger.warning("Too many .corrupt files beside the cron store; leaving it in place")
 
     def _save_store(self) -> None:
         """Save jobs to disk."""
