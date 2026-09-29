@@ -175,6 +175,27 @@ Custom endpoint 或 Azure 部署别名的能力未知时应使用 `none`；显�
 支持 `max` 的自适应 Claude 使用 `output_config.effort`，传统 Claude 使用思考预算。
 `none` 始终表示模型默认行为，不代表关闭思考。详见[推理强度](reasoning-effort.md)。
 
+**Requesty 的推理强度限制：** 当前 PAOS 的 Requesty 接入尚不支持显式推理强度档位。
+即使所选模型本身支持推理，`high` 等覆盖值仍会被 PAOS 的本地能力校验拒绝，请求不会发送到
+Requesty。如果原配置或当前会话保留了显式推理强度，切换到 Requesty 或使用它启动时也会失败。
+请清除覆盖值，使用模型默认行为。
+
+已配置 Requesty 凭据后，可以同时切换默认供应商并清除已保存的推理强度：
+
+```bash
+paos provider use requesty --model openai/gpt-5 --reasoning-effort none
+```
+
+仅为本次启动清除覆盖值时，使用：
+
+```bash
+paos agent --provider requesty --model openai/gpt-5 --reasoning-effort none
+```
+
+在已有会话中，先执行 `/effort none`，再执行 `/provider requesty`。直接编辑 JSON 时，
+将 `agents.defaults.reasoningEffort` 设为 `null` 或删除该字段，并在新进程中使用修改后的配置。
+这里的 `none` 仍表示采用模型默认行为，不代表关闭模型推理。
+
 优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
 开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
 子 Agent、Forge 任务、verification、evolution、记忆整理、Cron 和 Heartbeat 继续使用启动配置。

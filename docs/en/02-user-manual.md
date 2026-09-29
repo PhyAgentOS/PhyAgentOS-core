@@ -184,6 +184,28 @@ local catalog support and a working adapter mapping. Gateway choices can differ 
 provider choices. For adaptive Claude, supported `max` maps to `output_config.effort`; legacy
 Claude continues to use thinking budgets. `none` always means model default, not disabled thinking.
 
+**Requesty reasoning effort limitation:** The current PAOS Requesty integration does not support
+explicit reasoning effort levels. Even when the selected model supports reasoning, overrides such
+as `high` are rejected by PAOS's local capability validation before any request reaches Requesty.
+A saved or session-level effort override can therefore prevent startup or switching to Requesty.
+Clear the override to use the model's default behavior.
+
+After configuring Requesty credentials, switch the persistent default and clear the saved effort:
+
+```bash
+paos provider use requesty --model openai/gpt-5 --reasoning-effort none
+```
+
+To clear the override only for a new process, use:
+
+```bash
+paos agent --provider requesty --model openai/gpt-5 --reasoning-effort none
+```
+
+In an existing session, run `/effort none` before `/provider requesty`. When editing JSON directly,
+set `agents.defaults.reasoningEffort` to `null` or remove the field, then start a new process with
+the updated configuration. Here too, `none` uses the model default; it does not disable reasoning.
+
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
 session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.
