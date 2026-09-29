@@ -18,6 +18,7 @@
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
     <a href="#quick-start">快速开始</a> ·
+    <a href="example/quickstart/piper-quickstart.md">Piper 真机示例</a> ·
     <a href="#control-modes">控制方式</a> ·
     <a href="#benchmarks">Benchmark</a> ·
     <a href="#robot-skills">运行机器人技能</a> ·
@@ -253,6 +254,7 @@ PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical
 | 了解 Physical Execution API | [Physical Execution Tool API](docs/forge/README_zh.md) |
 | 开发与测试 Core | [开发者手册](docs/zh/03-developer-manual.md) |
 | 查看测评数值与来源 | [Benchmark](docs/benchmarks.md) |
+| 启动 Piper 真机并验证工具就绪 | [Piper 机械臂快速启动](example/quickstart/piper-quickstart.md) |
 | 浏览全部文档 | [文档索引](docs/README.md) |
 
 ## News · 最新动态

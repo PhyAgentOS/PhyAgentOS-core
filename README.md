@@ -18,6 +18,7 @@
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
     <a href="#quick-start">Quick Start</a> ·
+    <a href="example/quickstart/piper-quickstart.md">Piper Example</a> ·
     <a href="#control-modes">Control Modes</a> ·
     <a href="#benchmarks">Benchmark</a> ·
     <a href="#robot-skills">Robot Skills</a> ·
@@ -258,6 +259,7 @@ documents Bundle layout, local validation, immutable publication order, and Regi
 | Understand the Physical Execution API | [Physical Execution Tool API](docs/forge/README.md) |
 | Develop and test Core | [Developer manual](docs/en/03-developer-manual.md) |
 | Inspect benchmark values and provenance | [Benchmark](docs/benchmarks.md) |
+| Start a Piper robot and verify tool readiness | [Piper quickstart (Chinese)](example/quickstart/piper-quickstart.md) |
 | Browse all documentation | [Documentation index](docs/README.md) |
 
 ## News
