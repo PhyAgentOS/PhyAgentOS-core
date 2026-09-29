@@ -68,14 +68,77 @@ On Windows PowerShell, replace the activation command with `.venv\Scripts\Activa
 
 ### 2. Connect a model
 
-Use the interactive wizard to enter credentials and select a model available to your account, then set the default provider:
+
+Configure credentials with hidden input, then select the default:
 
 ```bash
 paos provider configure openrouter
-paos provider use openrouter
+paos provider use openrouter --model anthropic/claude-sonnet-4
 ```
 
-See the [provider CLI guide](docs/en/02-user-manual.md#2-configure-the-model-and-forge) for Docker/secret input, process overrides, and `/provider`, `/model`, `/effort`, `/status` session commands. Session switches affect subsequent turns only, leaving running tasks and other sessions unchanged.
+See the [provider CLI guide](docs/en/02-user-manual.md#2-configure-the-model-and-forge) for
+Docker/secret input, process overrides and session commands (`/provider`, `/model`, `/effort`, `/status`).
+Session switches affect subsequent turns only and leave running tasks and other sessions unchanged.
+
+<details>
+<summary>Full configuration reference (from dev)</summary>
+
+The configuration file is serialized in camelCase; snake_case keys are also accepted.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.PhyAgentOS/workspace",
+      "model": "openrouter/openai/gpt-4o-mini",
+      "provider": "openrouter"
+    },
+    "verification": {
+      "serviceEnabled": true,
+      "evidenceRetention": "failed",
+      "maxReplansPerEpisode": 2,
+      "maxVerifierCallsPerRun": 50
+    },
+    "evolution": {
+      "enabled": true,
+      "scope": "verified_forge_lineage",
+      "promotionMode": "guarded_auto",
+      "minSuccessfulEpisodes": 3,
+      "minLessonEpisodes": 3,
+      "maxLessonsPerSkill": 8,
+      "maxEvolutionCallsPerRun": 20
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "apiKey": "YOUR_API_KEY"
+    }
+  },
+  "forge": {
+    "requestTimeoutS": 10,
+    "pollIntervalS": 0.5,
+    "executionTimeoutS": 300,
+    "evidence": {
+      "requiredImageSources": ["front"],
+      "captureTimeoutS": 5,
+      "postCaptureTimeoutS": 5,
+      "connectionTimeoutS": 2,
+      "maxArtifactBytes": 8388608,
+      "associationQuality": "best_effort"
+    }
+  },
+  "resourceRegistry": {
+    "url": "https://paos-resource-manager.dev.x-era.com"
+  }
+}
+```
+
+The `front` source is only an example. `resourceRegistry.url` selects a generic package registry;
+it may be empty when all artifacts are installed from local bundles or a supplied static index.
+PAOS connects only to the Gateway URL in the manifest of the explicitly started, healthy Skill
+Runtime. It never starts or downloads a concrete Skill merely because the Agent starts.
+
+</details>
 
 ### 3. Run your first request
 
@@ -173,7 +236,19 @@ paos gateway
 
 `paos gateway` runs configured message channels and background services. For readiness checks and troubleshooting, see the [operations guide](docs/user_manual/README_en.md).
 
-Execution nodes support `executable_tar_gz` (one root-level executable) and `directory_tar_gz` (an entrypoint-named root directory with its runtime tree), with digest validation at installation. See the [integration guide](docs/user_development_guide/README_en.md#5-package-publish-and-close-the-local-loop) for packaging, Node locks, and publication.
+Each Physical Execution Skill bundle declares its workflow document, required Tool IDs, named runtime profiles,
+and exact platform/architecture Node locks. Each locked archive has an exact SHA-256 and contains
+either one named root-level executable (`executable_tar_gz`) or one root directory named after the
+entrypoint that holds the executable and its runtime tree (`directory_tar_gz`). For Registry Node
+downloads, the verified Skill lock supplies the
+digest when the Registry omits that duplicate field, and the exact size is resolved before the
+download begins; installation records and verifies the extracted binary hash.
+`python scripts/package_skill.py <bundle-dir> --output-dir <directory>` creates a deterministic
+bundle for publication. The PhyAgentOS source and release packages do not
+bundle concrete Physical Execution Skills, Physical Execution nodes, models, or simulation assets; obtain only the Skills
+needed for a deployment and install them explicitly.
+The [integration development guide](docs/user_development_guide/README_en.md#5-package-publish-and-close-the-local-loop)
+documents Bundle layout, local validation, immutable publication order, and Registry acceptance.
 
 </details>
 
@@ -193,9 +268,9 @@ Execution nodes support `executable_tar_gz` (one root-level executable) and `dir
 
 | Version | Date | Update |
 | --- | --- | --- |
-| **v1.0.0** | 2026-08-30 | First stable release, with Bridge dependency upgrades and security fixes. |
-| **v0.2.3** | 2026-08-27 | Independently distributed Physical Execution Skills, immutable task bindings, and Query / Action / Session lifecycle management. |
-| **v0.2.2** | 2026-08-21 | Unified Physical Execution Tool API execution, AgentTask orchestration, a verifiable Skill Runtime, and Resource Registry integration. |
+| **v1.0.0** | 2026-08-30 | Initial stable release of PhyAgentOS. |
+| **v0.2.3** | 2026-08-27 | Physical Execution Skills can be installed and managed independently, activated into immutable AgentTask bindings, and used through governed Query, Action, and Session Tool API lifecycles with recovery and version-scoped experience. |
+| **v0.2.2** | 2026-08-21 | Unified Physical Execution execution on the Query/Action Tool API and added AgentTask aggregation, a verifiable Skill Runtime, Resource Registry integration, and the move-arm-by-ee Skill while retaining Agent verification and evolution. |
 
 See the [full changelog](CHANGELOG.md).
 
