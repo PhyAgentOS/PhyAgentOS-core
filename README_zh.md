@@ -1,168 +1,69 @@
 <div align="center">
-  <img src="docs/imgs/logo_en.png" alt="PhyAgentOS" width="560">
-
-  <h3>面向物理智能体的递归自我进化基础设施</h3>
-
+  <img src="docs/imgs/logo_en.png" alt="PhyAgentOS" width="460">
+  <h3>面向具身智能体的递归自进化基础设施</h3>
   <p>
-    <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/stargazers">
-      <img src="https://img.shields.io/github/stars/PhyAgentOS/PhyAgentOS-core?style=social" alt="Stars">
-    </a>
-    <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/network/members">
-      <img src="https://img.shields.io/github/forks/PhyAgentOS/PhyAgentOS-core?style=social" alt="Forks">
-    </a>
+    <a href="https://arxiv.org/abs/2607.16636">技术报告</a> ·
+    <a href="https://phy-agent-os.net/">官网</a> ·
+    <a href="docs/README.md">文档</a> ·
+    <a href="https://discord.gg/YJztZ4wUM">Discord</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/Python-≥3.11-3776AB?logo=python&logoColor=white" alt="Python">
-    <img src="https://img.shields.io/badge/Version-v1.0.0-47A882" alt="Version">
-    <img src="https://img.shields.io/badge/License-MIT-3DA639" alt="License">
-    <a href="https://arxiv.org/pdf/2607.16636">
-      <img src="https://img.shields.io/badge/技术报告-arXiv-b31b1b?logo=arxiv&logoColor=white" alt="技术报告">
-    </a>
-    <a href="https://phy-agent-os.net/">
-      <img src="https://img.shields.io/badge/Website-online-FF6B35" alt="Website">
-    </a>
-    <a href="https://github.com/PhyAgentOS/PhyAgentOS-core">
-      <img src="https://img.shields.io/badge/PRs-Welcome-2EA44F" alt="PRs">
-    </a>
-  <p>
-    <a href="https://space.bilibili.com/3546880296355920?spm_id_from=333.1007.0.0">
-      <img src="https://img.shields.io/badge/Bilibili-00A1D6?logo=bilibili&logoColor=white" alt="Bilibili">
-    </a>
-    <a href="https://www.xiaohongshu.com/user/profile/673d83e3000000001c01a183">
-      <img src="https://img.shields.io/badge/%E5%B0%8F%E7%BA%A2%E4%B9%A6-FF2442?logo=xiaohongshu&logoColor=white" alt="小红书">
-    </a>
-    <a href="https://x.com/phyagentos">
-      <img src="https://img.shields.io/badge/X-000000?logo=x&logoColor=white" alt="X">
-    </a>
-    <a href="https://www.linkedin.com/in/phyagent-os-252372401/">
-      <img src="https://img.shields.io/badge/LinkedIn-0A66C2?logo=linkedin&logoColor=white" alt="LinkedIn">
-    </a>
-    <a href="https://discord.gg/YJztZ4wUM">
-      <img src="https://img.shields.io/badge/Discord-5865F2?logo=discord&logoColor=white" alt="Discord">
-    </a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4264ce" alt="MIT License"></a>
+    <img src="https://img.shields.io/badge/Python-3.11%2B-4264ce?logo=python&amp;logoColor=white" alt="Python 3.11 or newer">
+    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.0.0-4264ce" alt="Release v1.0.0"></a>
+    <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/stargazers"><img src="https://img.shields.io/github/stars/PhyAgentOS/PhyAgentOS-core?style=flat&amp;color=4264ce" alt="GitHub stars"></a>
   </p>
-  </p>
+  <p><a href="README.md">English</a> · <a href="README_zh.md">简体中文</a></p>
   <p>
-    <sub><a href="README.md">English</a> · <a href="README_zh.md">中文</a> · <a href="docs/README.md">文档</a></sub>
+    <a href="#what">What</a> ·
+    <a href="#why">Why</a> ·
+    <a href="#quick-start">快速开始</a> ·
+    <a href="#control-modes">控制方式</a> ·
+    <a href="#benchmarks">Benchmark</a> ·
+    <a href="#robot-skills">运行机器人技能</a> ·
+    <a href="#documentation">文档导航</a>
   </p>
 </div>
 
 ---
 
-PhyAgentOS 是一个面向具身任务的 Agent 框架。Agent 规划高层动作，Forge Tool API 返回 Gateway 的执行事实，观测采集器保存动作前后证据，任务级 Verifier 再判断用户目标是否真正达成。
+<a id="what"></a>
+## What · PhyAgentOS 是什么？
 
-## 📢 更新日志
+**PhyAgentOS 是面向具身智能体的递归自进化（RSI）框架。** 它将认知规划、Physical Execution 与任务验证连接为跨 Runtime 的反馈闭环，从经过验证的经验中改进 Skill 与 Lesson，并用于后续任务。
 
-| 版本 | 日期 | 更新内容 |
-|:-----|:-----|:---------|
-| ![v1.0.0](https://img.shields.io/badge/v1.0.0-47A882) | 2026-08-30 | Initial stable release of PhyAgentOS. |
-| ![v0.2.3](https://img.shields.io/badge/v0.2.3-47A882) | 2026-08-27 | Forge Skill 可独立安装和管理，经显式激活冻结到 AgentTask，并通过受治理的 Query、Action、Session Tool API 生命周期执行，支持恢复和按版本限定的经验。 |
-| ![v0.2.2](https://img.shields.io/badge/v0.2.2-47A882) | 2026-08-21 | 将 Forge 执行统一到 Query/Action Tool API，并增加 AgentTask 聚合、可校验 Skill Runtime、Resource Registry 接入和 move-arm-by-ee Skill，同时保留 Agent 验证与演化能力。 |
-| ![v0.2.1](https://img.shields.io/badge/v0.2.1-47A882) | 2026-08-14 | 增加经验证的任务经验、显式工作流 Skill 激活、受控 Skill 自进化、聚类式作用域 Lesson，以及用于语义验证的 Skill 作用域建议上下文。 |
-| ![v0.2.0](https://img.shields.io/badge/v0.2.0-47A882) | 2026-08-03 | 引入 Forge 执行架构，全面对接 Forge Gateway 1.0.0；新增不可变 Execution/Evidence 公共契约、系统级语义验证、Planner 主导的恢复、崩溃安全 SQLite 编排，并彻底移除旧 Runtime 执行链。 |
-| ![v0.1.7](https://img.shields.io/badge/v0.1.7-47A882) | 2026-07-05 | 支持 Policy loop 与 Target-native builtin 两条 Benchmark 路径，并加入 Agent 验证与失败恢复服务。 |
-| ![v0.1.6](https://img.shields.io/badge/v0.1.6-47A882) | 2026-06-27 | 增加 BEHAVIOR-1K 支持、`SessionVerifier` 与显式 Session 验证工具。 |
-| ![v0.1.5](https://img.shields.io/badge/v0.1.5-47A882) | 2026-06-11 | 清理协议文件与文档，将游戏场景迁移到 `general-game-agent` 分支，主线聚焦仿真与真机工作。 |
-| ![v0.1.4](https://img.shields.io/badge/v0.1.4-11648A) | 2026-06-05 | 改进 onboarding、补充通信协议、优化代码规范，并推进 Game Agent 与 Benchmarking。 |
-| ![v0.1.3](https://img.shields.io/badge/v0.1.3-11648A) | 2026-05-25 | 建立严格的 `PolicySkillRuntime` / `BuiltinSkillRuntime` 分离，并推进 Game Agent Benchmark。 |
-| ![v0.1.2](https://img.shields.io/badge/v0.1.2-11648A) | 2026-05-20 | 引入感知插件系统、Sensor/Perception 配置与可审计的 Environment 写回。 |
-| ![v0.1.1](https://img.shields.io/badge/v0.1.1-11648A) | 2026-05-18 | 发布 Session-Centered Runtime MVP 与初始 Dummy Simulation 执行链。 |
-| ![v0.1.0](https://img.shields.io/badge/v0.1.0-11648A) | 2026-04-29 | 发布 Hackathon 基线，包括插件化 HAL 与早期 ReKep、SAM3、抓取和 VLN 流程。 |
+![PhyAgentOS 宏观架构：认知规划、物理执行与递归自进化闭环](docs/imgs/runtime-control-modes.png)
 
-## 为什么选择 PhyAgentOS？
+<a id="why"></a>
+## Why · 为什么选择 PhyAgentOS？
 
-<table>
-<tr><td width="32">🧭</td><td width="190"><b>唯一执行边界</b></td><td>机器人动作统一进入版本化 Forge Gateway 契约；Agent 不直接访问策略、仿真器、Dora 节点或硬件 SDK。</td></tr>
-<tr><td>🔎</td><td><b>先证据，后结论</b></td><td>绑定 Action 前后的图像与可选机器人状态经过校验后落盘，保留 source、sequence、时间、大小、摘要和 retention 信息。</td></tr>
-<tr><td>🧠</td><td><b>动作无关验证</b></td><td>Verifier 接收 goal、criteria、constraints、执行事实、证据、lineage history 与可选的 Skill 作用域建议，不设计动作专用开关；建议不能替代 criteria 或证据。</td></tr>
-<tr><td>🧱</td><td><b>崩溃安全任务聚合</b></td><td>SQLite 事务持久化 AgentTask、PlanRevision、Query record 与 Gateway invocation 引用，不创建第二套物理执行协议。</td></tr>
-<tr><td>🔄</td><td><b>Planner 主导恢复</b></td><td>恢复判定在同一任务追加有预算的 PlanRevision；未知物理效果必须先核实，不能盲目重试。</td></tr>
-<tr><td>📚</td><td><b>作用域经验</b></td><td>经过验证的 AgentTask 支持可复用工作流 Skill 和聚类 Lesson；无关失败只保留诊断，学习到的指导仅随匹配 Skill 动态加载。</td></tr>
-</table>
+| 核心能力 | 带来的价值 |
+| --- | --- |
+| **一套框架，多种控制方式** | 通过已安装 Skill 暴露的能力，接入通用模型、动作模型或混合控制。 |
+| **以任务结果为准的验证** | 结合观测和执行事实判断目标是否达成，需要恢复时支持有预算的重新规划。 |
+| **让经验改进后续任务** | 从经过验证的经验中积累可复用工作流与作用域 Lesson，并通过受控晋升和版本记录管理改进。 |
+| **可复用的物理执行能力** | 将环境相关工具与 Runtime 封装为版本化 Skill，使认知规划与机器人接入保持解耦。 |
 
-## 架构
+<a id="quick-start"></a>
+## Quickstart · 如何开始使用
 
-```text
-用户 / 消息渠道 / 定时事件
-              │
-              ▼
-      AgentLoop + Planner
-              │  绑定 AgentTask 或无任务调用
-              ▼
-       ForgeToolClient ─────────► AgentTask SQLite + evidence
-              │                         │
-              │ HTTP Tool API           ▼
-              ▼                  ForgeTaskVerifier
- Gateway /tools → ToolInvocation        │
-              │                  verdict / PlanRevision
-              ▼
- ToolEndpoint → Dora → 机器人/仿真器
+先运行模型驱动的 CLI 对话，再按下文接入机器人或仿真 Skill。**准备：** Python 3.11 或 3.12、Git，以及模型服务的 API Key。
 
-终结 AgentTask ───────► Experience Coordinator ──► evolution ledger
-                                │                         │
-                         Skill candidates          scoped Lessons
-                                └──────────► workspace Skills
-```
-
-系统始终分离三类事实：
-
-1. **Execution**：Gateway 执行了哪个 Query，或接纳了哪个 ToolInvocation，以及它如何终结。
-2. **Evidence**：PAOS 在命令执行前后观察到了什么。
-3. **Verdict**：每一项系统级 success criterion 是否满足。
-
-## 核心能力
-
-| 领域 | 当前能力 |
-|:-----|:---------|
-| Forge 契约 | Query、Action 与 Session 经 `/tools`、`/invocations` 进入同一 Tool API。 |
-| 异步编排 | Query 同步返回；Action 与 Session admission 返回 invocation ID，并通过 `/invocations` 核对状态。 |
-| 身份校验 | Agent `task_id`、`revision_id`、Query record ID、Gateway `invocation_id` 与 `attempt_id` 始终分离。 |
-| 证据 | 通过 `/ws/images`、`/ws/state` 异步采集；使用有界最新帧缓存、媒体校验、SHA-256 和 source sequence 边界。 |
-| 验证 | 支持 `off`、`audit`、`enforce`、`recovery`，并生成逐 criteria 的结构化 verdict。 |
-| 恢复 | 在同一 AgentTask 上追加有预算和 deadline 的 PlanRevision，不盲目重试未知效果。 |
-| 持久化 | SQLite WAL AgentTask 事件日志和工作区证据；现有 evolution 数据保持可读。 |
-| 任务经验 | 显式 Skill 激活、去敏 AgentTask episode、异步反思、聚类式作用域 Lesson 与受控 Skill 晋升。 |
-| Skill Runtime | manifest v2 Bundle、SHA-256 清单、安全事务安装、命名 Dora profile、持久化健康状态与显式 Registry 解析。 |
-| Agent 平台 | CLI、多渠道 Gateway、Provider、工具、Skills、MCP、记忆、Cron、Heartbeat 和知识工作区。 |
-
-## 5 分钟快速开始
-
-### 1. 安装
+### 1. 安装与初始化
 
 ```bash
 git clone https://github.com/PhyAgentOS/PhyAgentOS-core.git
 cd PhyAgentOS-core
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install -e .
-
-# 开发与测试依赖
-python -m pip install -e ".[dev]"
-```
-
-推荐 Python 3.11 或 3.12。具体 Forge Skill 及其 Runtime 制品独立分发。
-
-通用 Agent 与 `paos skill install` 不需要 Dora；`paos skill start` 启动托管 Forge Skill
-profile 时，`PATH` 中必须存在 Dora CLI。PhyAgentOS 1.0.0 以 Dora CLI v0.4.1 及
-`dora-message` v0.7.0 作为 Forge Skill 兼容基线。Linux 或 macOS 应安装该精确版本：
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/dora-rs/dora/releases/download/v0.4.1/dora-cli-installer.sh | sh
-dora --version
-# dora-cli 0.4.1
-# dora-message: 0.7.0
-```
-
-Windows、Cargo 安装和生命周期检查见[用户手册](docs/zh/02-user-manual.md#托管-skill-profile-所需的-dora-cli)。
-
-### 2. 初始化工作区
-
-```bash
 paos onboard
 ```
 
-该命令创建 `~/.PhyAgentOS/config.json`，并在 `~/.PhyAgentOS/workspace` 初始化默认工作区。
+Windows PowerShell 请将激活命令替换为 `.venv\Scripts\Activate.ps1`。
 
-### 3. 配置 Provider 与 Forge
+### 2. 配置模型
+
 
 通过隐藏输入配置密钥，再选择默认 Provider：
 
@@ -174,6 +75,9 @@ paos provider use openrouter --model anthropic/claude-sonnet-4
 Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`、`/status` 会话命令见
 [Provider CLI 指南](docs/zh/02-user-manual.md#2-配置模型与-forge)。会话切换只影响后续请求，
 不改变正在执行的任务及其他会话。
+
+<details>
+<summary>完整配置参考（来自 dev）</summary>
 
 配置保存为 camelCase，同时也接受 snake_case 输入。
 
@@ -229,171 +133,144 @@ Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`�
 或显式静态 index 安装时可留空。PAOS 只连接到已显式启动且健康的 Skill Runtime manifest
 所声明的 Gateway URL；启动 Agent 不会隐式启动或下载某个具体 Skill。
 
-其他网关的配置方式相同。使用 [Requesty](https://docs.requesty.ai) 时，设置 `"provider": "requesty"`，
-将 https://app.requesty.ai/api-keys 获取的 key 填入 `providers.requesty.apiKey`，模型 id 直接写
-`openai/gpt-4o-mini` 这类格式，无需 `requesty/` 前缀。将 `providers.requesty.apiBase` 设为
-`https://router.eu.requesty.ai/v1` 即可使用欧盟节点。
+</details>
 
-### 4. 启动 Agent
-
-先启动所需的已安装 Skill Runtime，再选择一种 PAOS 入口：
+### 3. 运行第一条请求
 
 ```bash
-# 交互式 CLI
+paos status
+paos agent -m "Hello! Introduce yourself."
 paos agent
-
-# 单条请求；Agent 可以创建 AgentTask 并将 Tool API 调用绑定到任务
-paos agent -m "先检查 Forge 能力，再把物体放入目标区域，并根据可见结果验证任务。"
-
-# 长期运行消息渠道、Cron、Heartbeat、Agent 与 Forge Tool API 集成
-paos gateway
 ```
 
-使用 `paos status` 检查本地模型与工作区配置；通过 Agent 调用 `forge_tool_context` 获取实时 ToolSpec、binding、readiness、Endpoint status 和 frame profile。
+收到模型回复即完成核心 Agent 与模型服务的连通检查；`paos agent` 会打开交互式对话。执行物理任务还需要启动对应的 Skill Runtime。
 
-## 验证模式
+其他模型服务与部署方式见 [用户手册](docs/zh/02-user-manual.md) · [Docker 部署](docs/user_manual/DOCKER.md).
 
-| 模式 | 任务契约 | 最终结果 | 恢复 |
-|:-----|:---------|:---------|:-----|
-| `off` | goal/criteria 可省略 | 跟随 Gateway 执行状态 | 永不恢复 |
-| `audit` | 必须提供 goal 和至少一项 criterion | 保持执行派生终态，只记录 verdict/error | 永不恢复 |
-| `enforce` | 必须提供 goal 和至少一项 criterion | verdict 决定成功；缺证、非法输出、服务错误和 `inconclusive` 均 fail closed | 不恢复 |
-| `recovery` | 必须提供 goal 和至少一项 criterion | 与 enforce 一样 fail closed；`replan_required` 进入恢复 | Planner 追加 PlanRevision |
+<a id="control-modes"></a>
+## 一套执行框架，三种控制方式
 
-典型的非 `off` 契约如下：
+![通用模型、混合控制与动作模型通过 PhyAgentOS 执行动作](docs/imgs/control-modes-original.jpg)
 
-```json
-{
-  "mode": "recovery",
-  "goal": "红色方块位于托盘内。",
-  "success_criteria": [
-    "红色方块在图像中完全位于托盘边界内。",
-    "没有其他物体被移出工作区。"
-  ],
-  "constraints": [
-    "不要移动蓝色方块。"
-  ],
-  "evidence_policy": {
-    "required_kinds": ["rgb_image"],
-    "required_sources": ["front"],
-    "minimum_association": "best_effort"
-  }
-}
+图中的 System 1 / System 2 沿用所提供原图的命名，分别指通用模型控制与动作模型控制。
+
+以上描述的是接入方式；具体模型与环境取决于安装的 Physical Execution Skill。Core 不捆绑模型权重、仿真资源或机器人驱动。
+
+<a id="benchmarks"></a>
+## Benchmark
+
+以下展示 **LIBERO-Long** 与 **RoboDojo** 上的任务成功率。深色为 PhyAgentOS（PAOS）结果，浅色为公开榜单参考值。
+
+![LIBERO-Long benchmark](docs/imgs/benchmark-libero-long-original.jpg)
+
+![RoboDojo benchmark](docs/imgs/benchmark-robodojo-original.jpg)
+
+| PhyAgentOS 配置 | LIBERO-Long ↑ | RoboDojo ↑ |
+| --- | ---: | ---: |
+| GPT6 + π0.5 | **100.00%** | 23.30% |
+| DeepSeek 4.1 Flash + π0.5 | 97.22% | **26.00%** |
+| GLM 5.3 Flash + π0.5 | — | 20.00% |
+| DeepSeek 4.1 Flash | 82.00% | — |
+
+> 使用维护者提供的评测原图。完整数值与评测口径见 [Benchmark 说明](docs/benchmarks.md)；“—”表示未提供。
+
+<a id="robot-skills"></a>
+## 接入机器人或仿真环境
+
+**Physical Execution Skill** 封装工作流及其运行需求。安装环境对应的 Skill、启动其中一个命名 profile 后，即可让 Agent 使用它。
+
+**1. 为托管 Runtime 安装 Dora**
+
+v1.0.0 的兼容基线为 Dora CLI **0.4.1**（`dora-message` **0.7.0**）。Linux/macOS：
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/dora-rs/dora/releases/download/v0.4.1/dora-cli-installer.sh | sh
+dora --version
 ```
 
-## Agent 可用的 Forge 工具
+`paos skill start` 需要 Dora，上面的 CLI 对话无需安装。[Windows 与 Cargo 安装说明](docs/zh/02-user-manual.md#托管-skill-profile-所需的-dora-cli)。
 
-| 工具 | 用途 |
-|:-----|:-----|
-| `forge_task_create/get/begin_revision/finalize/cancel` | 管理 PAOS 任务聚合与用户级验证生命周期。 |
-| `forge_tool_context` | 读取实时 ToolSpec、binding、readiness、Endpoint status 和 frame profile。 |
-| `forge_tool_query` | 调用同步 Query，可选绑定 AgentTask。 |
-| `forge_tool_start_action` | 接受异步 Action 并保留 Gateway invocation identity。 |
-| `forge_tool_action_status/result/cancel_action` | 查询或请求取消，不能把 cancel accepted 当作物理停止。 |
-| `forge_tool_start_session` | 按绑定策略启动 task-owned、shared 或 runtime-owned Session。 |
-| `forge_tool_session_status/result/stop_session` | 核对 Session，并且只允许生命周期所有者停止它。 |
+**2. 查找并安装 Skill**
 
-诊断用 context 工具始终可用。任务与变更类工具要求存在一个健康且显式活动的 Skill Runtime，
-并使用本轮 primary `activate_skill` 结果冻结出的不可变 Skill binding。
-
-## Forge Skill Runtime
-
-已安装 Skill 通过显式命令管理。Registry 下载必须配置 `resourceRegistry.url`、
-`PAOS_RESOURCE_REGISTRY_URL` 或传入静态 index；Bundle manifest、归档清单和锁定 Node 制品
-校验完成前不会替换本地版本。
+从 Registry 下载时，在配置中设置 `resourceRegistry.url`，或将环境变量 `PAOS_RESOURCE_REGISTRY_URL` 指向部署方提供的 Registry，然后运行：
 
 ```bash
 paos skill search
 paos skill install <skill-name> --version <version>
-# 也可以安装独立获取的本地 Bundle
-paos skill install /path/to/<skill-name>-<version>.tar.gz --local
 paos skill inspect <skill-name>
-paos skill start <skill-name> --profile <profile>
-paos skill status <skill-name>
-# 没有非终态 AgentTask 时，切换到另一个已安装 Runtime
-paos skill switch <other-skill-name> --profile <profile>
-paos skill logs <skill-name>
-paos skill stop <skill-name>
-
-# 也可以安装独立获取的本地 Node 归档
-paos forge-node install <skill-name> <node-id> --archive /path/to/<node>.tar.gz
-paos forge-node verify <skill-name> <node-id>
 ```
 
-每个 Forge Skill Bundle 声明工作流文档、所需 Tool ID、命名 Runtime profile，以及精确的
+将 `<skill-name>`、`<version>` 替换为搜索结果。也可以安装独立获取的本地 Bundle：
+
+```bash
+paos skill install /path/to/skill-bundle.tar.gz --local
+```
+
+**3. 启动 Runtime 并提交任务**
+
+将 `<profile>` 替换为该 Skill 声明的 profile；模型、资源与硬件准备请遵循对应 Skill 的说明。
+
+```bash
+paos skill start <skill-name> --profile <profile>
+paos skill status <skill-name>
+paos agent -m "Inspect the active Skill and Physical Execution capabilities, then report which tasks are available."
+```
+
+Runtime 健康后，在 `paos agent` 中描述该 Skill 支持的任务。启动 Agent 不会自动下载或启动 Runtime。
+
+<details>
+<summary>常用运行管理命令</summary>
+
+```bash
+paos skill list
+paos skill logs <skill-name>
+paos skill stop <skill-name>
+paos gateway
+```
+
+`paos gateway` 运行已配置的消息渠道与后台服务。就绪检查与排障见 [运行手册](docs/user_manual/README.md).
+
+每个 Physical Execution Skill Bundle 声明工作流文档、所需 Tool ID、命名 Runtime profile，以及精确的
 平台/架构 Node lock。每个锁定归档具有精确 SHA-256；`executable_tar_gz` 只包含一个指定文件名的
 根目录可执行文件，`directory_tar_gz` 则只包含一个以 entrypoint 命名的根目录（同名可执行文件及
 其运行时树置于其中）。安装时另行记录并校验解包后的 binary hash。
 `python scripts/package_skill.py <bundle-dir> --output-dir <directory>` 可生成确定性发布 Bundle。
-PhyAgentOS 源码与发布包不内置具体 Forge Skill、Forge node、模型或仿真资源；
+PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical Execution node、模型或仿真资源；
 部署者只需独立获取实际需要的 Skill 并显式安装。
 [集成开发指南](docs/user_development_guide/README.md#5-打包发布与本地闭环)说明 Bundle 布局、
 本地验证、不可变发布顺序与 Registry 验收。
 
-## 任务经验与 Skill 自进化
+</details>
 
-`agents.evolution.enabled=true` 时，Agent 会在首次工具调用前检查已注册 Skill 摘要。`activate_skill(name, role)` 会加载完整工作流及当前任务适用的作用域 Lesson，并记录可审计的任务—Skill 绑定。每个 turn 最多一个 primary Skill，可有多个 supporting Skill；只有 primary 可被自动更新。直接读取 `SKILL.md` 不会建立该绑定。
+<a id="documentation"></a>
+## 文档导航
 
-具有语义判定的 AgentTask 会在后台形成任务级经验：
+| 我想…… | 阅读入口 |
+| --- | --- |
+| 安装、配置并运行 PhyAgentOS | [用户手册](docs/zh/02-user-manual.md) |
+| 开发 Skill 或接入新环境 | [集成开发指南](docs/user_development_guide/README.md) |
+| 了解 Physical Execution API | [Physical Execution Tool API](docs/forge/README_zh.md) |
+| 开发与测试 Core | [开发者手册](docs/zh/03-developer-manual.md) |
+| 查看测评数值与来源 | [Benchmark](docs/benchmarks.md) |
+| 浏览全部文档 | [文档索引](docs/README.md) |
 
-- 与工作流相关的语义失败先形成规范化 observation；同一失败模式默认需要三个独立 AgentTask 支持，才能合成抽象 Lesson 并投影到 `skills/<name>/references/LESSONS.md`；
-- 任务不可满足、Verifier/证据能力不足、外部基础设施问题和不确定归因只记录诊断，不生成 Skill Lesson；
-- 语义成功支持 Skill candidate；默认三个独立成功 AgentTask 后，才可晋升经过校验的 workspace Skill revision；
-- `inconclusive`、非法 verdict、review-only 和 `verification=off` 不训练 Skill。
+## News · 最新动态
 
-已激活 Skill 返回的适用 active Lesson 会随 AgentTask binding 冻结。自动验证、后续 PlanRevision 验证和 review 都使用同一组作用域 Lesson，并且只把它们作为工作流建议。每个 criterion 状态与整体 verdict 都必须依据任务契约、执行事实和合法证据；Lesson 不能证明 criterion，也不能作为 evidence reference。没有激活 Skill 时，不向 Verifier 提供学习型 Lesson。
+| 版本 | 日期 | 更新 |
+| --- | --- | --- |
+| **v1.0.0** | 2026-08-30 | Initial stable release of PhyAgentOS. |
+| **v0.2.3** | 2026-08-27 | Physical Execution Skill 可独立安装和管理，经显式激活冻结到 AgentTask，并通过受治理的 Query、Action、Session Tool API 生命周期执行，支持恢复和按版本限定的经验。 |
+| **v0.2.2** | 2026-08-21 | 将 Physical Execution 执行统一到 Query/Action Tool API，并增加 AgentTask 聚合、可校验 Skill Runtime、Resource Registry 接入和 move-arm-by-ee Skill，同时保留 Agent 验证与演化能力。 |
 
-演化链路 fail-open，不改变 Forge 的提交、执行、证据、验证与恢复流程。Built-in Skill 不会原地修改；晋升结果写为 workspace override，旧版本保存在 `.paos/evolution/`。
+查看[完整更新记录](CHANGELOG.md)。
 
-## 持久化与工作区
+## 参与贡献与社区
 
-```text
-~/.PhyAgentOS/workspace/
-├── AGENTS.md / SOUL.md / USER.md / TOOLS.md / SKILLS.md
-├── EMBODIED.md / ENVIRONMENT.md / LESSONS.md / TASK.md
-├── .paos/agent_tasks/tasks.sqlite3
-├── .paos/evolution/experience.sqlite3
-├── .paos/evolution/revisions/<skill>/
-├── skills/<skill>/SKILL.md
-├── skills/<skill>/references/LESSONS.md
-└── artifacts/agent_tasks/<task_id>/
-    ├── evidence_bundle.json
-    ├── before_snapshot.json / after_snapshot.json
-    └── evidence/
-```
+欢迎报告问题、改进 Skill、接入新环境或完善文档。请先阅读[开发者手册](docs/zh/03-developer-manual.md)，再提交 [Issue](https://github.com/PhyAgentOS/PhyAgentOS-core/issues) 或 Pull Request。
 
-`EMBODIED.md`、`ENVIRONMENT.md` 和 SceneGraph 继续作为知识面存在，但不承担执行队列职责。启用 evolution 后，根目录 `LESSONS.md` 作为旧版/人工材料保留，但不再注入 Agent turn，也不进入 Forge 验证；只有当前任务已激活 Skill 冻结的 active scoped Lesson 可以作为非权威建议随验证请求传入。学习型 Lesson 以经验数据库为事实源。PAOS 不再读取或生成旧 Runtime Markdown queue 文件。
-
-## 项目结构
-
-```text
-PhyAgentOS/
-├── PhyAgentOS/agent/          # AgentLoop、工具、记忆、经验与 Verifier 集成
-├── PhyAgentOS/forge/          # Tool API client、AgentTask 聚合与观测
-├── PhyAgentOS/skill_runtime/  # Bundle 校验/安装与显式 Dora 生命周期
-├── PhyAgentOS/verification/   # 公共契约、请求构造、Engine、Service
-├── PhyAgentOS/channels/       # 消息渠道
-├── PhyAgentOS/config/         # 配置 Schema 与加载
-├── PhyAgentOS/templates/      # Agent 知识/工作区模板
-└── docs/                      # 中英文、运维、接入与 Forge 文档
-```
-
-## 文档
-
-| 文档 | 面向 | 内容 |
-|:-----|:-----|:-----|
-| [Changelog](CHANGELOG.md) | 所有人 | 按 Added、Changed、Security 分类的详细发布记录 |
-| [文档索引](docs/README.md) | 所有人 | 双语阅读路径与完整文档地图 |
-| [框架介绍](docs/zh/01-framework-introduction.md) | 架构师、用户 | 设计、边界、生命周期和当前能力 |
-| [用户手册](docs/zh/02-user-manual.md) | 使用与运维人员 | 安装、配置、任务、Artifact 和排障 |
-| [开发者手册](docs/zh/03-developer-manual.md) | 开发者 | 契约、不变量、扩展点和测试 |
-| [Forge 配置参考](docs/zh/04-forge-configuration-reference.md) | 部署人员 | Forge、Evidence、Verification 和 Task 精确字段 |
-| [Agent 经验与 Skill 自进化](docs/zh/05-agent-experience-and-skill-evolution.md) | 用户、开发者 | Skill 激活、Episode、Lesson 聚类、晋升、持久化与安全门控 |
-| [运行手册](docs/user_manual/README.md) | 运维人员 | 启动、监控、重启、取消与故障处理 |
-| [集成开发指南](docs/user_development_guide/README.md) | 生态开发者 | 不引入 action-specific verifier 的 Gateway action 接入方式 |
-| [Forge Tool API 接入契约](docs/forge/README_zh.md) | Gateway/PAOS 开发者 | Query/Action/Session Tool API、不可变 Skill binding、AgentTask、Runtime、验证与恢复 |
-
-## 开发验证
+<details>
+<summary>开发检查命令</summary>
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -402,28 +279,31 @@ ruff check PhyAgentOS tests
 python -m compileall -q PhyAgentOS tests
 ```
 
-可选黑盒测试可以通过 `FORGE_GATEWAY_URL` 连接运行中的兼容 Gateway。测试与 PAOS 文档不得修改 Gateway 源码或配置。
+</details>
 
-## 参与贡献
+[Discord](https://discord.gg/YJztZ4wUM) · [X](https://x.com/phyagentos) · [Bilibili](https://space.bilibili.com/3546880296355920) · [LinkedIn](https://www.linkedin.com/in/phyagent-os-252372401/) · [小红书](https://www.xiaohongshu.com/user/profile/673d83e3000000001c01a183)
 
-欢迎提交 PR 和 Issue，我们的开发计划可以在此处查看👉 [开发计划](https://phy-agent-os.net/docs/developer-guide/)。
+## 引用与致谢
 
+如果 PhyAgentOS 对你的研究有帮助，欢迎引用我们的[技术报告](https://arxiv.org/abs/2607.16636)。
+
+```bibtex
+@article{liu2026phyagentos,
+  title={PhyAgentOS: A Self-Evolving Operating System for Embodied Agents with Decoupled Cognitive Planning and Physical Execution},
+  author={Liu, Yang and Chen, Weixing and Song, Xinshuai and Pu, Tao and Mo, Siwen and Bai, Yongjie and Chen, Zihao and Sun, Qianran and Zhong, Liruo and Shen, Ying and others},
+  journal={arXiv preprint arXiv:2607.16636},
+  year={2026}
+}
+```
+
+感谢 MuJoCo、ROS、各开放基准的维护者，以及所有 PhyAgentOS 贡献者。
 
 ---
 
 <div align="center">
-
-由 **中山大学 HCP 实验室**、**鹏城实验室** 与 **拓元智慧** 联合开发
-
-<br>
-
-<img src="docs/imgs/HCP.jpg" alt="HCP" height="128">
-&nbsp;&nbsp;&nbsp;
-<img src="docs/imgs/Pengcheng.png" alt="Pengcheng" height="128">
-&nbsp;&nbsp;&nbsp;
-<img src="docs/imgs/logo-xera-mark.png" alt="X-Era Lab" height="128">
-
-<br>
-<sub>MIT License · Copyright © 2025-2026 PhyAgentOS</sub>
-
+  <p>由 <b>中山大学 HCP 实验室</b>、<b>鹏城实验室</b> 与 <b>拓元智慧</b> 联合开发。</p>
+  <img src="docs/imgs/HCP.jpg" alt="HCP Lab" height="64">&nbsp;&nbsp;
+  <img src="docs/imgs/Pengcheng.png" alt="Peng Cheng Laboratory" height="64">&nbsp;&nbsp;
+  <img src="docs/imgs/logo-xera-mark.png" alt="X-Era Lab" height="64">
+  <p><sub>MIT License · Copyright © 2025–2026 PhyAgentOS</sub></p>
 </div>
