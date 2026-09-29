@@ -1,14 +1,14 @@
 [project]
 name = "PhyAgentOS-ai"
 version = "1.0.0"
-description = "Recursive Self-Improvement Infrastructure for Physical Agents"
+description = "A lightweight personal AI assistant framework"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
     {name = "PhyAgentOS contributors"}
 ]
-keywords = ["embodied-ai", "robotics", "agent-os", "verification"]
+keywords = ["ai", "agent", "chatbot"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
