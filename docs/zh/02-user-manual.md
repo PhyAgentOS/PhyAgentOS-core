@@ -196,6 +196,14 @@ paos agent --provider requesty --model openai/gpt-5 --reasoning-effort none
 将 `agents.defaults.reasoningEffort` 设为 `null` 或删除该字段，并在新进程中使用修改后的配置。
 这里的 `none` 仍表示采用模型默认行为，不代表关闭模型推理。
 
+**Cheaper Inference**（`cheaperinference`）的配置方式相同，也有同样的限制。将
+https://cheaperinference.com/signup 获取的 key 填入 `providers.cheaperinference.apiKey`，
+模型 id 直接写 `gpt-5.4-mini` 这类格式：
+
+```bash
+paos provider use cheaperinference --model gpt-5.4-mini --reasoning-effort none
+```
+
 优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
 开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
 子 Agent、Forge 任务、verification、evolution、记忆整理、Cron 和 Heartbeat 继续使用启动配置。

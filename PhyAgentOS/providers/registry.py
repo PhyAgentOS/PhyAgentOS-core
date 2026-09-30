@@ -203,6 +203,24 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # Cheaper Inference: global gateway, OpenAI-compatible, bare model ids like "gpt-5.4-mini".
+    # "custom_openai" sends the model id upstream unchanged, like Requesty.
+    ProviderSpec(
+        name="cheaperinference",
+        keywords=("cheaperinference",),
+        env_key="CHEAPER_INFERENCE_API_KEY",
+        display_name="Cheaper Inference",
+        litellm_prefix="custom_openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="cheaperinference",
+        default_api_base="https://api.cheaperinference.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(
