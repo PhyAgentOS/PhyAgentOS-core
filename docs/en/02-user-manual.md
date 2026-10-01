@@ -206,6 +206,14 @@ In an existing session, run `/effort none` before `/provider requesty`. When edi
 set `agents.defaults.reasoningEffort` to `null` or remove the field, then start a new process with
 the updated configuration. Here too, `none` uses the model default; it does not disable reasoning.
 
+**Cheaper Inference** (`cheaperinference`) is configured the same way and has the same limitation.
+Put a key from https://cheaperinference.com/signup in `providers.cheaperinference.apiKey` and use
+bare model ids such as `gpt-5.4-mini`:
+
+```bash
+paos provider use cheaperinference --model gpt-5.4-mini --reasoning-effort none
+```
+
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
 session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.
