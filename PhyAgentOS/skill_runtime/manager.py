@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -139,6 +140,7 @@ class RuntimeManager:
             self._wait_until_ready(
                 manifest,
                 flow_name,
+                tools=manifest.tools_for_profile(profile_name),
                 timeout_s=self._startup_timeout_s(profile),
             )
             snapshot = self._gateway_snapshot(manifest) or {}
@@ -176,12 +178,15 @@ class RuntimeManager:
                     pass
             except SkillOperationBusyError:
                 startup_in_progress = True
+        tools = manifest.tools_for_profile(state.profile)
         flow_running = self._flow_running(state.flow_name)
         snapshot = self._gateway_snapshot(manifest)
-        contexts = self._tool_context_readiness(manifest) if snapshot is not None else {}
+        contexts = (
+            self._tool_context_readiness(manifest, tools) if snapshot is not None else {}
+        )
         gateway_ready = snapshot is not None
         live_ready = flow_running and gateway_ready and all(
-            contexts.get(tool_id, False) for tool_id in manifest.required_tools
+            contexts.get(tool_id, False) for tool_id in tools
         )
         reconciled = state
         if live_ready and state.status in {"starting", "running", "failed"}:
@@ -200,7 +205,7 @@ class RuntimeManager:
                 reasons.append("Dora flow is not running")
             if not gateway_ready:
                 reasons.append("Gateway GET /tools is unavailable")
-            missing = [tool for tool in manifest.required_tools if not contexts.get(tool, False)]
+            missing = [tool for tool in tools if not contexts.get(tool, False)]
             if missing and gateway_ready:
                 reasons.append(f"Tool context is not ready: {', '.join(missing)}")
             reconciled = state.with_status("failed", error="; ".join(reasons))
@@ -341,7 +346,12 @@ class RuntimeManager:
         return path
 
     def _run_start_hook(self, skill: SkillManifest, profile_name: str) -> None:
-        """Run the PR98 bundle ``start.sh`` hook before launching Dora."""
+        """Run the PR98 bundle ``start.sh`` hook before launching Dora.
+
+        The hook selects profile-specific dependencies (weights, tokenizer,
+        downloads). It receives the bundle identity plus the active profile name
+        through the environment, so a single bundle can serve several profiles.
+        """
         hook = skill.bundle_root / "start.sh"
         if not hook.is_file():
             return
@@ -351,10 +361,19 @@ class RuntimeManager:
                 "bundle start.sh requires bash, but bash is not available on PATH"
             )
         self._log(skill.name, f"running bundle start.sh hook (profile={profile_name})")
+        env = {
+            **os.environ,
+            "PAOS_SKILL_PROFILE": profile_name,
+            "PAOS_HOOK_PYTHON": sys.executable,
+            "PAOS_SKILL_ROOT": str(skill.bundle_root),
+            "PAOS_SKILL_NAME": skill.name,
+            "PAOS_SKILL_VERSION": skill.version,
+        }
         try:
             result = subprocess.run(
                 [bash, str(hook), skill.name, skill.version],
                 check=False,
+                env=env,
             )
         except OSError as exc:
             raise RuntimeManagerError("failed to execute bundle start.sh hook") from exc
@@ -529,6 +548,7 @@ class RuntimeManager:
         manifest: SkillManifest,
         flow_name: str,
         *,
+        tools: tuple[str, ...],
         timeout_s: float,
     ) -> None:
         deadline = time.monotonic() + timeout_s
@@ -539,9 +559,9 @@ class RuntimeManager:
             elif self._gateway_snapshot(manifest) is None:
                 last_reason = "Gateway GET /tools is unavailable"
             else:
-                contexts = self._tool_context_readiness(manifest)
+                contexts = self._tool_context_readiness(manifest, tools)
                 missing = [
-                    tool for tool in manifest.required_tools if not contexts.get(tool, False)
+                    tool for tool in tools if not contexts.get(tool, False)
                 ]
                 if not missing:
                     return
@@ -556,9 +576,11 @@ class RuntimeManager:
             return None
         return value if value.get("ok") is True else None
 
-    def _tool_context_readiness(self, manifest: SkillManifest) -> dict[str, bool]:
+    def _tool_context_readiness(
+        self, manifest: SkillManifest, tools: tuple[str, ...]
+    ) -> dict[str, bool]:
         readiness: dict[str, bool] = {}
-        for tool_id in manifest.required_tools:
+        for tool_id in tools:
             try:
                 value = self._get_json(
                     f"{manifest.gateway_url}/tools/{quote(tool_id, safe='')}/context"

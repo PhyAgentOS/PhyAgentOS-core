@@ -111,7 +111,7 @@ class ForgeSkillBindingResolver:
         if manifest.version != runtime.skill_version:
             raise ForgeSkillBindingError("installed Skill changed after Runtime startup")
         tools: list[BoundToolSpec] = []
-        for tool_id in sorted(manifest.required_tools):
+        for tool_id in sorted(manifest.tools_for_profile(runtime.profile)):
             response = await runtime.client.get_tool(tool_id)
             spec = _response_data(response, f"ToolSpec {tool_id!r}")
             semantics = spec.get("semantics")
