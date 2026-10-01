@@ -214,6 +214,19 @@ bare model ids such as `gpt-5.4-mini`:
 paos provider use cheaperinference --model gpt-5.4-mini --reasoning-effort none
 ```
 
+**[API Route](https://www.api-route.com)** (`api_route`) uses the same gateway configuration.
+Create a key in its dashboard and put it in `providers.api_route.apiKey`, or supply
+`API_ROUTE_API_KEY` / `PAOS_API_ROUTE_API_KEY` at startup. The default endpoint is
+`https://global.api-route.com/v1`; use a model ID available to your key without adding a vendor
+prefix. This integration also uses PAOS's conservative gateway effort validation, so clear any
+explicit reasoning effort when selecting it:
+
+```bash
+paos provider use api_route --model gpt-6.1-sol --reasoning-effort none
+```
+
+In an existing session, use `/effort none` before `/provider api_route`.
+
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
 session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.
