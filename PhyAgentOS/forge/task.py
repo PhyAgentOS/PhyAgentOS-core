@@ -298,6 +298,13 @@ class AgentTaskStore:
                     return task, record
         return None
 
+    def has_event(self, task_id: str, event_type: str) -> bool:
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM agent_task_events WHERE task_id=? AND event_type=? LIMIT 1",
+                (task_id, event_type),
+            ).fetchone() is not None
+
     def events(self, task_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
@@ -382,6 +389,8 @@ class AgentTaskCoordinator:
         self.runtime_session_ids = runtime_session_ids
         self.runtime_task_binding_ids = runtime_task_binding_ids
         self.store = store or AgentTaskStore(self.workspace)
+        from PhyAgentOS.forge.interaction.service import InteractionService
+        self.interaction = InteractionService(self)
         self.max_replans = max(0, int(max_replans))
         self.replan_timeout_s = max(0.1, float(replan_timeout_s))
 
@@ -489,10 +498,13 @@ class AgentTaskCoordinator:
             ),
             origin_session_key=origin_session_key,
         )
+        await self.interaction.freeze(task)
         if binding is not None and self.runtime_task_binding_ids is not None:
             self.runtime_task_binding_ids.add(binding.binding_id)
         try:
             self.store.create(task)
+            if self.interaction.path.exists() and self.interaction.store.binding(task_id):
+                self.store.update(task_id, lambda current: None, event_type="interaction_bound")
         except Exception:
             if binding is not None and self.runtime_task_binding_ids is not None:
                 self.runtime_task_binding_ids.discard(binding.binding_id)
@@ -509,6 +521,7 @@ class AgentTaskCoordinator:
         return self.store.get(task_id)
 
     def begin_revision(self, task_id: str, *, reason: str) -> AgentTaskRecord:
+        self.interaction.assert_settled(task_id)
         task = self.store.get(task_id)
         if task.status != AgentTaskStatus.AWAITING_REPLAN:
             raise AgentTaskError("a new PlanRevision requires awaiting_replan status")
@@ -558,7 +571,7 @@ class AgentTaskCoordinator:
             task_id, tool_id, "query", arguments, tool=tool
         )
         try:
-            response = await self.client.invoke_query_tool(
+            response = await self._execution_client(task_id).invoke_query_tool(
                 tool_id, arguments, caller_id=caller, timeout_ms=timeout_ms
             )
         except Exception as exc:
@@ -600,7 +613,7 @@ class AgentTaskCoordinator:
         invocation_id: str | None = None
         attempt_id: str | None = None
         try:
-            response = await self.client.invoke_action(
+            response = await self._execution_client(task_id).invoke_action(
                 tool_id, arguments, caller_id=caller, timeout_ms=timeout_ms
             )
             data = _response_data(response)
@@ -679,7 +692,9 @@ class AgentTaskCoordinator:
             status in TERMINAL_TOOL_STATUSES - {"unknown"}
             and self.runtime_invocation_ids is not None
         ):
-            self.runtime_invocation_ids.discard(invocation_id)
+            from PhyAgentOS.forge.interaction.client import trusted_runtime
+            runtime = trusted_runtime(self, task_id)
+            (runtime.invocation_ids if runtime is not None else self.runtime_invocation_ids).discard(invocation_id)
 
     def require_action_invocation(
         self, task_id: str, invocation_id: str
@@ -718,6 +733,9 @@ class AgentTaskCoordinator:
         *,
         ownership: Literal["task", "shared"] = "task",
     ) -> dict[str, Any]:
+        from PhyAgentOS.forge.interaction.client import trusted_runtime
+        if self.interaction.managed(task_id) and trusted_runtime(self, task_id) is None:
+            return await self.interaction.start(task_id, tool_id, arguments, ownership)
         if ownership not in {"task", "shared"}:
             raise AgentTaskError("runtime-owned Sessions may only be created by RuntimeManager")
         tool = await self._require_binding_tool(task_id, tool_id, "session")
@@ -732,7 +750,7 @@ class AgentTaskCoordinator:
         invocation_id: str | None = None
         attempt_id: str | None = None
         try:
-            response = await self.client.start_session(
+            response = await self._execution_client(task_id).start_session(
                 tool_id, arguments, caller_id=caller
             )
             data = _response_data(response)
@@ -805,16 +823,25 @@ class AgentTaskCoordinator:
             status in TERMINAL_TOOL_STATUSES - {"unknown"}
             and self.runtime_session_ids is not None
         ):
-            self.runtime_session_ids.discard(invocation_id)
+            from PhyAgentOS.forge.interaction.client import trusted_runtime
+            runtime = trusted_runtime(self, task_id)
+            (runtime.session_ids if runtime is not None else self.runtime_session_ids).discard(invocation_id)
 
     async def stop_session(self, task_id: str, invocation_id: str) -> dict[str, Any]:
+        from PhyAgentOS.forge.interaction.client import trusted_runtime
+        if self.interaction.managed(task_id) and trusted_runtime(self, task_id) is None:
+            self.require_session_invocation(task_id, invocation_id)
+            await self.interaction.cancel(task_id, "session_stop_requested")
+            return {"ok": True, "data": {"status": "requested"}}
         task = self.store.get(task_id)
         record = _owned_execution(task, invocation_id, semantics="session")
         if record.ownership != "task":
             raise AgentTaskError(
                 f"{record.ownership}-owned Session must be stopped by its Runtime owner"
             )
-        response = await self.client.stop_session(invocation_id)
+        self.store.update(task_id, lambda current: None, event_type="session_stop_intent",
+                          payload={"invocation_id": invocation_id})
+        response = await self._execution_client(task_id).stop_session(invocation_id)
 
         def mutate(current: AgentTaskRecord) -> None:
             target = _task_execution(current, record.record_id)
@@ -825,6 +852,8 @@ class AgentTaskCoordinator:
         return response
 
     async def cancel_task(self, task_id: str, *, reason: str) -> AgentTaskRecord:
+        if self.interaction.managed(task_id):
+            return await self.interaction.cancel(task_id, reason)
         task = self.store.get(task_id)
         if task.terminal:
             return task
@@ -844,9 +873,9 @@ class AgentTaskCoordinator:
             assert invocation_id is not None
             try:
                 responses[invocation_id] = (
-                    await self.client.stop_session(invocation_id)
+                    await self._execution_client(task_id).stop_session(invocation_id)
                     if item.semantics == "session"
-                    else await self.client.cancel_invocation(invocation_id)
+                    else await self._execution_client(task_id).cancel_invocation(invocation_id)
                 )
             except Exception as exc:
                 responses[invocation_id] = {
@@ -882,6 +911,7 @@ class AgentTaskCoordinator:
         return result
 
     async def finalize_task(self, task_id: str) -> AgentTaskRecord:
+        await self.interaction.validate_finalization(task_id)
         task = self.store.get(task_id)
         if task.terminal:
             return task
@@ -904,7 +934,7 @@ class AgentTaskCoordinator:
         await self._capture_after(task_id)
         task = self.store.get(task_id)
         if task.cancellation_requested:
-            status = _cancel_terminal_status(task)
+            status = AgentTaskStatus.CANCELLED if self.interaction.managed(task_id) else _cancel_terminal_status(task)
             result = self.store.update(
                 task_id,
                 lambda current: setattr(current, "status", status),
@@ -950,6 +980,10 @@ class AgentTaskCoordinator:
                 task_id, str(exc) or type(exc).__name__
             )
 
+        await self.interaction.validate_finalization(task_id)
+        if self.interaction.managed(task_id) and self.store.get(task_id).cancellation_requested:
+            return await self.finalize_task(task_id)
+
         def mutate(current: AgentTaskRecord) -> None:
             current.verdict = verdict
             current.verification_attempts.append(attempt)
@@ -983,6 +1017,7 @@ class AgentTaskCoordinator:
         return result
 
     def _verification_error(self, task_id: str, message: str) -> AgentTaskRecord:
+        self.interaction.assert_settled(task_id)
         task = self.store.get(task_id)
         status = (
             AgentTaskStatus.SUCCEEDED
@@ -1014,7 +1049,11 @@ class AgentTaskCoordinator:
 
     async def reconcile_nonterminal(self) -> AgentTaskRecord | None:
         """Repair local execution facts from Gateway GETs without redispatching POSTs."""
+        if self.interaction.supervisor is not None:
+            await self.interaction.supervisor.recover()
         task = self.store.active()
+        if task is not None and self.interaction.managed(task.task_id):
+            return task
         if task is None:
             return None
         binding = task.primary_skill_binding
@@ -1044,7 +1083,7 @@ class AgentTaskCoordinator:
             if tracker is not None:
                 tracker.add(record.invocation_id)
             try:
-                response = await self.client.invocation_status(record.invocation_id)
+                response = await self._execution_client(task.task_id).invocation_status(record.invocation_id)
             except Exception as exc:
                 self._finish_execution(
                     task.task_id,
@@ -1060,6 +1099,20 @@ class AgentTaskCoordinator:
             else:
                 self.observe_action(task.task_id, record.invocation_id, response)
         return self.store.get(task.task_id)
+
+    def _execution_client(self, task_id):
+        from PhyAgentOS.forge.interaction.client import trusted_runtime
+        runtime = trusted_runtime(self, task_id)
+        return runtime.client if runtime is not None else self.client
+
+    async def cancel_action(self, task_id: str, invocation_id: str):
+        self.require_action_invocation(task_id, invocation_id)
+        if self.interaction.managed(task_id):
+            await self.interaction.cancel(task_id, "action_cancel_requested")
+            return {"ok": True, "data": {"status": "requested"}}
+        response = await self.client.cancel_invocation(invocation_id)
+        self.record_cancel_response(task_id, invocation_id, response)
+        return response
 
     def capabilities_summary(self) -> str:
         return (
@@ -1082,6 +1135,7 @@ class AgentTaskCoordinator:
         tool_id: str,
         semantics: Literal["query", "action", "session"],
     ) -> BoundToolSpec:
+        self.interaction.guard_call(task_id, tool_id, semantics)
         task = self._require_executable(task_id)
         binding = task.primary_skill_binding
         if binding is None and self.binding_resolver is None:
@@ -1096,6 +1150,10 @@ class AgentTaskCoordinator:
         if binding is None or self.binding_resolver is None:
             raise AgentTaskError("AgentTask has no frozen primary Forge Skill binding")
         try:
+            from PhyAgentOS.forge.interaction.client import trusted_runtime
+            runtime = trusted_runtime(self, task_id)
+            if runtime is not None:
+                return await self.binding_resolver.validate_tool(binding, tool_id, semantics, runtime=runtime)
             return await self.binding_resolver.validate_tool(binding, tool_id, semantics)
         except ForgeSkillBindingError as exc:
             raise AgentTaskError(str(exc)) from exc
@@ -1115,6 +1173,8 @@ class AgentTaskCoordinator:
         caller_id = f"paos:{task_id}:{task.active_revision_id}:{record_id}"
 
         def mutate(current: AgentTaskRecord) -> None:
+            if current.cancellation_requested or current.status != AgentTaskStatus.EXECUTING:
+                raise AgentTaskError("task stopped accepting dispatch")
             current.active_revision.execution_records.append(
                 ToolExecutionRecord(
                     record_id=record_id,
@@ -1170,6 +1230,10 @@ class AgentTaskCoordinator:
         kind: str,
     ) -> dict[str, Any]:
         """Retain an admitted remote identity even when Runtime-state tracking fails."""
+        from PhyAgentOS.forge.interaction.client import trusted_runtime
+        runtime = trusted_runtime(self, task_id)
+        if runtime is not None:
+            tracker = runtime.session_ids if kind == "Session" else runtime.invocation_ids
         if tracker is None:
             return response
         try:
@@ -1204,6 +1268,8 @@ class AgentTaskCoordinator:
             return enriched
 
     async def _capture_before(self, task_id: str) -> None:
+        if self.interaction.managed(task_id):
+            return  # Initial executor snapshot is recorded before the first proposal.
         task = self.store.get(task_id)
         writer = ForgeEvidenceWriter(
             self.workspace,
@@ -1233,6 +1299,10 @@ class AgentTaskCoordinator:
         self.store.update(task_id, mutate, event_type="before_evidence_captured")
 
     async def _capture_after(self, task_id: str) -> None:
+        if self.interaction.managed(task_id):
+            from PhyAgentOS.forge.interaction.evidence import write_task_evidence
+            write_task_evidence(self, task_id)
+            return
         task = self.store.get(task_id)
         writer = ForgeEvidenceWriter(
             self.workspace,
@@ -1307,6 +1377,7 @@ class AgentTaskCoordinator:
         )
 
     def _schedule_experience(self, task: AgentTaskRecord) -> None:
+        self.interaction.assert_settled(task.task_id)
         if (
             task.terminal
             and task.primary_skill_binding is not None

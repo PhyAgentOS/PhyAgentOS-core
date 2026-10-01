@@ -19,6 +19,8 @@ The PhyAgentOS team maintains this directory for users, operators, and ecosystem
 
 ### 专题手册
 
+- [Game 接入前通用交互基础](interaction/README.md)：可选协议、真实任务治理、后台 Runner、恢复安全门及假环境验收。
+
 - [运行手册](user_manual/README.md)：上线前检查、启动顺序、状态观测、取消、重启恢复、备份与故障分层。
 - [Docker 部署指南](user_manual/DOCKER.md)：基于 Docker 的快速部署，配合一键脚本完成构建、初始化与运行（仅外连网关，无入站端口）。
 - [集成开发指南](user_development_guide/README.md)：Tool/Node/Skill 接入、Bundle 打包与不可变发布、本地闭环、证据源、Provider 和 PAOS 扩展边界。
@@ -49,6 +51,8 @@ The PhyAgentOS team maintains this directory for users, operators, and ecosystem
 5. [Agent Experience and Skill Evolution](en/05-agent-experience-and-skill-evolution.md): Skill activation and attribution, episodes, Lesson clustering, Skill promotion, persistence, and guardrails.
 
 ### Focused manuals
+
+- [Governed Interaction Foundation](interaction/README.md): opt-in contracts, task governance, background monitoring, recovery gates and fake-world acceptance.
 
 - [Operations Manual](user_manual/README_en.md): preflight checklist, startup order, observation, cancellation, restart recovery, backup, and failure layers.
 - [Docker Deployment Guide](user_manual/DOCKER_en.md): Docker-based quick deployment with a one-click script for build, init, and run (outbound-only gateway, no inbound port).

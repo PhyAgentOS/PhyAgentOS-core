@@ -286,6 +286,12 @@ class ForgeEvidenceConfig(Base):
     association_quality: Literal["best_effort"] = "best_effort"
 
 
+class InteractionConfig(Base):
+    """Opt-in interaction scheduling; enabling is not deployment authorization."""
+
+    enabled: bool = False
+
+
 class ForgeConfig(Base):
     """Agent-side timeout and evidence policy for an active Forge Skill runtime."""
 
@@ -293,6 +299,7 @@ class ForgeConfig(Base):
     poll_interval_s: float = Field(default=0.5, ge=0.1, le=5.0)
     execution_timeout_s: float = Field(default=300.0, gt=0)
     evidence: ForgeEvidenceConfig = Field(default_factory=ForgeEvidenceConfig)
+    interaction: InteractionConfig = Field(default_factory=InteractionConfig)
 
 DEFAULT_RESOURCE_REGISTRY_URL = "https://paos-resource-manager.dev.x-era.com"
 

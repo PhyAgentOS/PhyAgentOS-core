@@ -1,5 +1,6 @@
 """Tool registry for dynamic tool management."""
 
+from contextlib import nullcontext
 from typing import Any
 
 from PhyAgentOS.agent.tools.base import Tool
@@ -12,7 +13,8 @@ class ToolRegistry:
     Allows dynamic registration and execution of tools.
     """
 
-    def __init__(self):
+    def __init__(self, policy=None):
+        self.policy = policy
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
@@ -33,7 +35,8 @@ class ToolRegistry:
 
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
-        return [tool.to_schema() for tool in self._tools.values()]
+        return [tool.to_schema() for tool in self._tools.values()
+                if self.policy is None or self.policy.allows(tool.name)]
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
         """Execute a tool by name with given parameters."""
@@ -51,7 +54,8 @@ class ToolRegistry:
             errors = tool.validate_params(params)
             if errors:
                 return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + hint
-            result = await tool.execute(**params)
+            with self.policy.tool_call(name) if self.policy is not None else nullcontext():
+                result = await tool.execute(**params)
             if isinstance(result, str) and result.startswith("Error"):
                 return result + hint
             return result
