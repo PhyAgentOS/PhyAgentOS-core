@@ -18,6 +18,7 @@
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
     <a href="#quick-start">Quick Start</a> ·
+    <a href="#quickstart-examples">Examples</a> ·
     <a href="#control-modes">Control Modes</a> ·
     <a href="#benchmarks">Benchmark</a> ·
     <a href="#robot-skills">Robot Skills</a> ·
@@ -247,6 +248,13 @@ The [integration development guide](docs/user_development_guide/README_en.md#5-p
 documents Bundle layout, local validation, immutable publication order, and Registry acceptance.
 
 </details>
+
+<a id="quickstart-examples"></a>
+## Quickstart examples
+
+| Platform | Coverage | Guide |
+| --- | --- | --- |
+| Piper robot arm | Skill installation, CAN setup, hardware startup, and tool readiness | [Piper quickstart (Chinese)](example/quickstart/piper-quickstart.md) |
 
 <a id="documentation"></a>
 ## Documentation
