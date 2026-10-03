@@ -221,6 +221,23 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # API Route: OpenAI-compatible gateway; preserve upstream model IDs.
+    ProviderSpec(
+        name="api_route",
+        keywords=("api_route", "api-route"),
+        env_key="API_ROUTE_API_KEY",
+        display_name="API Route",
+        litellm_prefix="custom_openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="api-route.com",
+        default_api_base="https://global.api-route.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(
