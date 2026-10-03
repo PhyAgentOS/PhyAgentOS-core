@@ -201,6 +201,8 @@ class ForgeToolClient:
         payload: dict[str, Any] | None = None,
         expected_statuses: set[int],
     ) -> dict[str, Any]:
+        from PhyAgentOS.forge.interaction.client import check_transport_dispatch
+        check_transport_dispatch(self, method, path)
         try:
             response = await self._client.request(method, path, json=payload)
         except httpx.TimeoutException as exc:

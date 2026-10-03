@@ -179,7 +179,8 @@ class AgentLoop:
             self.forge_task_coordinator.set_experience(self.experience)
             self.forge_task_coordinator.set_activation_manager(self.skill_activation)
         self.sessions = session_manager or SessionManager(workspace)
-        self.tools = ToolRegistry()
+        interaction = self.forge_task_coordinator.interaction if self.forge_task_coordinator else None
+        self.tools = ToolRegistry(policy=interaction)
         self.embodiment_registry = embodiment_registry
         self.subagents = SubagentManager(
             provider=provider,
@@ -190,6 +191,7 @@ class AgentLoop:
             web_proxy=web_proxy,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            tool_policy=interaction,
         )
 
         self._running = False
@@ -264,6 +266,17 @@ class AgentLoop:
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
         if not self._forge_reconciled and self.forge_task_coordinator is not None:
+            interaction = self.forge_task_coordinator.interaction
+            if interaction.supervisor is not None and interaction.supervisor.notify is None:
+                async def notify_interaction(task_id, summary):
+                    task = self.forge_task_coordinator.get_task(task_id)
+                    origin = task.origin_session_key or "cli:direct"
+                    channel, _, chat_id = origin.partition(":")
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=channel, chat_id=chat_id or "direct",
+                        content="Interaction task: " + json.dumps(summary, ensure_ascii=False),
+                        metadata={"interaction_task_id": task_id}))
+                interaction.supervisor.notify = notify_interaction
             await self.forge_task_coordinator.reconcile_nonterminal()
             self._forge_reconciled = True
         if self.experience is not None:
@@ -421,6 +434,8 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
+        if self.forge_task_coordinator is not None:
+            self.forge_task_coordinator.interaction.long_lived = True
         await self._connect_mcp()
         logger.info("Agent loop started")
 
@@ -482,6 +497,7 @@ class AgentLoop:
         ))
 
         async def _do_restart():
+            await self.close_mcp()
             await asyncio.sleep(1)
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -538,7 +554,11 @@ class AgentLoop:
         )
 
     async def close_mcp(self) -> None:
-        """Close MCP connections."""
+        """Persist interaction shutdown before closing its transport."""
+        if self.forge_task_coordinator is not None:
+            supervisor = self.forge_task_coordinator.interaction.supervisor
+            if supervisor is not None:
+                await supervisor.shutdown()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -551,6 +571,8 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
+        if self.forge_task_coordinator is not None:
+            self.forge_task_coordinator.interaction.closing = True
         if self.experience is not None:
             self.experience.stop()
         if (
@@ -792,6 +814,8 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
+        if self.forge_task_coordinator is not None:
+            self.forge_task_coordinator.interaction.long_lived = self._running
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)

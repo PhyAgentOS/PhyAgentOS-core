@@ -32,8 +32,10 @@ class SubagentManager:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        tool_policy=None,
     ):
         from PhyAgentOS.config.schema import ExecToolConfig
+        self.tool_policy = tool_policy
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
@@ -54,6 +56,8 @@ class SubagentManager:
         session_key: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
+        if self.tool_policy is not None and not self.tool_policy.allows("spawn"):
+            raise RuntimeError("delegation is unavailable in interaction mode")
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
@@ -89,7 +93,7 @@ class SubagentManager:
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
-            tools = ToolRegistry()
+            tools = ToolRegistry(policy=self.tool_policy)
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
             tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
