@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PhyAgentOS.cron.service import CronService
 
@@ -41,8 +42,8 @@ class TestCronStoreLoad(unittest.IsolatedAsyncioTestCase):
 
     async def _start(self) -> CronService:
         service = CronService(store_path=self.path)
-        await service.start()
         self.addCleanup(service.stop)
+        await service.start()
         return service
 
     def _on_disk(self) -> list[dict]:
@@ -73,6 +74,57 @@ class TestCronStoreLoad(unittest.IsolatedAsyncioTestCase):
         kept = self._on_disk()
         self.assertEqual([j["id"] for j in kept], ["job1", "job2", "job3"])
         self.assertEqual(len(service._store.jobs), 3)
+
+    async def test_non_object_jobs_do_not_discard_the_others(self) -> None:
+        self.path.write_text(
+            json.dumps({"jobs": [_job(1), None, 42, "bad", [], _job(2)]}), encoding="utf-8"
+        )
+
+        service = await self._start()
+
+        self.assertEqual([j.id for j in service._store.jobs], ["job1", "job2"])
+        self.assertEqual([j["id"] for j in self._on_disk()], ["job1", "job2"])
+
+    async def test_invalid_store_structure_is_preserved_for_recovery(self) -> None:
+        invalid_stores = [None, [], 42, "bad", {"jobs": None}, {"jobs": {}}, {"jobs": "bad"}, {"jobs": 42}]
+        for data in invalid_stores:
+            with self.subTest(data=data):
+                original = json.dumps(data)
+                self.path.write_text(original, encoding="utf-8")
+
+                await self._start()
+
+                self.assertEqual(self._on_disk(), [])
+                self.assertIn(original, [
+                    p.read_text(encoding="utf-8")
+                    for p in self.path.parent.glob("cron.json.corrupt*")
+                ])
+
+    async def test_failed_quarantine_does_not_overwrite_the_store(self) -> None:
+        original = '{"jobs": [{"id": "recoverable"'
+        self.path.write_text(original, encoding="utf-8")
+
+        # Simulate a failed rename while leaving writes to the file possible.
+        with patch.object(Path, "replace", side_effect=PermissionError("rename denied")):
+            with self.assertRaises(PermissionError):
+                await self._start()
+
+        self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+
+    async def test_exhausted_quarantine_names_do_not_overwrite_the_store(self) -> None:
+        original = '{"jobs": [{"id": "recoverable"'
+        self.path.write_text(original, encoding="utf-8")
+        for n in range(1, 1000):
+            self.path.with_name(f"cron.json.corrupt{n}").write_text("old backup", encoding="utf-8")
+
+        with self.assertRaises(OSError):
+            await self._start()
+
+        self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+        self.assertTrue(all(
+            p.read_text(encoding="utf-8") == "old backup"
+            for p in self.path.parent.glob("cron.json.corrupt*")
+        ))
 
     async def test_unparseable_store_is_preserved_for_recovery(self) -> None:
         truncated = '{"version": 1, "jobs": [{"id": "job1", "name": "job 1"'

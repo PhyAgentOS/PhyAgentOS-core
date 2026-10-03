@@ -88,6 +88,8 @@ class CronService:
         if self.store_path.exists():
             try:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or not isinstance(data.get("jobs", []), list):
+                    raise ValueError("cron store must be an object with a jobs array")
             except Exception as e:
                 # Do not let start()'s following _save_store() overwrite the
                 # only copy of the file; move it aside so it stays recoverable.
@@ -128,7 +130,8 @@ class CronService:
                     ))
                 except Exception as e:
                     # One unreadable job must not cost the user the others.
-                    logger.warning("Skipping unreadable cron job {}: {}", j.get("id", "<unknown>"), e)
+                    job_id = j.get("id", "<unknown>") if isinstance(j, dict) else "<unknown>"
+                    logger.warning("Skipping unreadable cron job {}: {}", job_id, e)
             self._store = CronStore(jobs=jobs)
         else:
             self._store = CronStore()
@@ -136,7 +139,7 @@ class CronService:
         return self._store
 
     def _quarantine_store(self) -> None:
-        """Move an unreadable store aside so its contents survive."""
+        """Move an unreadable store aside, or raise to prevent overwriting it."""
         for n in range(1, 1000):
             candidate = self.store_path.with_name(f"{self.store_path.name}.corrupt{n}")
             if not candidate.exists():
@@ -144,10 +147,10 @@ class CronService:
                     self.store_path.replace(candidate)
                 except OSError as e:
                     logger.warning("Could not set the unreadable cron store aside: {}", e)
-                    return
+                    raise
                 logger.warning("Moved the unreadable cron store to {}", candidate.name)
                 return
-        logger.warning("Too many .corrupt files beside the cron store; leaving it in place")
+        raise OSError("Too many .corrupt files beside the cron store; refusing to overwrite it")
 
     def _save_store(self) -> None:
         """Save jobs to disk."""
