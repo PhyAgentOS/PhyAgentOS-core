@@ -204,6 +204,20 @@ https://cheaperinference.com/signup 获取的 key 填入 `providers.cheaperinfer
 paos provider use cheaperinference --model gpt-5.4-mini --reasoning-effort none
 ```
 
+**[API Route](https://www.api-route.com)**（`api_route`）使用相同的网关配置方式。在其控制台
+创建密钥，填入 `providers.api_route.apiKey`，或在启动时提供 `API_ROUTE_API_KEY` /
+`PAOS_API_ROUTE_API_KEY`。默认地址为 `https://global.api-route.com/v1`；填写密钥可用的
+模型 ID，不要额外添加厂商前缀。本接入同样沿用 PAOS 对网关推理强度的保守校验，选择时
+请清除显式推理强度：
+
+```bash
+paos provider use api_route --model gpt-6.1-sol --reasoning-effort none
+```
+
+在已有会话中，依次执行 `/effort none`、`/provider api_route`，然后执行
+`/model <model-id>`，填写密钥可用且不带厂商前缀的模型 ID。未设置
+`providers.api_route.defaultModel` 时，切换 Provider 会沿用原模型，包括其厂商前缀。
+
 优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
 开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
 子 Agent、Forge 任务、verification、evolution、记忆整理、Cron 和 Heartbeat 继续使用启动配置。
