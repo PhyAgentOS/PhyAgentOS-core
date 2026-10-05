@@ -214,7 +214,9 @@ paos provider use cheaperinference --model gpt-5.4-mini --reasoning-effort none
 paos provider use api_route --model gpt-6.1-sol --reasoning-effort none
 ```
 
-在已有会话中，先执行 `/effort none`，再执行 `/provider api_route`。
+在已有会话中，依次执行 `/effort none`、`/provider api_route`，然后执行
+`/model <model-id>`，填写密钥可用且不带厂商前缀的模型 ID。未设置
+`providers.api_route.defaultModel` 时，切换 Provider 会沿用原模型，包括其厂商前缀。
 
 优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
 开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的

@@ -225,7 +225,10 @@ explicit reasoning effort when selecting it:
 paos provider use api_route --model gpt-6.1-sol --reasoning-effort none
 ```
 
-In an existing session, use `/effort none` before `/provider api_route`.
+In an existing session, run `/effort none`, then `/provider api_route`, followed by
+`/model <model-id>` using a bare model ID available to your key. Without
+`providers.api_route.defaultModel`, switching providers retains the previous model,
+including any vendor prefix.
 
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current

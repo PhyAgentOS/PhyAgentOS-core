@@ -14,7 +14,7 @@ from PhyAgentOS.providers.service import ProviderService
 
 
 @pytest.mark.parametrize("provider_name", ["api_route", "auto"])
-def test_config_selects_gateway_before_native_model_provider(provider_name: str) -> None:
+def test_config_selects_gateway_when_only_gateway_is_configured(provider_name: str) -> None:
     config = Config.model_validate(
         {
             "agents": {"defaults": {"model": "claude-fable-5-1", "provider": provider_name}},
@@ -25,6 +25,25 @@ def test_config_selects_gateway_before_native_model_provider(provider_name: str)
     assert config.get_api_key() == "test-route-key"
     assert config.get_api_base() == "https://global.api-route.com/v1"
     assert find_gateway(api_base=config.get_api_base()) is find_by_name("api_route")
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "expected_provider"), [("auto", "anthropic"), ("api_route", "api_route")]
+)
+def test_config_respects_provider_selection_with_native_credentials(
+    provider_name: str, expected_provider: str
+) -> None:
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"model": "claude-fable-5-1", "provider": provider_name}},
+            "providers": {
+                "anthropic": {"apiKey": "test-anthropic-key"},
+                "api_route": {"apiKey": "test-route-key"},
+            },
+        }
+    )
+    assert config.get_provider_name() == expected_provider
+    assert config.get_api_key() == getattr(config.providers, expected_provider).api_key
 
 
 def test_runtime_reads_provider_key_without_persisting_it(monkeypatch: pytest.MonkeyPatch) -> None:
