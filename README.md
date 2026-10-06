@@ -174,7 +174,7 @@ Reported task success rates on **LIBERO-Long** and **RoboDojo**. Purple bars sho
 | GLM 5.3 Flash + π0.5 | — | 20.00% |
 | DeepSeek 4.1 Flash | 82.00% | — |
 
-> English-localized versions of the benchmark figures supplied by the maintainers; model names and reported values are preserved. See [full results and evaluation context](docs/benchmarks.md). “—” means not reported.
+> English-localized versions of the benchmark figures supplied by the maintainers; model names and reported values are preserved. See [full results and evaluation context](docs/benchmarks.md). “—” means not reported. To reproduce the LIBERO evaluation, follow the [LIBERO quickstart](example/quickstart/libero-quickstart.md).
 
 <a id="robot-skills"></a>
 ## Connect a robot or simulator
@@ -255,6 +255,7 @@ documents Bundle layout, local validation, immutable publication order, and Regi
 | Platform | Coverage | Guide |
 | --- | --- | --- |
 | Piper robot arm | Skill installation, CAN setup, hardware startup, and tool readiness | [Piper quickstart (Chinese)](example/quickstart/piper-quickstart.md) |
+| LIBERO-10 simulation benchmark | Skill/Node installation, π0.5 weights, model API setup, and a 50-episode run (π0.5-only or GPT-6 supervised) | [LIBERO quickstart (Chinese)](example/quickstart/libero-quickstart.md) |
 
 <a id="documentation"></a>
 ## Documentation
