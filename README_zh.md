@@ -18,6 +18,7 @@
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
     <a href="#quick-start">快速开始</a> ·
+    <a href="#quickstart-examples">快速启动示例</a> ·
     <a href="#control-modes">控制方式</a> ·
     <a href="#benchmarks">Benchmark</a> ·
     <a href="#robot-skills">运行机器人技能</a> ·
@@ -172,7 +173,7 @@ paos agent
 | GLM 5.3 Flash + π0.5 | — | 20.00% |
 | DeepSeek 4.1 Flash | 82.00% | — |
 
-> 使用维护者提供的评测原图。完整数值与评测口径见 [Benchmark 说明](docs/benchmarks.md)；“—”表示未提供。
+> 使用维护者提供的评测原图。完整数值与评测口径见 [Benchmark 说明](docs/benchmarks.md)；“—”表示未提供。复现 LIBERO 评测见 [LIBERO 快速启动](example/quickstart/libero-quickstart.md)。
 
 <a id="robot-skills"></a>
 ## 接入机器人或仿真环境
@@ -242,6 +243,14 @@ PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical
 本地验证、不可变发布顺序与 Registry 验收。
 
 </details>
+
+<a id="quickstart-examples"></a>
+## Quickstart · 快速启动示例
+
+| 平台 | 内容 | 指南 |
+| --- | --- | --- |
+| Piper 机械臂 | Skill 安装、CAN 配置、真机启动与工具就绪验证 | [Piper 快速启动](example/quickstart/piper-quickstart.md) |
+| LIBERO-10 仿真评测 | Skill/Node 安装、π0.5 权重、模型 API 配置与 50 集测评（π0.5 纯策略 / GPT-6 监督两条路线） | [LIBERO 快速启动](example/quickstart/libero-quickstart.md) |
 
 <a id="documentation"></a>
 ## 文档导航
