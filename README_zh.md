@@ -160,20 +160,30 @@ paos agent
 <a id="benchmarks"></a>
 ## Benchmark
 
-以下展示 **LIBERO-Long** 与 **RoboDojo** 上的任务成功率。深色为 PhyAgentOS（PAOS）结果，浅色为公开榜单参考值。
+以下展示 **LIBERO-Long**、**RoboDojo** 与 **RoboTwin** 上的任务成功率。深色为 PhyAgentOS（PAOS）结果，浅色为公开榜单参考值。
 
-![LIBERO-Long benchmark](docs/imgs/benchmark-libero-long-original.jpg)
+**评测口径：** LIBERO 使用 `libero-10`（图中标为 LIBERO-Long）；RoboDojo 和 RoboTwin 各随机抽样 10 个任务，部分模型的评测样本量不同。公开榜单参考结果可能采用不同评测协议。
 
-![RoboDojo benchmark](docs/imgs/benchmark-robodojo-original.jpg)
+![LIBERO-Long benchmark](docs/imgs/benchmark-libero-long-original.png)
 
-| PhyAgentOS 配置 | LIBERO-Long ↑ | RoboDojo ↑ |
-| --- | ---: | ---: |
-| GPT6 + π0.5 | **100.00%** | 23.30% |
-| DeepSeek 4.1 Flash + π0.5 | 97.22% | **26.00%** |
-| GLM 5.3 Flash + π0.5 | — | 20.00% |
-| DeepSeek 4.1 Flash | 82.00% | — |
+![RoboDojo benchmark](docs/imgs/benchmark-robodojo-original.png)
 
-> 使用维护者提供的评测原图。完整数值与评测口径见 [Benchmark 说明](docs/benchmarks.md)；“—”表示未提供。复现 LIBERO 评测见 [LIBERO 快速启动](example/quickstart/libero-quickstart.md)。
+![RoboTwin benchmark](docs/imgs/benchmark-robotwin-original.png)
+
+| PhyAgentOS 配置 | LIBERO-10 ↑ | RoboDojo ↑ | RoboTwin ↑ |
+| --- | ---: | ---: | ---: |
+| GPT-6 + π0.5 | 100.00% | 23.30% | 76.70% |
+| DeepSeek 4.1 Flash + π0.5 | 97.22% | 26.70% | 77.80% |
+| GLM 5.3 Flash + π0.5 | 100.00% | 20.00% | 66.70% |
+| Gemini Robotic ER2 + π0.5 | — | — | 80.00% |
+| Kimi-K3 + π0.5 | — | — | 66.70% |
+| Gemini 3.8 Flash + π0.5 | — | — | 66.70% |
+| DeepSeek 4.1 Flash | 82.00% | 8.30% | — |
+| GPT-6 | — | 8.30% | — |
+| GLM 5.3 Flash | — | 2.78% | — |
+| Kimi-K3 | 60.00% | 0.00% | — |
+
+> 使用维护者提供的最新评测原图。完整数值、耗时、Token 消耗与评测口径见 [Benchmark 说明](docs/benchmarks.md)；“—”表示未提供。复现 LIBERO 评测见 [LIBERO 快速启动](example/quickstart/libero-quickstart.md)。
 
 <a id="robot-skills"></a>
 ## 接入机器人或仿真环境
