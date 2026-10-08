@@ -15,6 +15,10 @@ There is deliberately no `private_control_plane=true` production bypass. A futur
 production adapter must demonstrate network/credential isolation and endpoint
 scope enforcement before it is registered here.
 
+The interaction protocol has no token or HMAC authentication layer. Its current
+authority comes from trusted in-process capabilities and the fake deployment
+adapter; the protocol does not establish production authentication.
+
 The existing workflow remains:
 
 1. Install the Skill archive using the normal verified installer and activate it.
@@ -122,6 +126,38 @@ Use `required_kinds: [interaction_observation]`; the complete process trace is a
 required by the interaction adapter, not inserted into the legacy before/after
 kind requirement. One root task produces one deduplicated experience episode with
 trace references. A model `finish_candidate` can still yield a failed root goal.
+
+## Compatibility and operational limits
+
+The Coordinator's `_append_execution` admission guard also applies to ordinary
+AgentTasks, even when interaction is disabled. When a cancellation request is
+persisted or a task leaves `executing`, the intent transaction refuses new Query,
+Action and Session records before dispatch. This tightens ordinary-task behavior
+when state changes after the initial executable check; it does not cancel calls
+already dispatched or prove their remote outcome.
+
+When two processes share an interaction journal and one still owns an unresolved
+run, the second process raises `RunnerAlreadyOwnedError` during recovery. This
+propagates through the Coordinator to Agent startup, so the second Agent fails to
+start; the original owner continues. This startup failure path is introduced by
+the interaction foundation. It is retained as the v1 single-Runner policy, with
+no hot takeover or restricted-chat fallback. Operators must avoid starting a
+second owner against the same workspace and must never remove the owner lock to
+force takeover of a live run.
+
+If the Supervisor is absent or its monitoring task is no longer running, persisted
+cancellation alone cannot guarantee physical stop or continued reconciliation.
+Unresolved runs retain their blockers and resource ownership. Notifications from
+the same Supervisor do not provide independent failure detection. Before real-game
+admission, add external health monitoring and an operator procedure to stop the
+environment through its authorized control plane and reconcile its execution
+facts. Do not manually mark the journal settled or delete it to release resources.
+
+`verified_extension` currently hashes every installed bundle file on each check,
+including repeated checks during finalization. This is acceptable for the small
+fake environment but may be expensive for bundles containing large game assets.
+A manifest-digest cache is follow-up work and must have reliable invalidation on
+bundle changes without weakening tamper detection. v1 retains full validation.
 
 ## Reproducible acceptance
 

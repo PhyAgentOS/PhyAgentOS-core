@@ -391,11 +391,19 @@ async def test_competing_recovery_does_not_mutate_live_run(tmp_path, monkeypatch
     )
     contender = other.interaction.enable_in_process(c.interaction.deployment)
     before = c.interaction.store.runs()[0]
+    task_before = c.get_task(t.task_id)
+    posts_before = [call for call in grid.calls if call[0] == "POST"]
     with pytest.raises(RunnerAlreadyOwnedError):
-        await contender.recover()
+        await other.reconcile_nonterminal()
     assert c.interaction.store.runs()[0] == before
+    assert c.get_task(t.task_id) == task_before
+    assert [call for call in grid.calls if call[0] == "POST"] == posts_before
     assert not contender.runners
+    assert not contender.jobs
+    original_runner = next(iter(sup.runners.values()))
+    assert c.interaction.store.owns(original_runner)
     await c.cancel_task(t.task_id, reason="cleanup")
     release.set()
     await finish(sup)
     await sup.shutdown()
+    other.interaction.store.close()

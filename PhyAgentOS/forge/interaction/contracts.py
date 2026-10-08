@@ -16,19 +16,6 @@ ID = {
     "pattern": r"^[A-Za-z0-9_.:-]+$(?![\s\S])",
 }
 COUNT = {"type": "integer", "minimum": 1, "maximum": 10000}
-AUTHORIZATION_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["expires_at", "issued_at", "key_id", "nonce", "signature", "version"],
-    "properties": {
-        "version": {"const": "hmac_sha256_v1"},
-        "key_id": {"type": "string", "minLength": 1, "maxLength": 160},
-        "issued_at": {"type": "integer", "minimum": 0},
-        "expires_at": {"type": "integer", "minimum": 0},
-        "nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
-        "signature": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    },
-}
 
 
 def object_schema(properties: dict, required: list[str] | None = None) -> dict:
