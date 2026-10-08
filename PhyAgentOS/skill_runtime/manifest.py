@@ -311,9 +311,18 @@ class SkillManifest:
         list is both the startup health-check set (``RuntimeManager``) and
         the AgentTask Skill allowlist (``forge.binding``), so one Skill can
         expose a different Tool surface per profile.
+
+        An unknown profile is an error rather than an implicit fallback:
+        resolving it to the Skill-wide list would check, and admit, a Tool
+        surface the profile never declared.
         """
         profile = self.profiles.get(profile_name)
-        if profile is None or profile.required_tools is None:
+        if profile is None:
+            available = ", ".join(sorted(self.profiles))
+            raise ManifestError(
+                f"unknown profile {profile_name!r}; available profiles: {available}"
+            )
+        if profile.required_tools is None:
             return self.required_tools
         return profile.required_tools
 

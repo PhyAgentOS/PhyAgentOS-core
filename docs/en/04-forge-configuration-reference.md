@@ -162,9 +162,11 @@ Runtime lifecycle and `paos forge-node install/verify <skill-name> <node-id>` fo
 locked nodes. Pass `--archive <path>` to install a separately obtained Node without Registry
 access. Starting a profile requires Dora CLI on `PATH` (v0.4.1 with `dora-message` v0.7.0 is the
 current Forge Skill compatibility baseline), validates required binaries, assets, environment
-variables, Gateway `/tools`, and all manifest `required_tools`. RuntimeManager starts local Dora
-services when needed. An active
-Runtime's manifest `gateway_url` is the Tool API URL used by the Agent.
+variables, Gateway `/tools`, and the Tool list the started profile resolves:
+`profiles.<name>.required_tools` when it is present, otherwise the manifest-wide `required_tools`.
+That same resolved list is the AgentTask Skill allowlist, so readiness checks and task bindings
+cannot disagree about which Tools a profile exposes. RuntimeManager starts local Dora services when
+needed. An active Runtime's manifest `gateway_url` is the Tool API URL used by the Agent.
 
 ## 9. `embodiments`
 

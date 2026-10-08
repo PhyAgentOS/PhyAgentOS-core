@@ -23,7 +23,11 @@ from PhyAgentOS.config.paths import (
 from PhyAgentOS.skill_runtime.catalog import SkillCatalog
 from PhyAgentOS.skill_runtime.installer import InstallerError, SkillEnvironmentBuilder
 from PhyAgentOS.skill_runtime.locking import SkillOperationBusyError, SkillOperationLock
-from PhyAgentOS.skill_runtime.manifest import RuntimeProfile, SkillManifest
+from PhyAgentOS.skill_runtime.manifest import (
+    ManifestError,
+    RuntimeProfile,
+    SkillManifest,
+)
 from PhyAgentOS.skill_runtime.state import RuntimeState, RuntimeStateStore, utc_now
 
 
@@ -178,8 +182,19 @@ class RuntimeManager:
                     pass
             except SkillOperationBusyError:
                 startup_in_progress = True
-        tools = manifest.tools_for_profile(state.profile)
         flow_running = self._flow_running(state.flow_name)
+        try:
+            tools = manifest.tools_for_profile(state.profile)
+        except ManifestError as exc:
+            # The installed bundle no longer declares the profile this Runtime
+            # was started with (the Skill was replaced underneath it). Readiness
+            # cannot be evaluated against a Tool list that is not that profile's,
+            # so report the mismatch instead of a readiness verdict.
+            if state.status in {"stopped", "failed"}:
+                return RuntimeStatusReport(state, flow_running, False, {})
+            reconciled = state.with_status("failed", error=str(exc))
+            self.state_store.save(reconciled)
+            return RuntimeStatusReport(reconciled, flow_running, False, {})
         snapshot = self._gateway_snapshot(manifest)
         contexts = (
             self._tool_context_readiness(manifest, tools) if snapshot is not None else {}
