@@ -161,20 +161,30 @@ These describe integration patterns; model and environment availability depends 
 <a id="benchmarks"></a>
 ## Benchmark
 
-Reported task success rates on **LIBERO-Long** and **RoboDojo**. Purple bars show PhyAgentOS (PAOS); muted bars show public-leaderboard references.
+Reported task success rates on **LIBERO-Long**, **RoboDojo**, and **RoboTwin**. Purple bars show PhyAgentOS (PAOS); muted bars show public-leaderboard references.
+
+**Evaluation scope:** LIBERO uses `libero-10` (labeled LIBERO-Long in the figures). RoboDojo and RoboTwin each use 10 randomly sampled tasks; sample counts vary for some models. Public-leaderboard references may use different protocols.
 
 ![LIBERO-Long benchmark](docs/imgs/benchmark-libero-long-en.png)
 
 ![RoboDojo benchmark](docs/imgs/benchmark-robodojo-en.png)
 
-| PhyAgentOS configuration | LIBERO-Long ↑ | RoboDojo ↑ |
-| --- | ---: | ---: |
-| GPT6 + π0.5 | **100.00%** | 23.30% |
-| DeepSeek 4.1 Flash + π0.5 | 97.22% | **26.00%** |
-| GLM 5.3 Flash + π0.5 | — | 20.00% |
-| DeepSeek 4.1 Flash | 82.00% | — |
+![RoboTwin benchmark](docs/imgs/benchmark-robotwin-en.png)
 
-> English-localized versions of the benchmark figures supplied by the maintainers; model names and reported values are preserved. See [full results and evaluation context](docs/benchmarks.md). “—” means not reported. To reproduce the LIBERO evaluation, follow the [LIBERO quickstart](example/quickstart/libero-quickstart.md).
+| PhyAgentOS configuration | LIBERO-10 ↑ | RoboDojo ↑ | RoboTwin ↑ |
+| --- | ---: | ---: | ---: |
+| GPT-6 + π0.5 | 100.00% | 23.30% | 76.70% |
+| DeepSeek 4.1 Flash + π0.5 | 97.22% | 26.70% | 77.80% |
+| GLM 5.3 Flash + π0.5 | 100.00% | 20.00% | 66.70% |
+| Gemini Robotic ER2 + π0.5 | — | — | 80.00% |
+| Kimi-K3 + π0.5 | — | — | 66.70% |
+| Gemini 3.8 Flash + π0.5 | — | — | 66.70% |
+| DeepSeek 4.1 Flash | 82.00% | 8.30% | — |
+| GPT-6 | — | 8.30% | — |
+| GLM 5.3 Flash | — | 2.78% | — |
+| Kimi-K3 | 60.00% | 0.00% | — |
+
+> English translations of the latest maintainer-supplied figures. See [full results, time and token usage, and evaluation context](docs/benchmarks.md). “—” means not reported. To reproduce the LIBERO evaluation, follow the [LIBERO quickstart](example/quickstart/libero-quickstart.md).
 
 <a id="robot-skills"></a>
 ## Connect a robot or simulator
