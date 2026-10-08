@@ -116,6 +116,8 @@ required_tools: [example.query, example.action]
 profiles:
   sim:
     dataflow: profiles/sim/dataflow.yaml
+    # optional: overrides the Skill-wide required_tools; omit to inherit
+    required_tools: [example.query]
     required_binaries: [gateway, example_node]
     required_assets: [assets/scene.xml]
     required_environment: []
@@ -148,6 +150,23 @@ caller's working directory, and inherits terminal stdio. The script should resol
 relative to its own location, tolerate repeated execution, and return non-zero on failure. Such a
 Bundle requires Bash on the host `PATH`. `PAOS_SKILL_NAME` and `PAOS_SKILL_VERSION` are available as
 dataflow placeholders and in Dora process environments.
+
+Hook environment contract: PAOS also passes `PAOS_SKILL_PROFILE` (the profile being started),
+`PAOS_SKILL_ROOT` (the Bundle root), and `PAOS_HOOK_PYTHON` (the interpreter running PAOS Core).
+`PAOS_HOOK_PYTHON` is only guaranteed to import Core's own dependencies, not any model-runtime
+dependency: create your own virtual environment or call an external tool when the hook must prepare
+CUDA PyTorch, transformers, or similar.
+
+`profiles.<profile>.required_tools` is optional: when present it overrides the Skill-wide
+`required_tools`, and a profile that omits it inherits that list. The field carries two contracts at
+once - the Tool set the startup and status health checks require, and the Tool allowlist the AgentTask
+may call (`forge/binding.py` freezes the same list into the AgentTask). One Bundle can therefore
+expose a different Tool surface per profile while both checks stay in agreement for a given profile.
+
+`profiles.<profile>.required_tools` needs a PAOS Core that knows the field. An older Core, including
+v1.0.0, rejects the whole Bundle with
+`profiles.<profile> has unknown field(s): required_tools`, so Bundles using it should state their
+minimum Core version.
 
 ## 5. Package, publish, and close the local loop
 

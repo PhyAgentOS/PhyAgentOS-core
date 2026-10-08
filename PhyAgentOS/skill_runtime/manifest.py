@@ -25,6 +25,7 @@ _MANIFEST_FIELDS = {
 _PROFILE_FIELDS = {
     "dataflow",
     "startup_timeout_s",
+    "required_tools",
     "required_binaries",
     "required_assets",
     "required_environment",
@@ -86,6 +87,16 @@ def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
     return items
 
 
+def _optional_string_tuple(value: Any, label: str) -> tuple[str, ...] | None:
+    """Parse an optional non-empty string list; ``None`` means "inherit"."""
+    if value is None:
+        return None
+    items = _string_tuple(value, label)
+    if not items:
+        raise ManifestError(f"{label} must not be empty")
+    return items
+
+
 def _path_tuple(value: Any, label: str) -> tuple[Path, ...]:
     if value is None:
         return ()
@@ -111,6 +122,7 @@ class RuntimeProfile:
 
     dataflow: Path
     startup_timeout_s: float | None = None
+    required_tools: tuple[str, ...] | None = None
     required_binaries: tuple[Path, ...] = ()
     required_assets: tuple[Path, ...] = ()
     required_environment: tuple[str, ...] = ()
@@ -131,6 +143,9 @@ class RuntimeProfile:
             dataflow=_relative_path(data.get("dataflow"), f"{label}.dataflow"),
             startup_timeout_s=_optional_positive_float(
                 data.get("startup_timeout_s"), f"{label}.startup_timeout_s"
+            ),
+            required_tools=_optional_string_tuple(
+                data.get("required_tools"), f"{label}.required_tools"
             ),
             required_binaries=_path_tuple(
                 data.get("required_binaries"), f"{label}.required_binaries"
@@ -287,6 +302,29 @@ class SkillManifest:
         if not document.is_file():
             raise ManifestError("skill_document does not exist in the Skill bundle")
         return manifest
+
+    def tools_for_profile(self, profile_name: str) -> tuple[str, ...]:
+        """Resolve the Tool allowlist for one profile.
+
+        ``profiles.<name>.required_tools`` overrides the Skill-wide list;
+        profiles without the field keep the Skill-wide list. The resolved
+        list is both the startup health-check set (``RuntimeManager``) and
+        the AgentTask Skill allowlist (``forge.binding``), so one Skill can
+        expose a different Tool surface per profile.
+
+        An unknown profile is an error rather than an implicit fallback:
+        resolving it to the Skill-wide list would check, and admit, a Tool
+        surface the profile never declared.
+        """
+        profile = self.profiles.get(profile_name)
+        if profile is None:
+            available = ", ".join(sorted(self.profiles))
+            raise ManifestError(
+                f"unknown profile {profile_name!r}; available profiles: {available}"
+            )
+        if profile.required_tools is None:
+            return self.required_tools
+        return profile.required_tools
 
     def resolve_bundle_path(self, relative: Path) -> Path:
         """Resolve and contain a path within this bundle."""

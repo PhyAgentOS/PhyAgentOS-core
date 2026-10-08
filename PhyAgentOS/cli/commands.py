@@ -1250,18 +1250,22 @@ def skill_inspect(skill_name: str = typer.Argument(..., help="Installed Skill na
     console.print(manifest.description)
     console.print(f"Document: {manifest.skill_document.as_posix()}")
     console.print(f"Gateway: {manifest.gateway_url}")
-    console.print(f"Tools: {', '.join(manifest.required_tools)}")
+    console.print(
+        f"Tools: {', '.join(manifest.required_tools)} (Skill-wide; profiles may override)"
+    )
     profile_table = Table(title="Runtime Profiles")
     profile_table.add_column("Profile")
     profile_table.add_column("Dataflow")
     profile_table.add_column("Binaries")
     profile_table.add_column("Assets")
+    profile_table.add_column("Tools")
     for name, profile in sorted(manifest.profiles.items()):
         profile_table.add_row(
             name,
             profile.dataflow.as_posix(),
             str(len(profile.required_binaries)),
             str(len(profile.required_assets)),
+            ", ".join(manifest.tools_for_profile(name)),
         )
     console.print(profile_table)
     console.print(f"Runtime: {state.status if state is not None else 'not started'}")

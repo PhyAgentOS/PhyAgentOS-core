@@ -17,7 +17,7 @@ from PhyAgentOS.agent.tools.forge_tool_api import (
     ForgeToolSessionStatusTool,
 )
 from PhyAgentOS.config.schema import ForgeConfig, ForgeEvidenceConfig
-from PhyAgentOS.forge.binding import ForgeSkillBindingResolver
+from PhyAgentOS.forge.binding import ForgeSkillBindingError, ForgeSkillBindingResolver
 from PhyAgentOS.forge.task import (
     AgentTaskCoordinator,
     AgentTaskError,
@@ -117,7 +117,7 @@ class FakeGatewayClient:
         }
 
 
-def _write_skill(root: Path) -> Path:
+def _write_skill(root: Path, *, profile_tools: list[str] | None = None) -> Path:
     bundle = root / "example-forge"
     profile = bundle / "profiles" / "local"
     profile.mkdir(parents=True)
@@ -130,6 +130,9 @@ def _write_skill(root: Path) -> Path:
         encoding="utf-8",
     )
     (profile / "dataflow.yaml").write_text("nodes: []\n", encoding="utf-8")
+    profile_manifest: dict[str, Any] = {"dataflow": "profiles/local/dataflow.yaml"}
+    if profile_tools is not None:
+        profile_manifest["required_tools"] = list(profile_tools)
     manifest = {
         "manifest_version": 2,
         "name": "example-forge",
@@ -138,7 +141,7 @@ def _write_skill(root: Path) -> Path:
         "skill_document": "SKILL.md",
         "gateway_url": "http://127.0.0.1:9",
         "required_tools": ["demo.query", "demo.action", "demo.session"],
-        "profiles": {"local": {"dataflow": "profiles/local/dataflow.yaml"}},
+        "profiles": {"local": profile_manifest},
     }
     (bundle / "skill.yaml").write_text(
         yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8"
@@ -174,9 +177,14 @@ def _write_runtime_skill(root: Path, name: str, gateway_url: str) -> Path:
     return bundle
 
 
-async def _bound_system(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+async def _bound_system(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    profile_tools: list[str] | None = None,
+):
     installed = tmp_path / "skills"
-    _write_skill(installed)
+    _write_skill(installed, profile_tools=profile_tools)
     monkeypatch.setattr(
         "PhyAgentOS.agent.skills.get_config_path", lambda: tmp_path / "config.json"
     )
@@ -657,3 +665,37 @@ def test_runtime_state_v2_rejects_old_or_incomplete_records() -> None:
     del state["runtime_instance_id"]
     with pytest.raises(StateError, match="missing field.*runtime_instance_id"):
         RuntimeState.from_dict(state)
+
+
+async def test_binding_uses_profile_required_tools_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator, task, _, _, _, _ = await _bound_system(
+        tmp_path, monkeypatch, profile_tools=["demo.query"]
+    )
+
+    binding = task.primary_skill_binding
+    assert binding is not None
+    assert [item.tool_id for item in binding.required_tools] == ["demo.query"]
+    assert binding.tool("demo.action") is None
+    with pytest.raises(AgentTaskError, match="not in the Skill allowlist"):
+        await coordinator.start_action(task.task_id, "demo.action", {})
+
+async def test_binding_reports_profile_missing_from_installed_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator, _, _, _, _, _ = await _bound_system(tmp_path, monkeypatch)
+    resolver = coordinator.binding_resolver
+    assert resolver is not None
+
+    # The Bundle is replaced underneath a live Runtime: same version, but the
+    # profile the Runtime was started with is gone.
+    manifest_path = tmp_path / "skills" / "example-forge" / "skill.yaml"
+    data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    data["profiles"] = {"renamed": data["profiles"]["local"]}
+    manifest_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(
+        ForgeSkillBindingError, match="no longer declares profile 'local'"
+    ):
+        await resolver.preview("example-forge")

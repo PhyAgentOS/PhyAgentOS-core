@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from PhyAgentOS.skill_runtime.catalog import SkillCatalog
+from PhyAgentOS.skill_runtime.manifest import ManifestError
 from PhyAgentOS.verification.contracts import utc_now
 
 
@@ -110,8 +111,17 @@ class ForgeSkillBindingResolver:
         manifest = self.catalog.get(skill_name)
         if manifest.version != runtime.skill_version:
             raise ForgeSkillBindingError("installed Skill changed after Runtime startup")
+        try:
+            tool_ids = manifest.tools_for_profile(runtime.profile)
+        except ManifestError as exc:
+            # The Bundle was replaced underneath a live Runtime, so the profile
+            # it was started with no longer exists and there is no Tool surface
+            # to bind. Report a binding failure instead of a manifest error.
+            raise ForgeSkillBindingError(
+                f"installed Skill no longer declares profile {runtime.profile!r}"
+            ) from exc
         tools: list[BoundToolSpec] = []
-        for tool_id in sorted(manifest.required_tools):
+        for tool_id in sorted(tool_ids):
             response = await runtime.client.get_tool(tool_id)
             spec = _response_data(response, f"ToolSpec {tool_id!r}")
             semantics = spec.get("semantics")
