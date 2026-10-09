@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -275,6 +276,49 @@ async def test_binding_freezes_runtime_and_rejects_toolspec_drift(
         await coordinator.start_action(task.task_id, "demo.action", {})
     assert client.action_calls == []
     client.specs["demo.action"] = original
+
+
+@pytest.mark.parametrize("semantics", ["query", "action", "session"])
+@pytest.mark.parametrize("change", ["cancel_requested", "status_changed"])
+async def test_ordinary_task_rechecks_admission_before_recording_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, semantics: str, change: str
+) -> None:
+    coordinator, task, client, _, _, _ = await _bound_system(tmp_path, monkeypatch)
+    assert not coordinator.interaction.managed(task.task_id)
+    transport = AsyncMock()
+    monkeypatch.setattr(
+        client,
+        {"query": "invoke_query_tool", "action": "invoke_action", "session": "start_session"}[
+            semantics
+        ],
+        transport,
+    )
+    update = coordinator.store.update
+
+    def change_before_intent(task_id, mutate, *, event_type, **kwargs):
+        if event_type == f"{semantics}_started":
+            # Simulate a concurrent writer after the preflight read, before the
+            # intent transaction loads its current record.
+            def close_admission(current):
+                if change == "cancel_requested":
+                    current.cancellation_requested = True
+                else:
+                    current.status = AgentTaskStatus.CANCELLING
+
+            update(task_id, close_admission, event_type="test_admission_closed")
+        return update(task_id, mutate, event_type=event_type, **kwargs)
+
+    monkeypatch.setattr(coordinator.store, "update", change_before_intent)
+    invoke = getattr(
+        coordinator,
+        {"query": "invoke_query", "action": "start_action", "session": "start_session"}[
+            semantics
+        ],
+    )
+    with pytest.raises(AgentTaskError, match="task stopped accepting dispatch"):
+        await invoke(task.task_id, f"demo.{semantics}", {})
+    transport.assert_not_awaited()
+    assert coordinator.get_task(task.task_id).execution_records == []
 
 
 async def test_session_ownership_and_terminal_binding_release(

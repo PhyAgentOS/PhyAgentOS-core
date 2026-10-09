@@ -153,6 +153,13 @@ class AgentTaskOutcomeSource:
             criteria_statuses = {
                 item: "unknown" for item in task.verification.success_criteria
             }
+        interaction_refs = []
+        service = getattr(self.coordinator, "interaction", None)
+        if service is not None and service.managed(task.task_id):
+            from PhyAgentOS.forge.interaction.evidence import checked_trace
+            for run in service.store.runs(task.task_id):
+                checked_trace(service, run)
+                interaction_refs.append(opaque_ref("interaction:" + run["interaction_run_id"]))
         return TaskOutcomeEnvelope(
             task_id=task.task_id,
             root_task_id=task.task_id,
@@ -166,7 +173,7 @@ class AgentTaskOutcomeSource:
                 for criterion, status in criteria_statuses.items()
             },
             lineage=lineage,
-            record_refs=[f"agent-task:{item.session_ref}" for item in lineage],
+            record_refs=[f"agent-task:{item.session_ref}" for item in lineage] + interaction_refs,
             agent_task_ref=opaque_ref(task.task_id),
             tool_invocation_refs=[
                 opaque_ref(item.invocation_id)

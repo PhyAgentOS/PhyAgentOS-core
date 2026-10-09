@@ -89,7 +89,12 @@ class ForgeTaskGetTool(Tool):
         return _task_id_schema()
 
     async def execute(self, task_id: str) -> str:
-        return _task_response(self.coordinator.get_task(task_id))
+        response = json.loads(_task_response(self.coordinator.get_task(task_id)))
+        interaction = getattr(self.coordinator, "interaction", None)
+        summary = interaction.summary(task_id) if interaction is not None else None
+        if summary is not None:
+            response["interaction"] = summary
+        return json.dumps(response, ensure_ascii=False)
 
 
 class ForgeTaskBeginRevisionTool(Tool):
