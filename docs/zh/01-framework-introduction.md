@@ -106,7 +106,7 @@ Forge ToolResult 与事件仍是权威执行事实。
 ## 8. Skill Runtime
 
 Skill Runtime 管理 manifest v2 Bundle 和显式命名 Dora profile。Bundle 使用安全解包、
-SHA-256 清单、精确单可执行文件 Node lock、事务替换、持久化状态、生命周期日志以及 Gateway `/tools`
+SHA-256 清单、精确单 entrypoint Node lock、事务替换、持久化状态、生命周期日志以及 Gateway `/tools`
 健康检查。
 
 Skill 发现优先级为 workspace override、已安装 Skill、内置 Skill。健康活动 Runtime 会把

@@ -157,8 +157,10 @@ Skill Runtime 路径由 PAOS 数据路径 helper 管理，不增加额外配置�
 Runtime 生命周期，使用 `paos forge-node install/verify <skill-name> <node-id>` 管理独立锁定
 Node；通过 `--archive <path>` 可安装独立获取的 Node 而不访问 Registry。启动 profile 要求
 `PATH` 中存在 Dora CLI（v0.4.1 与 `dora-message` v0.7.0 是当前 Forge Skill 兼容基线），并
-校验 required binaries、assets、环境变量、Gateway `/tools` 和 manifest 中全部
-`required_tools`。RuntimeManager 需要时启动本地 Dora 服务。活动 Runtime manifest 的
+校验 required binaries、assets、环境变量、Gateway `/tools`，以及本次启动 profile 解析出的
+Tool 列表：存在 `profiles.<name>.required_tools` 时用它，否则用 manifest 级 `required_tools`。
+同一份列表也是 AgentTask 的 Skill allowlist，所以健康检查与任务绑定不会对同一 profile 暴露的
+Tool 面产生分歧。RuntimeManager 需要时启动本地 Dora 服务。活动 Runtime manifest 的
 `gateway_url` 是 Agent 使用的 Tool API URL。
 
 ## 9. `embodiments`

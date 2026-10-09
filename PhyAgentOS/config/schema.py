@@ -243,7 +243,7 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     # Deprecated compatibility field: accepted from old configs but ignored at runtime.
     memory_window: int | None = Field(default=None, exclude=True)
-    reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    reasoning_effort: str | None = None  # Model-supported level; validated by ProviderService.
 
     @property
     def should_warn_deprecated_memory_window(self) -> bool:
@@ -286,6 +286,12 @@ class ForgeEvidenceConfig(Base):
     association_quality: Literal["best_effort"] = "best_effort"
 
 
+class InteractionConfig(Base):
+    """Opt-in interaction scheduling; enabling is not deployment authorization."""
+
+    enabled: bool = False
+
+
 class ForgeConfig(Base):
     """Agent-side timeout and evidence policy for an active Forge Skill runtime."""
 
@@ -293,6 +299,7 @@ class ForgeConfig(Base):
     poll_interval_s: float = Field(default=0.5, ge=0.1, le=5.0)
     execution_timeout_s: float = Field(default=300.0, gt=0)
     evidence: ForgeEvidenceConfig = Field(default_factory=ForgeEvidenceConfig)
+    interaction: InteractionConfig = Field(default_factory=InteractionConfig)
 
 DEFAULT_RESOURCE_REGISTRY_URL = "https://paos-resource-manager.dev.x-era.com"
 
@@ -379,16 +386,31 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
+    enabled: bool = True  # Explicit removal suppresses ambient credentials until reconfigured.
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    default_model: str | None = None
+    models: list[str] = Field(default_factory=list)  # Models explicitly added for this provider
+    # One HTTP attempt's read timeout for the direct providers (custom / openai_responses).
+    # Left at None, those providers use their 180s default, which assumes a model that answers
+    # in seconds. A reasoning model can need minutes on a long turn, and the SDK retries a call
+    # that exceeds the timeout, so a ceiling below the model's real latency turns slow turns
+    # into failed ones.
+    timeout_s: float | None = None
+    # SDK-level retries per chat call; None keeps the SDK default (2). 0 leaves retrying to the
+    # framework's chat_with_retry, which makes one logical call's worst case a known multiple of
+    # timeout_s instead of the SDK's own multiplication on top of it.
+    max_retries: int | None = None
 
 
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
+    openai_responses: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI /v1/responses (tools + reasoning together)
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
+    bedrock: ProviderConfig = Field(default_factory=ProviderConfig)  # AWS SDK credential chain
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -404,6 +426,9 @@ class ProvidersConfig(Base):
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎)
+    requesty: ProviderConfig = Field(default_factory=ProviderConfig)  # Requesty API gateway
+    cheaperinference: ProviderConfig = Field(default_factory=ProviderConfig)  # Cheaper Inference
+    api_route: ProviderConfig = Field(default_factory=ProviderConfig)  # API Route gateway
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
@@ -519,7 +544,7 @@ class Config(BaseSettings):
         forced = self.agents.defaults.provider
         if forced != "auto":
             p = getattr(self.providers, forced, None)
-            return (p, forced) if p else (None, None)
+            return (p, forced) if p and p.enabled else (None, None)
 
         model_lower = (model or self.agents.defaults.model).lower()
         model_normalized = model_lower.replace("-", "_")
@@ -533,15 +558,19 @@ class Config(BaseSettings):
         # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
-            if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or spec.is_local or p.api_key:
+            if p and p.enabled and model_prefix and normalized_prefix == spec.name:
+                if spec.is_oauth or spec.uses_aws_credentials or p.api_key or (
+                    spec.is_local and (p.api_base or p.default_model or p.models)
+                ):
                     return p, spec.name
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
-            if p and any(_kw_matches(kw) for kw in spec.keywords):
-                if spec.is_oauth or spec.is_local or p.api_key:
+            if p and p.enabled and any(_kw_matches(kw) for kw in spec.keywords):
+                if spec.is_oauth or spec.uses_aws_credentials or p.api_key or (
+                    spec.is_local and (p.api_base or p.default_model or p.models)
+                ):
                     return p, spec.name
 
         # Fallback: configured local providers can route models without
@@ -550,7 +579,7 @@ class Config(BaseSettings):
             if not spec.is_local:
                 continue
             p = getattr(self.providers, spec.name, None)
-            if p and p.api_base:
+            if p and p.enabled and p.api_base:
                 return p, spec.name
 
         # Fallback: gateways first, then others (follows registry order)
@@ -559,7 +588,7 @@ class Config(BaseSettings):
             if spec.is_oauth:
                 continue
             p = getattr(self.providers, spec.name, None)
-            if p and p.api_key:
+            if p and p.enabled and p.api_key:
                 return p, spec.name
         return None, None
 
@@ -585,9 +614,8 @@ class Config(BaseSettings):
         p, name = self._match_provider(model)
         if p and p.api_base:
             return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # (like Moonshot) set their base URL via env vars in _setup_env
-        # to avoid polluting the global litellm.api_base.
+        # Gateway/local defaults are exposed here for legacy callers. Standard
+        # provider defaults are resolved per instance by ProviderService/LiteLLMProvider.
         if name:
             spec = find_by_name(name)
             if spec and (spec.is_gateway or spec.is_local) and spec.default_api_base:

@@ -113,6 +113,8 @@ required_tools: [example.query, example.action]
 profiles:
   sim:
     dataflow: profiles/sim/dataflow.yaml
+    # 可选：覆盖 Skill 级 required_tools；省略则继承
+    required_tools: [example.query]
     required_binaries: [gateway, example_node]
     required_assets: [assets/scene.xml]
     required_environment: []
@@ -130,8 +132,10 @@ artifacts:
       sha256: <64-character-sha256>
 ```
 
-所有路径必须相对并包含在 Bundle 内。每个 Node archive 具有 lock 指定的 SHA-256，并且只包含
-一个 lock 指定文件名的根目录 executable；installer 在 receipt 中另行记录解包后 binary hash。
+所有路径必须相对并包含在 Bundle 内。每个 Node archive 具有 lock 指定的 SHA-256。
+`executable_tar_gz` 只包含一个 lock 指定文件名的根目录 executable；`directory_tar_gz`
+只包含一个以 `entrypoint` 命名的根目录，同名 executable 及其运行时树置于其中（仅允许
+解析不出树的相对符号链接）。installer 在 receipt 中另行记录解包后 binary hash。
 Bundle archive inventory 需要覆盖每个文件及 SHA-256；links、路径穿越、冲突、过度展开和未列出
 内容会被拒绝。
 
@@ -140,6 +144,21 @@ Bundle 如需在启动前下载权重或准备其他外部资源，可在根目�
 自身路径解析 Bundle 内文件，支持重复执行，并在失败时返回非零退出码。此类 Bundle 要求主机
 `PATH` 中存在 Bash。`PAOS_SKILL_NAME` 与 `PAOS_SKILL_VERSION` 可用于 dataflow 占位符，
 也会进入 Dora 进程环境。
+
+Hook 的环境契约：除 `PAOS_SKILL_NAME` / `PAOS_SKILL_VERSION` 外，PAOS 还会传入
+`PAOS_SKILL_PROFILE`（本次启动的 profile 名）、`PAOS_SKILL_ROOT`（Bundle 根目录）和
+`PAOS_HOOK_PYTHON`（运行 PAOS Core 的解释器）。`PAOS_HOOK_PYTHON` 只保证能执行 Core 自身的依赖，
+**不保证**包含任何模型运行时依赖：要在 Hook 里准备 CUDA 版 PyTorch / transformers 之类，请自行创建
+虚拟环境或调用外部工具，不要假定它可用。
+
+`profiles.<profile>.required_tools` 是可选字段：写了覆盖 Skill 级 `required_tools`，不写则继承。
+这一个字段同时承担两个契约——启动与状态健康检查要求就绪的 Tool 集合，以及 AgentTask 允许该 Skill
+调用的 Tool allowlist（`forge/binding.py` 冻结进 AgentTask 的 `required_tools` 就是同一份列表）。
+因此一个 Bundle 可以按 profile 暴露不同工具面，而同一 profile 的这两处始终一致。
+
+`profiles.<profile>.required_tools` 需要支持该字段的 PAOS Core。不支持它的 Core（含 v1.0.0）会把整个
+Bundle 判为 `profiles.<profile> has unknown field(s): required_tools` 并拒绝安装，发布这类 Bundle 时
+请在说明里写明最低 Core 版本。
 
 ## 5. 打包、发布与本地闭环
 
@@ -173,8 +192,10 @@ rollback。不得要求调用方关闭摘要校验。
 
 ### 5.2 不可变发布顺序
 
-1. 先发布并登记所有 Node artifacts。每个 `executable_tar_gz` 归档根目录只能包含一个与
-   `entrypoint` 同名的 executable，最终归档 SHA-256 必须写入 Skill lock。
+1. 先发布并登记所有 Node artifacts。`executable_tar_gz` 归档根目录只能包含一个与
+   `entrypoint` 同名的 executable；`directory_tar_gz` 归档根目录只能包含一个与
+   `entrypoint` 同名的目录（内含同名 executable 与运行时树）。最终归档 SHA-256 必须写入
+   Skill lock。
 2. 固定 `skill.yaml` 的 name/version、profiles 与 Node locks，执行打包，并保存输出的 Bundle
    SHA-256 与 `size_bytes`。
 3. 将 Bundle 上传到不可覆盖、长期有效的 HTTPS 对象键。上传后从最终 URL 回读并重新校验

@@ -1,6 +1,7 @@
 """Image tools for analyzing and displaying images."""
 
 import base64
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -8,7 +9,7 @@ from loguru import logger
 
 from PhyAgentOS.agent.tools.base import Tool
 from PhyAgentOS.bus.events import OutboundMessage
-from PhyAgentOS.providers.providers_manager import ProvidersManager
+from PhyAgentOS.providers.base import LLMProvider
 
 
 class ImageTool(Tool):
@@ -23,7 +24,7 @@ class ImageTool(Tool):
 
     def __init__(
         self,
-        provider: ProvidersManager,
+        provider: LLMProvider,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         default_channel: str = "",
         default_chat_id: str = "",
@@ -213,6 +214,11 @@ class ImageTool(Tool):
         Returns:
             Analysis result (vision mode), status message (display mode), or generation result (generate mode).
         """
+        if mode in ("vision", "display"):
+            # Model-supplied read paths get debris tolerance (see _clean_image_path).
+            # generate's image_path is an output filename, not an existing file,
+            # so it is left untouched.
+            image_path = self._clean_image_path(image_path)
         if mode == "vision":
             return await self._execute_vision(text=text, image_path=image_path, **kwargs)
         elif mode == "display":
@@ -230,6 +236,52 @@ class ImageTool(Tool):
             )
         else:
             return f"Error: Invalid mode '{mode}'. Must be 'vision', 'display', or 'generate'."
+
+    @staticmethod
+    def _clean_image_path(image_path: str) -> str:
+        """Tolerate leaked reasoning debris around the path.
+
+        Models occasionally emit chain-of-thought fragments inside the
+        argument value (e.g. ``"/path/frame.jpg conventionaloops"``) or wrap
+        it in quotes. Quotes are honoured first — a quoted path may itself
+        contain spaces, so the closing quote, not whitespace, ends it —
+        then a whitespace-free prefix is tried: file paths from tool
+        results never contain spaces in these flows. Every rewrite is
+        gated on the candidate existing, so an already-valid path is
+        returned unchanged.
+        """
+        cleaned = image_path.strip()
+        if not cleaned:
+            return ""
+
+        candidates: list[str] = []
+        # Quote-wrapped path (possibly followed by debris): the closing quote ends it.
+        if cleaned[:1] in "\"'`":
+            end = cleaned.find(cleaned[0], 1)
+            if end > 0:
+                candidates.append(cleaned[1:end].strip())
+        # Wrapping punctuation stripped from the edges only.
+        base = cleaned.strip("\"'`").strip()
+        candidates.append(base)
+        # Debris separated by whitespace after the path.
+        if " " in base and not Path(base).exists():
+            candidates.append(base.split()[0].strip("\"'`").strip())
+
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+
+        # Debris glued on WITHOUT whitespace (e.g. "/path/frame.jpgjunk"):
+        # keep the prefix ending at the last image extension, but only when
+        # that candidate actually exists on disk.
+        last = candidates[-1]
+        if last:
+            match = re.match(r"^(.*\.(?:jpe?g|png|gif|webp|bmp))", last, re.IGNORECASE)
+            if match:
+                candidate = match.group(1)
+                if candidate != last and Path(candidate).exists():
+                    return candidate
+        return last
 
     async def _execute_vision(self, text: str, image_path: str, **kwargs: Any) -> str:
         """
@@ -291,6 +343,9 @@ class ImageTool(Tool):
         Returns:
             Status message indicating success or error.
         """
+
+        if not image_path:
+            return "Error: No image provided. Please provide at least one image path."
 
         if not self._send_callback:
             return "Error: Message sending not configured"

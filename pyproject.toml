@@ -1,14 +1,14 @@
 [project]
 name = "PhyAgentOS-ai"
-version = "1.0.0"
-description = "Recursive Self-Improvement Infrastructure for Physical Agents"
+version = "1.1.0"
+description = "A lightweight personal AI assistant framework"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
     {name = "PhyAgentOS contributors"}
 ]
-keywords = ["embodied-ai", "robotics", "agent-os", "verification"]
+keywords = ["ai", "agent", "chatbot"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
@@ -43,6 +43,7 @@ dependencies = [
     "prompt-toolkit>=3.0.50,<4.0.0",
     "mcp>=1.26.0,<2.0.0",
     "json-repair>=0.57.0,<1.0.0",
+    "jsonschema>=4.23,<5",
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
     "tiktoken>=0.12.0,<1.0.0",

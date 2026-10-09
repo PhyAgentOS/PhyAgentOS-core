@@ -11,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from PhyAgentOS.skill_runtime.catalog import SkillCatalog
+from PhyAgentOS.skill_runtime.manifest import ManifestError
 from PhyAgentOS.verification.contracts import utc_now
 
 
@@ -94,6 +95,7 @@ class ForgeSkillBindingResolver:
         self.catalog = catalog or SkillCatalog()
         self._candidates: dict[str, ForgeSkillBindingCandidate] = {}
         self._lock = threading.RLock()
+        self.interaction_candidates: dict[str, dict] = {}
 
     def _runtime(self) -> Any:
         runtime = self.runtime_registry.current()
@@ -108,10 +110,21 @@ class ForgeSkillBindingResolver:
                 f"active Forge runtime is {runtime.skill_name!r}, not {skill_name!r}"
             )
         manifest = self.catalog.get(skill_name)
+        from PhyAgentOS.forge.interaction.binding import verified_extension
+        extension = verified_extension(manifest)
         if manifest.version != runtime.skill_version:
             raise ForgeSkillBindingError("installed Skill changed after Runtime startup")
+        try:
+            tool_ids = manifest.tools_for_profile(runtime.profile)
+        except ManifestError as exc:
+            # The Bundle was replaced underneath a live Runtime, so the profile
+            # it was started with no longer exists and there is no Tool surface
+            # to bind. Report a binding failure instead of a manifest error.
+            raise ForgeSkillBindingError(
+                f"installed Skill no longer declares profile {runtime.profile!r}"
+            ) from exc
         tools: list[BoundToolSpec] = []
-        for tool_id in sorted(manifest.required_tools):
+        for tool_id in sorted(tool_ids):
             response = await runtime.client.get_tool(tool_id)
             spec = _response_data(response, f"ToolSpec {tool_id!r}")
             semantics = spec.get("semantics")
@@ -158,6 +171,8 @@ class ForgeSkillBindingResolver:
         )
         with self._lock:
             self._candidates[candidate.candidate_id] = candidate
+            if extension is not None:
+                self.interaction_candidates[candidate.candidate_id] = extension
         return candidate
 
     async def freeze(self, candidate_id: str, *, task_id: str) -> ForgeSkillBinding:
@@ -165,7 +180,10 @@ class ForgeSkillBindingResolver:
             candidate = self._candidates.get(candidate_id)
         if candidate is None:
             raise ForgeSkillBindingError("activation binding candidate is missing or expired")
+        extension = self.interaction_candidates.get(candidate_id)
         current = await self.preview(candidate.skill_name)
+        if extension != self.interaction_candidates.get(current.candidate_id):
+            raise ForgeSkillBindingError("interaction bundle changed after activation")
         if _candidate_payload(current) != _candidate_payload(candidate):
             raise ForgeSkillBindingError(
                 "Skill Runtime or ToolSpec changed after activation; activate the Skill again"
@@ -182,8 +200,9 @@ class ForgeSkillBindingResolver:
         binding: ForgeSkillBinding,
         tool_id: str,
         semantics: Literal["query", "action", "session"],
+        *, runtime: Any | None = None,
     ) -> BoundToolSpec:
-        runtime = self._runtime()
+        runtime = runtime or self._runtime()
         if (
             runtime.runtime_instance_id != binding.runtime_instance_id
             or runtime.gateway_url != binding.gateway_url

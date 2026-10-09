@@ -25,6 +25,7 @@ _MANIFEST_FIELDS = {
 _PROFILE_FIELDS = {
     "dataflow",
     "startup_timeout_s",
+    "required_tools",
     "required_binaries",
     "required_assets",
     "required_environment",
@@ -40,6 +41,7 @@ _NODE_LOCK_FIELDS = {
     "entrypoint",
     "sha256",
 }
+_NODE_ARTIFACT_TYPES = {"executable_tar_gz", "directory_tar_gz"}
 
 
 class ManifestError(ValueError):
@@ -85,6 +87,16 @@ def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
     return items
 
 
+def _optional_string_tuple(value: Any, label: str) -> tuple[str, ...] | None:
+    """Parse an optional non-empty string list; ``None`` means "inherit"."""
+    if value is None:
+        return None
+    items = _string_tuple(value, label)
+    if not items:
+        raise ManifestError(f"{label} must not be empty")
+    return items
+
+
 def _path_tuple(value: Any, label: str) -> tuple[Path, ...]:
     if value is None:
         return ()
@@ -110,6 +122,7 @@ class RuntimeProfile:
 
     dataflow: Path
     startup_timeout_s: float | None = None
+    required_tools: tuple[str, ...] | None = None
     required_binaries: tuple[Path, ...] = ()
     required_assets: tuple[Path, ...] = ()
     required_environment: tuple[str, ...] = ()
@@ -131,6 +144,9 @@ class RuntimeProfile:
             startup_timeout_s=_optional_positive_float(
                 data.get("startup_timeout_s"), f"{label}.startup_timeout_s"
             ),
+            required_tools=_optional_string_tuple(
+                data.get("required_tools"), f"{label}.required_tools"
+            ),
             required_binaries=_path_tuple(
                 data.get("required_binaries"), f"{label}.required_binaries"
             ),
@@ -146,7 +162,12 @@ class RuntimeProfile:
 
 @dataclass(frozen=True)
 class NodeLock:
-    """Immutable reference to one single-executable ``tar.gz`` release asset."""
+    """Immutable reference to a pinned ``tar.gz`` node release asset.
+
+    ``executable_tar_gz`` archives contain a single root-level executable;
+    ``directory_tar_gz`` archives contain one root directory named after the
+    entrypoint that holds the executable and its runtime tree.
+    """
 
     node_id: str
     artifact_id: str
@@ -171,9 +192,10 @@ class NodeLock:
         artifact_type = _string(
             data.get("artifact_type"), f"{label}.artifact_type"
         ).lower()
-        if artifact_type != "executable_tar_gz":
+        if artifact_type not in _NODE_ARTIFACT_TYPES:
             raise ManifestError(
-                f"{label}.artifact_type must be 'executable_tar_gz'; "
+                f"{label}.artifact_type must be one of "
+                f"{', '.join(sorted(_NODE_ARTIFACT_TYPES))}; "
                 "additional artifact types are reserved for future installers"
             )
         entrypoint = _string(data.get("entrypoint"), f"{label}.entrypoint")
@@ -280,6 +302,29 @@ class SkillManifest:
         if not document.is_file():
             raise ManifestError("skill_document does not exist in the Skill bundle")
         return manifest
+
+    def tools_for_profile(self, profile_name: str) -> tuple[str, ...]:
+        """Resolve the Tool allowlist for one profile.
+
+        ``profiles.<name>.required_tools`` overrides the Skill-wide list;
+        profiles without the field keep the Skill-wide list. The resolved
+        list is both the startup health-check set (``RuntimeManager``) and
+        the AgentTask Skill allowlist (``forge.binding``), so one Skill can
+        expose a different Tool surface per profile.
+
+        An unknown profile is an error rather than an implicit fallback:
+        resolving it to the Skill-wide list would check, and admit, a Tool
+        surface the profile never declared.
+        """
+        profile = self.profiles.get(profile_name)
+        if profile is None:
+            available = ", ".join(sorted(self.profiles))
+            raise ManifestError(
+                f"unknown profile {profile_name!r}; available profiles: {available}"
+            )
+        if profile.required_tools is None:
+            return self.required_tools
+        return profile.required_tools
 
     def resolve_bundle_path(self, relative: Path) -> Path:
         """Resolve and contain a path within this bundle."""

@@ -73,6 +73,179 @@ Python package `dora-rs` 是 Python node/operator API，不能替代 Dora CLI �
 
 ## 2. 配置模型与 Forge
 
+无需编辑 JSON，即可管理已注册的 Provider：
+
+```bash
+paos provider list                    # 普通表格；加 --json 输出机器可读结果
+paos provider configure               # TTY 中打开行内键盘选择器
+paos provider configure openrouter    # 输入密钥和 endpoint，测试后获取并多选模型
+paos provider show                    # 选择供应商，脱敏查看
+paos provider test                    # 选择供应商，发送最小测试请求
+paos provider use                     # 选择供应商及已保存模型，设为默认
+paos provider use openrouter --model anthropic/claude-sonnet-4
+paos provider login                   # 选择 OAuth 供应商并登录
+paos provider remove                  # 选择供应商并清除存储的配置
+```
+
+除 OAuth login 外，以上管理命令都支持 `--config /path/to/config.json`。
+在 TTY 中，`configure`、`show`、`test`、`use`、`remove`、`login` 省略供应商名称时会
+打开相应选择器。也可直接传名称（不区分大小写）；非交互环境必须显式指定名称。
+向导用上下键选择、Enter 确认；Esc 或 Ctrl+C 取消时不保存。仅当 stdin、stdout 均为 TTY 时
+启动，不进入全屏页面。OAuth 状态只代表本地存在凭据，实际有效性请用 `provider test` 验证。
+`remove` 不撤销共享 OAuth token，也不修改已有进程使用的环境变量。
+`remove` 会持久化清空该供应商的 API Key、API Base、Header、默认模型和模型列表，保留
+供应商字段并标记 `enabled: false`，防止环境变量或共享登录凭据将它自动恢复。
+`list` 和 `configure` 中仍可看到该内置供应商，但状态为未配置；`use`、`test` 的选择器不再列出它。
+移除当前默认供应商时也会清空全局供应商、模型和推理设置，请用 `provider use` 重新选择。
+重新执行 `provider configure` 并成功保存后恢复启用。Ollama 的内置地址仅作为配置建议，
+不会使空配置自动变成已配置。
+
+输入 API Key、API Base 和可选 Header 后，向导会询问是否测试连接并获取模型列表。
+确认后用上下键定位、空格多选要添加的模型，再按 Enter 确认并选择默认模型。
+已添加模型保存在该 Provider 的 `models` 列表中，再次配置时可继续添加。
+获取列表不会发送聊天请求；要验证具体模型能否对话，请执行 `provider test`。
+跳过测试或接口不支持模型列表时，可选择已保存模型或手动输入模型 ID；OAuth 和 Azure
+目前使用此方式，Azure 需填写部署名称。认证或网络失败时不保存本次配置。
+`paos provider use <provider>` 在 TTY 中会展示已保存模型供选择，非交互环境仍可用 `--model`。
+使用 `--reasoning-effort <档位>` 可同时保存兼容的默认推理强度，使用 `--reasoning-effort none`
+可清除已保存的覆盖值。省略此选项时保留原值；不兼容的选择不会修改配置。例如，从推理模型
+切换到 DeepSeek：`paos provider use deepseek --reasoning-effort none`。
+`provider show` 展示已保存模型，长 API Key 显示前后各 4 位，中间隐藏；短密钥全部隐藏。
+
+Docker、CI 和远程服务器应明确指定 Provider、模型，并通过 stdin、环境变量或挂载的
+Secret 文件传入密钥。不提供明文 `--api-key` 参数：
+
+```bash
+paos provider configure openrouter --model anthropic/claude-sonnet-4 \
+  --api-key-stdin < /run/secrets/openrouter_api_key
+paos provider configure openrouter --model anthropic/claude-sonnet-4 \
+  --api-key-env OPENROUTER_API_KEY
+paos provider configure custom --api-base http://localhost:8000/v1 --model gpt-5 \
+  --api-key-file /run/secrets/custom_api_key --headers-file /run/secrets/headers.json
+```
+
+`--headers-file` 读取键和值均为字符串的 JSON 对象。向导隐藏 API Key 和 Header 值，错误信息
+不回显服务端响应正文。启动时也可通过 `PAOS_<PROVIDER>_API_KEY` 提供凭据，例如
+`PAOS_OPENROUTER_API_KEY`；支持对应供应商的标准变量，如 `OPENAI_API_KEY`、
+`ANTHROPIC_API_KEY`。网关别名不会借用 OpenAI 的密钥。
+运行时环境凭据不落盘，只有明确配置该 Provider 时才保存。
+
+Amazon Bedrock 使用 AWS SDK 凭证链（环境凭据、AWS profile 或 IAM 角色）及 AWS 区域配置，
+无需提供 Provider API Key。已有 `provider: auto` 配合 `bedrock/...` 模型的配置可继续使用，
+也可以显式保存默认选择：
+
+```bash
+paos provider use bedrock --model bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0 --reasoning-effort none
+```
+
+供应商列表将 AWS 凭据标为未测试，SDK 在实际请求时解析凭据。Bedrock 暂不支持模型发现，
+需手动输入模型或推理配置文件 ID。AWS 凭据不会复制到 PAOS 配置中。移除 Bedrock 后，
+需通过 `paos provider configure bedrock --model <model-id>` 重新启用。
+
+`custom`（Chat Completions）与 `openai_responses`（Responses）均要求显式配置
+`--api-base`；API Key 可省略以连接无鉴权的本地服务。使用需要鉴权的服务时，通过上述
+安全输入方式提供密钥。未配置地址时不会回退到 SDK 默认地址。例如：
+
+```bash
+paos provider configure openai_responses --api-base http://localhost:8000/v1 --model local-model
+```
+
+启动参数只影响新进程：
+
+```bash
+paos agent --provider openai --model gpt-5 --reasoning-effort high
+paos gateway --provider openrouter --model anthropic/claude-sonnet-4
+```
+
+Agent 内 `/help` 列出全部命令。使用 `/provider [list|<provider>]`、
+`/model [list|<编号>|<model-id>]`、`/effort [list|<档位>|none]` 和 `/status` 查看或切换当前会话。
+终端聊天中直接输入 `/model` 会打开模型选择器，展示所有已配置供应商下保存的模型并标注
+供应商。上下键选择、Enter 确认后立即切换当前会话的供应商和模型，下一条消息使用新选择。
+Esc 或 Ctrl+C 取消选择并返回聊天。`/model list` 只查看列表；非终端渠道保留文字列表与编号选择。
+`/model list` 展示当前 Provider 已保存模型及编号，例如 `/model 2` 选择第 2 个模型。
+旧配置中的默认模型也会保留为选项。列表不代表已经验证聊天可用；不兼容的模型路由、
+思考程度会被拒绝，保留原选择。`none` 表示移除显式思考程度，采用模型默认行为。
+Custom endpoint 或 Azure 部署别名的能力未知时应使用 `none`；显式指定思考程度需要可识别的
+推理模型名称。
+
+终端聊天输入 `/effort` 显示行内列表：上下键移动、Enter 确认、Esc / Ctrl+C 取消。
+`/effort list` 查看当前模型可选档位。菜单和启动校验使用同一套供应商及模型能力判断，
+从 `minimal / low / medium / high / xhigh / max` 中仅展示支持的档位。
+额外档位需要本地目录明确支持且适配器可映射；网关可选档位可能与原厂接口不同。
+支持 `max` 的自适应 Claude 使用 `output_config.effort`，传统 Claude 使用思考预算。
+`none` 始终表示模型默认行为，不代表关闭思考。详见[推理强度](reasoning-effort.md)。
+
+**Requesty 的推理强度限制：** 当前 PAOS 的 Requesty 接入尚不支持显式推理强度档位。
+即使所选模型本身支持推理，`high` 等覆盖值仍会被 PAOS 的本地能力校验拒绝，请求不会发送到
+Requesty。如果原配置或当前会话保留了显式推理强度，切换到 Requesty 或使用它启动时也会失败。
+请清除覆盖值，使用模型默认行为。
+
+已配置 Requesty 凭据后，可以同时切换默认供应商并清除已保存的推理强度：
+
+```bash
+paos provider use requesty --model openai/gpt-5 --reasoning-effort none
+```
+
+仅为本次启动清除覆盖值时，使用：
+
+```bash
+paos agent --provider requesty --model openai/gpt-5 --reasoning-effort none
+```
+
+在已有会话中，先执行 `/effort none`，再执行 `/provider requesty`。直接编辑 JSON 时，
+将 `agents.defaults.reasoningEffort` 设为 `null` 或删除该字段，并在新进程中使用修改后的配置。
+这里的 `none` 仍表示采用模型默认行为，不代表关闭模型推理。
+
+**Cheaper Inference**（`cheaperinference`）的配置方式相同，也有同样的限制。将
+https://cheaperinference.com/signup 获取的 key 填入 `providers.cheaperinference.apiKey`，
+模型 id 直接写 `gpt-5.4-mini` 这类格式：
+
+```bash
+paos provider use cheaperinference --model gpt-5.4-mini --reasoning-effort none
+```
+
+**[API Route](https://www.api-route.com)**（`api_route`）使用相同的网关配置方式。在其控制台
+创建密钥，填入 `providers.api_route.apiKey`，或在启动时提供 `API_ROUTE_API_KEY` /
+`PAOS_API_ROUTE_API_KEY`。默认地址为 `https://global.api-route.com/v1`；填写密钥可用的
+模型 ID，不要额外添加厂商前缀。本接入同样沿用 PAOS 对网关推理强度的保守校验，选择时
+请清除显式推理强度：
+
+```bash
+paos provider use api_route --model gpt-6.1-sol --reasoning-effort none
+```
+
+在已有会话中，依次执行 `/effort none`、`/provider api_route`，然后执行
+`/model <model-id>`，填写密钥可用且不带厂商前缀的模型 ID。未设置
+`providers.api_route.defaultModel` 时，切换 Provider 会沿用原模型，包括其厂商前缀。
+
+优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
+开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
+子 Agent、Forge 任务、verification、evolution、记忆整理、Cron 和 Heartbeat 继续使用启动配置。
+切换不会重启或停止进程，也不会改写全局默认值。`/provider reset` 清除会话覆盖；`/new` 只清理
+会话上下文，保留当前选择。会话覆盖在进程退出后失效。永久默认值请通过 `paos provider use`
+设置，只影响未来启动的进程。
+
+安全边界：
+
+- `configure`、`use`、`remove` 的配置读—改—写使用跨进程锁；竞争时本次操作不写入，提示稍后
+  重试。不要删除 `.lock` 文件来解锁；锁会在操作结束或进程退出时自动释放。
+- `remove` 不是凭据撤销或运行任务停止操作：已运行进程仍持有自己的配置快照，OAuth 共享
+  登录也不会被删除。需要立即撤销访问时，应在供应商端撤销凭据，并通过现有生命周期流程
+  停止相关进程与任务；不能把本地进程退出视为物理机器人已经停止。
+- 切换不会清空会话历史，后续请求可能把已有上下文发送给新选择的供应商。只配置可信的
+  endpoint，并限制聊天渠道的授权用户。验证子进程是受信任的本地进程，不是隔离不可信代码
+  的安全沙箱；会话切换不扩大 Forge 权限或改变任务 ownership。
+
+使用现有 Docker CLI service：
+
+```bash
+docker compose run --rm -T phyagentos-cli provider configure openrouter \
+  --model anthropic/claude-sonnet-4 --api-key-stdin < /path/to/secret
+docker compose run --rm -T phyagentos-cli provider use openrouter
+docker compose up -d phyagentos-gateway
+docker compose run --rm phyagentos-cli agent --provider openai --model gpt-5 --reasoning-effort high
+```
+
 先配置一个模型 Provider 和 Forge timeout/evidence policy。Runtime 不是配置开关，而由显式
 启动的 Skill profile 决定。配置以 camelCase 保存，也接受 snake_case。
 

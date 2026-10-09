@@ -75,6 +75,198 @@ assets and checksums. Do not follow an unversioned installer that can select a n
 
 ## 2. Configure the model and Forge
 
+Manage registered providers without editing JSON:
+
+```bash
+paos provider list                    # plain table; add --json for automation
+paos provider configure               # inline keyboard selector in a TTY
+paos provider configure openrouter    # enter credentials, test and select models from the API
+paos provider show                    # select a provider and view masked settings
+paos provider test                    # select a provider and send a minimal test request
+paos provider use                     # select a provider and saved model as the default
+paos provider use openrouter --model anthropic/claude-sonnet-4
+paos provider login                   # select an OAuth provider and log in
+paos provider remove                  # select a provider and clear stored settings
+```
+
+All management commands except OAuth login accept `--config /path/to/config.json`.
+In a TTY, omitting the provider name from `configure`, `show`, `test`, `use`, `remove`, or `login`
+opens the appropriate picker. Explicit names are case-insensitive and remain required outside a TTY.
+The wizard uses Up/Down and Enter; Esc or Ctrl+C cancels without saving. It runs only when
+stdin and stdout are terminals and never opens a full-screen UI. OAuth status means local
+credentials exist, not that they have been validated. `remove` does not revoke shared OAuth
+tokens or alter environment variables used by running processes.
+`remove` persistently clears the provider's API key, API base, headers, default model and saved
+models. It retains the provider field with `enabled: false` so environment credentials or shared
+OAuth tokens cannot automatically restore it. `list` and `configure` show it as unconfigured;
+the `use` and `test` pickers omit it. Removing the current default also clears the global provider,
+model and reasoning effort; run `provider use` to select a new default. Successfully saving through
+`provider configure` enables it again. Ollama's built-in endpoint is only a configuration suggestion
+and does not make empty settings count as configured.
+
+After API Key, API Base and optional headers, the wizard asks whether to test the connection
+and fetch models. Use Up/Down and Space to select models to add, then Enter to confirm and
+choose a default. Choices are saved in the provider's `models` list; configuring again can add more.
+Listing models does not send a chat request; use `provider test` to verify a specific model.
+If you skip discovery or the endpoint does not support it, select a saved model or enter an ID
+manually. OAuth and Azure currently use this fallback; Azure requires a deployment name.
+Authentication or network failures leave configuration unchanged.
+`paos provider use <provider>` offers saved models in a TTY; `--model` remains available for scripts.
+Use `--reasoning-effort <level>` to save a compatible effort together with the default provider/model,
+or `--reasoning-effort none` to clear the saved override. Omitting the option retains the saved effort;
+an incompatible selection leaves the configuration unchanged. For example, when switching from a
+reasoning model to DeepSeek: `paos provider use deepseek --reasoning-effort none`.
+`provider show` includes saved models and displays the first and last four characters of long API
+keys with the middle masked. Short keys are fully masked.
+
+For Docker, CI and remote servers, select a provider and model explicitly and read secrets from
+stdin, an environment variable, or a mounted file. There is no plaintext `--api-key` option:
+
+```bash
+paos provider configure openrouter --model anthropic/claude-sonnet-4 \
+  --api-key-stdin < /run/secrets/openrouter_api_key
+paos provider configure openrouter --model anthropic/claude-sonnet-4 \
+  --api-key-env OPENROUTER_API_KEY
+paos provider configure custom --api-base http://localhost:8000/v1 --model gpt-5 \
+  --api-key-file /run/secrets/custom_api_key --headers-file /run/secrets/headers.json
+```
+
+`--headers-file` reads a JSON object of string header names/values. API keys and header values
+are hidden in the wizard; errors never include server response bodies. Environment credentials
+can also be provided at startup as `PAOS_<PROVIDER>_API_KEY` (for example,
+`PAOS_OPENROUTER_API_KEY`). Standard matching provider variables such as `OPENAI_API_KEY` and
+`ANTHROPIC_API_KEY` are accepted too. Gateway aliases do not borrow `OPENAI_API_KEY`.
+Runtime environment values are not written to configuration unless explicitly configuring that provider.
+
+Amazon Bedrock uses the AWS SDK credential chain (environment credentials, AWS profiles or IAM roles)
+and AWS region settings. No provider API key is required. Existing `provider: auto` configurations with
+a `bedrock/...` model continue to work. You can also save a default explicitly:
+
+```bash
+paos provider use bedrock --model bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0 --reasoning-effort none
+```
+
+The provider list labels AWS credentials as not tested; they are resolved by the SDK when a request is
+sent. Bedrock model discovery is unavailable, so enter a model or inference-profile ID manually.
+AWS credentials are not copied into the PAOS configuration. Removing Bedrock disables it until it is
+enabled again with `paos provider configure bedrock --model <model-id>`.
+
+`custom` (Chat Completions) and `openai_responses` (Responses) both require an explicit
+`--api-base`. API keys are optional for unauthenticated local services; use the secure input
+methods above when the endpoint requires authentication. A missing endpoint never falls back
+to the SDK default. For example:
+
+```bash
+paos provider configure openai_responses --api-base http://localhost:8000/v1 --model local-model
+```
+
+Startup overrides apply only to the new process:
+
+```bash
+paos agent --provider openai --model gpt-5 --reasoning-effort high
+paos gateway --provider openrouter --model anthropic/claude-sonnet-4
+```
+
+In the Agent, `/help` lists all commands. Use `/provider [list|<provider>]`,
+`/model [list|<number>|<model-id>]`, `/effort [list|<level>|none]`, and `/status` to inspect or change
+the current session. `/model list` numbers the current provider's saved models; `/model 2` selects
+the second entry. Defaults from older configurations remain available. Listing is not a chat
+availability check. Unsupported model routes or effort settings are rejected
+without changing the session. `none` removes the explicit effort setting and uses the model default.
+Custom endpoints and Azure deployment aliases with unknown capabilities should use `none`;
+choose a recognized reasoning model ID to request an explicit effort.
+
+Bare `/effort` in terminal chat shows an inline list: Up/Down moves, Enter confirms, and
+Esc or Ctrl+C cancels. `/effort list` displays the current model's supported levels.
+The menu and startup validation use the same provider/model capabilities: `minimal`, `low`,
+`medium`, `high`, `xhigh`, or `max` appear only when supported. Extra levels require explicit
+local catalog support and a working adapter mapping. Gateway choices can differ from native
+provider choices. For adaptive Claude, supported `max` maps to `output_config.effort`; legacy
+Claude continues to use thinking budgets. `none` always means model default, not disabled thinking.
+
+**Requesty reasoning effort limitation:** The current PAOS Requesty integration does not support
+explicit reasoning effort levels. Even when the selected model supports reasoning, overrides such
+as `high` are rejected by PAOS's local capability validation before any request reaches Requesty.
+A saved or session-level effort override can therefore prevent startup or switching to Requesty.
+Clear the override to use the model's default behavior.
+
+After configuring Requesty credentials, switch the persistent default and clear the saved effort:
+
+```bash
+paos provider use requesty --model openai/gpt-5 --reasoning-effort none
+```
+
+To clear the override only for a new process, use:
+
+```bash
+paos agent --provider requesty --model openai/gpt-5 --reasoning-effort none
+```
+
+In an existing session, run `/effort none` before `/provider requesty`. When editing JSON directly,
+set `agents.defaults.reasoningEffort` to `null` or remove the field, then start a new process with
+the updated configuration. Here too, `none` uses the model default; it does not disable reasoning.
+
+**Cheaper Inference** (`cheaperinference`) is configured the same way and has the same limitation.
+Put a key from https://cheaperinference.com/signup in `providers.cheaperinference.apiKey` and use
+bare model ids such as `gpt-5.4-mini`:
+
+```bash
+paos provider use cheaperinference --model gpt-5.4-mini --reasoning-effort none
+```
+
+**[API Route](https://www.api-route.com)** (`api_route`) uses the same gateway configuration.
+Create a key in its dashboard and put it in `providers.api_route.apiKey`, or supply
+`API_ROUTE_API_KEY` / `PAOS_API_ROUTE_API_KEY` at startup. The default endpoint is
+`https://global.api-route.com/v1`; use a model ID available to your key without adding a vendor
+prefix. This integration also uses PAOS's conservative gateway effort validation, so clear any
+explicit reasoning effort when selecting it:
+
+```bash
+paos provider use api_route --model gpt-6.1-sol --reasoning-effort none
+```
+
+In an existing session, run `/effort none`, then `/provider api_route`, followed by
+`/model <model-id>` using a bare model ID available to your key. Without
+`providers.api_route.defaultModel`, switching providers retains the previous model,
+including any vendor prefix.
+
+In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
+labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
+session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.
+`/model list` only displays the list. Non-terminal channels retain text lists and numbered selection.
+
+Precedence is **session override → process startup override → config default**. Each running turn
+keeps its provider/model/effort through all retries and tool calls. Changes affect subsequent turns
+of the same session only: other sessions, running subagents, Forge tasks, verification, evolution,
+memory consolidation, Cron and Heartbeat continue using startup settings. Changes do not restart or
+stop processes and never save global defaults. `/provider reset` clears session overrides;
+`/new` only clears conversation history and keeps the session selection. Overrides expire when the
+process exits. Use `paos provider use` to set persistent defaults for future processes.
+
+Security boundaries:
+
+- `configure`, `use`, and `remove` serialize configuration read-modify-write operations with a
+  cross-process lock. A competing operation makes no changes and asks you to retry. Do not delete
+  the `.lock` file to unlock it; ownership is released when the operation or process ends.
+- `remove` neither revokes credentials nor stops running tasks. Existing processes retain their
+  own configuration snapshots, and shared OAuth logins remain intact. For immediate revocation,
+  revoke credentials with the provider and use the existing lifecycle controls to stop affected
+  processes and tasks. A local process exiting does not prove that a physical robot has stopped.
+- Switching keeps conversation history, so subsequent requests may send existing context to the
+  newly selected provider. Configure only trusted endpoints and restrict authorized channel users.
+  The verifier subprocess is a trusted local process, not a sandbox for untrusted code. Session
+  switching does not expand Forge permissions or change task ownership.
+
+Docker examples using the existing CLI service:
+
+```bash
+docker compose run --rm -T phyagentos-cli provider configure openrouter \
+  --model anthropic/claude-sonnet-4 --api-key-stdin < /path/to/secret
+docker compose run --rm -T phyagentos-cli provider use openrouter
+docker compose up -d phyagentos-gateway
+docker compose run --rm phyagentos-cli agent --provider openai --model gpt-5 --reasoning-effort high
+```
+
 Configure one supported model provider and the Forge timeout/evidence policy. Runtime selection is
 not a configuration switch; it follows the Skill profile that you start explicitly. Configuration
 is serialized in camelCase and also accepts snake_case.

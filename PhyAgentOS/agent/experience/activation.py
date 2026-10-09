@@ -74,6 +74,15 @@ class SkillActivationManager:
             raise ValueError(f"Skill {name!r} is not registered or is unavailable")
         if role not in {"primary", "supporting"}:
             raise ValueError("role must be primary or supporting")
+        if self.binding_resolver is not None:
+            from PhyAgentOS.forge.interaction.binding import verified_extension
+            try:
+                installed = self.binding_resolver.catalog.get(name)
+            except (LookupError, FileNotFoundError):
+                installed = None
+            if installed is not None and verified_extension(installed) is not None:
+                if Path(skill["path"]).resolve() != (installed.bundle_root / "SKILL.md").resolve():
+                    raise ValueError("interaction Skill cannot be shadowed by workspace content")
         content = Path(skill["path"]).read_text(encoding="utf-8")
         skill_version: str | None = None
         manifest_path = Path(skill["path"]).parent / "skill.yaml"

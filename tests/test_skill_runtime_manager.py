@@ -125,7 +125,7 @@ def test_start_uses_named_attached_launcher_for_relative_mujoco_dataflow(
     monkeypatch.setattr(
         manager,
         "_tool_context_readiness",
-        lambda manifest: {tool_id: True for tool_id in manifest.required_tools},
+        lambda manifest, tools: {tool_id: True for tool_id in tools},
     )
 
     state = manager.start("move-arm-by-ee", "mujoco")
@@ -165,7 +165,7 @@ def test_start_is_idempotent_when_live_runtime_is_ready(
     monkeypatch.setattr(
         manager,
         "_tool_context_readiness",
-        lambda manifest: {tool_id: True for tool_id in manifest.required_tools},
+        lambda manifest, tools: {tool_id: True for tool_id in tools},
     )
     monkeypatch.setattr(manager, "_start_flow", lambda *args: pytest.fail("started twice"))
 
@@ -258,3 +258,91 @@ def test_start_rejects_node_that_does_not_match_lock(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeManagerError, match="receipt does not match Skill lock"):
         manager.start("move-arm-by-ee", "mujoco")
+
+
+def test_status_checks_the_profile_tool_list(tmp_path: Path, monkeypatch) -> None:
+    manager = _manager(tmp_path)
+    bundle = manager.catalog.root / "move-arm-by-ee"
+    data = yaml.safe_load((bundle / "skill.yaml").read_text())
+    data["profiles"]["mujoco"]["required_tools"] = ["motion.move_pose"]
+    (bundle / "skill.yaml").write_text(
+        yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+    )
+    manager.state_store.save(
+        RuntimeState(
+            skill_name="move-arm-by-ee",
+            profile="mujoco",
+            status="running",
+            flow_name="paos-move-arm-by-ee-mujoco",
+            gateway_url="http://127.0.0.1:19002",
+        )
+    )
+    checked: list[tuple[str, ...]] = []
+
+    def fake_readiness(manifest, tools):
+        checked.append(tools)
+        return {tool_id: True for tool_id in tools}
+
+    monkeypatch.setattr(manager, "_flow_running", lambda flow_name: True)
+    monkeypatch.setattr(manager, "_gateway_snapshot", lambda manifest: {"ok": True})
+    monkeypatch.setattr(manager, "_tool_context_readiness", fake_readiness)
+
+    report = manager.status("move-arm-by-ee")
+
+    # The profile override, not the Skill-wide list, is what readiness checks.
+    assert checked == [("motion.move_pose",)]
+    assert report.ready is True
+
+
+def test_status_reports_profile_missing_from_installed_bundle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(tmp_path)
+    manager.state_store.save(
+        RuntimeState(
+            skill_name="move-arm-by-ee",
+            profile="mujoco-v2",
+            status="running",
+            flow_name="paos-move-arm-by-ee-mujoco-v2",
+            gateway_url="http://127.0.0.1:19002",
+        )
+    )
+    monkeypatch.setattr(manager, "_flow_running", lambda flow_name: True)
+
+    report = manager.status("move-arm-by-ee")
+
+    assert report.state is not None
+    assert report.state.status == "failed"
+    assert "mujoco-v2" in (report.state.last_error or "")
+
+
+def test_start_hook_receives_profile_and_runtime_context(tmp_path, monkeypatch) -> None:
+    manager = _manager(tmp_path)
+    manifest = manager.catalog.get("move-arm-by-ee")
+    hook = manifest.bundle_root / "start.sh"
+    hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    manager._run_start_hook(manifest, "mujoco")
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["PAOS_SKILL_PROFILE"] == "mujoco"
+    assert env["PAOS_HOOK_PYTHON"] == sys.executable
+    assert env["PAOS_SKILL_ROOT"] == str(manifest.bundle_root)
+    assert env["PAOS_SKILL_NAME"] == "move-arm-by-ee"
+    assert env["PAOS_SKILL_VERSION"] == "1.0.0"
+    assert captured["command"] == [
+        "/usr/bin/bash",
+        str(hook),
+        "move-arm-by-ee",
+        "1.0.0",
+    ]

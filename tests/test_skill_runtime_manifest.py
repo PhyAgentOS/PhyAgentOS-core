@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import stat
 import sys
 import tarfile
 from pathlib import Path
@@ -266,6 +268,36 @@ def test_archive_validator_safely_extracts_direct_archive_without_manifest(
     assert (tmp_path / "direct-out/gateway").read_bytes() == b"binary"
 
 
+@pytest.mark.parametrize(
+    ("archive_mode", "expected_mode"),
+    [(0o755, 0o755), (0o644, 0o644), (0o7777, 0o755), (0, 0o600)],
+)
+def test_archive_permissions_without_symlink_chmod_support(
+    tmp_path: Path, monkeypatch, archive_mode: int, expected_mode: int,
+) -> None:
+    original_chmod = os.chmod
+
+    def chmod_without_symlink_support(path, mode, *, follow_symlinks=True, **kwargs):
+        if not follow_symlinks:
+            raise NotImplementedError("chmod: follow_symlinks unavailable on this platform")
+        return original_chmod(path, mode, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", chmod_without_symlink_support)
+    archive = tmp_path / "permissions.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        member = tarfile.TarInfo("gateway")
+        member.size = len(b"binary")
+        member.mode = archive_mode
+        tar.addfile(member, io.BytesIO(b"binary"))
+
+    destination = tmp_path / "out"
+    ArchiveValidator().extract(archive, destination, verify_manifest=False)
+
+    extracted = destination / "gateway"
+    assert extracted.read_bytes() == b"binary"
+    assert stat.S_IMODE(extracted.stat().st_mode) == expected_mode
+
+
 def test_static_package_index_resolves_direct_skill_and_node(tmp_path: Path) -> None:
     index_path = tmp_path / "index.yaml"
     index_path.write_text(
@@ -476,4 +508,43 @@ def test_node_lock_schema_is_strict(tmp_path: Path) -> None:
     (bundle / "skill.yaml").write_text(yaml.safe_dump(skill))
 
     with pytest.raises(ManifestError, match="unknown field"):
+        load_manifest(bundle / "skill.yaml")
+
+
+def test_profile_required_tools_override_and_inherit(tmp_path: Path) -> None:
+    data = _manifest()
+    data["profiles"]["mujoco"]["required_tools"] = ["motion.move_pose"]
+    data["profiles"]["other"] = {"dataflow": "profiles/other/dataflow.yaml"}
+    bundle = _bundle(tmp_path, data)
+
+    manifest = load_manifest(bundle / "skill.yaml")
+
+    assert manifest.tools_for_profile("mujoco") == ("motion.move_pose",)
+    # A profile that omits the field inherits the Skill-wide list.
+    assert manifest.tools_for_profile("other") == (
+        "motion.resolve_relative_pose",
+        "motion.move_pose",
+    )
+    assert manifest.required_tools == (
+        "motion.resolve_relative_pose",
+        "motion.move_pose",
+    )
+
+
+def test_manifest_rejects_unknown_profile_instead_of_falling_back(
+    tmp_path: Path,
+) -> None:
+    bundle = _bundle(tmp_path)
+    manifest = load_manifest(bundle / "skill.yaml")
+
+    with pytest.raises(ManifestError, match="unknown profile 'ghost'"):
+        manifest.tools_for_profile("ghost")
+
+
+def test_profile_required_tools_must_not_be_empty(tmp_path: Path) -> None:
+    data = _manifest()
+    data["profiles"]["mujoco"]["required_tools"] = []
+    bundle = _bundle(tmp_path, data)
+
+    with pytest.raises(ManifestError, match="required_tools must not be empty"):
         load_manifest(bundle / "skill.yaml")

@@ -133,7 +133,7 @@ SQLite update 与 artifact write 在各自边界中保持事务或原子。不�
 ## 11. Skill Runtime 与 Registry 边界
 
 Registry/index client 返回 artifact metadata 与下载。Cache/installer 要求 size 与 SHA-256，
-随后校验 archive inventory 和精确单可执行文件 Node lock，再原子安装。RuntimeManager 启动命名 Dora flow
+随后校验 archive inventory 和 Node 归档契约（单根目录可执行文件，或 `directory_tar_gz` 的单根目录树），再原子安装。RuntimeManager 启动命名 Dora flow
 并观察 Gateway `/tools`，不调用另一套 Gateway Agent API。
 
 活动 Runtime availability provider 向 Agent 提供 Skill visibility 与 Gateway URL，但不修改

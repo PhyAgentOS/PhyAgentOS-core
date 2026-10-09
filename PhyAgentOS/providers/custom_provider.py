@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
-import httpx
 import json_repair
-from openai import AsyncOpenAI
 
+from PhyAgentOS.providers._openai_client import build_async_openai_client
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from PhyAgentOS.providers.effort import is_openai_reasoning_model
+from PhyAgentOS.providers.errors import describe_provider_error
 
 
 class CustomProvider(LLMProvider):
@@ -19,23 +19,17 @@ class CustomProvider(LLMProvider):
         api_key: str = "no-key",
         api_base: str = "http://localhost:8000/v1",
         default_model: str = "default",
-        timeout_s: float = 180.0,
+        timeout_s: float | None = None,
+        max_retries: int | None = None,
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
-        # Use httpx client with trust_env=False to avoid picking up system SOCKS proxy
-        # that uses the unsupported 'socks://' scheme (httpx only supports socks5://).
-        http_client = httpx.AsyncClient(
-            trust_env=False,
-            timeout=httpx.Timeout(float(timeout_s), connect=15.0),
-            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+        self._client = build_async_openai_client(
+            api_key, api_base, timeout_s, max_retries, extra_headers=extra_headers
         )
-        self._client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=api_base,
-            default_headers={"x-session-affinity": uuid.uuid4().hex},
-            http_client=http_client,
-        )
+        # Remember the parameter supported by this endpoint after a rejection.
+        self._max_tokens_param = "max_tokens"
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
@@ -44,17 +38,31 @@ class CustomProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": self._sanitize_empty_content(messages),
-            "max_tokens": max(1, max_tokens),
+            self._max_tokens_param: max(1, max_tokens),
             "temperature": temperature,
         }
-        if reasoning_effort:
+        if reasoning_effort and reasoning_effort != "none":
             kwargs["reasoning_effort"] = reasoning_effort
+        # Clearing effort restores the model default, not legacy request parameters.
+        if "reasoning_effort" in kwargs or is_openai_reasoning_model(kwargs["model"]):
+            kwargs.pop("temperature", None)
+            kwargs["max_completion_tokens"] = kwargs.pop(self._max_tokens_param)
         if tools:
             kwargs.update(tools=tools, tool_choice=tool_choice or "auto")
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
-            return LLMResponse(content=f"Error: {e}", finish_reason="error")
+            # Reasoning requests already use max_completion_tokens. Only adapt
+            # a request that actually sent the legacy parameter; otherwise a
+            # server rejection would be replaced by a local KeyError.
+            if "max_tokens" in kwargs and "max_completion_tokens" in str(e):
+                self._max_tokens_param = "max_completion_tokens"
+                kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                try:
+                    return self._parse(await self._client.chat.completions.create(**kwargs))
+                except Exception as e2:
+                    return LLMResponse(content=describe_provider_error(e2), finish_reason="error")
+            return LLMResponse(content=describe_provider_error(e), finish_reason="error")
 
     def _parse(self, response: Any) -> LLMResponse:
         choice = response.choices[0]

@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from PhyAgentOS.providers.errors import describe_provider_error
+
 try:
     from loguru import logger
 except ImportError:  # pragma: no cover - fallback for lightweight test envs
@@ -53,6 +55,33 @@ class LLMResponse:
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
+
+
+class LLMCallError(RuntimeError):
+    """A completion could not be obtained from the provider.
+
+    Providers report transport and API failures as an ``LLMResponse`` with
+    ``finish_reason="error"`` instead of raising, because most call sites want
+    to inspect the failure and carry on (verification, memory consolidation,
+    the experience analyzer). The agent loop is not one of those: a failed call
+    is not an answer, and treating it as one ended the turn with the provider's
+    error text as the assistant's reply — a reply the session and the caller
+    could not tell apart from a real one.
+
+    Raised by the agent loop when a completion comes back with
+    ``finish_reason="error"``. Transient failures (timeouts included) reach it
+    only after ``chat_with_retry`` has spent its retries; permanent ones — a
+    400 the endpoint will reject again — are returned unretried on the first
+    attempt, so the error is not necessarily an availability problem.
+    ``detail`` carries the provider's own error text; ``messages`` carries the
+    partial conversation so the caller can persist the user's message and any
+    completed tool exchanges before replying.
+    """
+
+    def __init__(self, detail: str, messages: list[dict[str, Any]] | None = None) -> None:
+        self.detail = detail
+        self.messages: list[dict[str, Any]] = list(messages) if messages is not None else []
+        super().__init__(detail)
 
 
 @dataclass(frozen=True)
@@ -202,12 +231,17 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
+        mode: str | None = None,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
         Parameters default to ``self.generation`` when not explicitly passed,
         so callers no longer need to thread temperature / max_tokens /
         reasoning_effort through every layer.
+
+        ``mode`` is accepted and ignored: single-model deployments serve
+        every mode (main / multimodal / ...) with the same model. Only
+        ProvidersManager routes it to a mode-specific provider.
         """
         if max_tokens is self._SENTINEL:
             max_tokens = self.generation.max_tokens
@@ -231,7 +265,7 @@ class LLMProvider(ABC):
                 raise
             except Exception as exc:
                 response = LLMResponse(
-                    content=f"Error calling LLM: {exc}",
+                    content=describe_provider_error(exc),
                     finish_reason="error",
                 )
 
@@ -264,7 +298,7 @@ class LLMProvider(ABC):
             raise
         except Exception as exc:
             return LLMResponse(
-                content=f"Error calling LLM: {exc}",
+                content=describe_provider_error(exc),
                 finish_reason="error",
             )
 
