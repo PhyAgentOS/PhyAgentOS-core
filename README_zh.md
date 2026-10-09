@@ -10,13 +10,14 @@
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4264ce" alt="MIT License"></a>
     <img src="https://img.shields.io/badge/Python-3.11%2B-4264ce?logo=python&amp;logoColor=white" alt="Python 3.11 or newer">
-    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.0.0-4264ce" alt="Release v1.0.0"></a>
+    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.1.0-4264ce" alt="Release v1.1.0"></a>
     <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/stargazers"><img src="https://img.shields.io/github/stars/PhyAgentOS/PhyAgentOS-core?style=flat&amp;color=4264ce" alt="GitHub stars"></a>
   </p>
   <p><a href="README.md">English</a> · <a href="README_zh.md">简体中文</a></p>
   <p>
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
+    <a href="#release">v1.1.0</a> ·
     <a href="#quick-start">快速开始</a> ·
     <a href="#quickstart-examples">快速启动示例</a> ·
     <a href="#control-modes">控制方式</a> ·
@@ -45,6 +46,20 @@
 | **让经验改进后续任务** | 从经过验证的经验中积累可复用工作流与作用域 Lesson，并通过受控晋升和版本记录管理改进。 |
 | **可复用的物理执行能力** | 将环境相关工具与 Runtime 封装为版本化 Skill，使认知规划与机器人接入保持解耦。 |
 
+<a id="release"></a>
+## v1.1.0 更新亮点
+
+**Provider 管理、Skill Runtime 与受治理的交互。** 本次版本包含：
+
+- **Provider 管理：** 集中配置、连接测试、认证、模型发现、模型选择保存与会话级覆盖。
+- **更多模型接入：** 直接支持 OpenAI Responses API 的工具调用、多模态输入、推理强度与 Forge 验证；新增 Requesty、Cheaper Inference 和 API Route 网关。
+- **Skill Runtime 更新：** `directory_tar_gz` Node 包可携带运行时依赖并校验内部相对符号链接；profile 支持启动超时、`required_tools` 覆盖，以及用于 LIBERO 0.3.4 前置准备的启动 hook 上下文。
+- **受治理的交互基础（默认关闭）：** 通过冻结绑定、持久化 Runner 和 Supervisor，将 AgentTask、Session、多步决策、独立根目标验证与一条去重的经验 episode 连接起来。参见[适用范围与启用说明](docs/interaction/README.md)。
+- **可靠性改进：** 保留有效 cron 任务，完善 Dora 状态解析和 profile 环境注入、归档与图片路径处理，并在模型调用失败时保留对话历史。取消后拒绝新的执行意图并丢弃迟到决策；不确定操作不会自动重发，资源保护保持到执行状态完成核对。
+- **指南与验证：** 扩展回归测试和构建检查，完善双语文档、Piper 与 LIBERO-10 快速启动，以及评测范围和结果说明。
+
+查看[完整更新记录](CHANGELOG.md)和[相对 v1.0.0 的全部变更](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.0.0...v1.1.0)。
+
 <a id="quick-start"></a>
 ## Quickstart · 如何开始使用
 
@@ -53,7 +68,7 @@
 ### 1. 安装与初始化
 
 ```bash
-git clone https://github.com/PhyAgentOS/PhyAgentOS-core.git
+git clone --branch v1.1.0 https://github.com/PhyAgentOS/PhyAgentOS-core.git
 cd PhyAgentOS-core
 python -m venv .venv
 source .venv/bin/activate
@@ -78,7 +93,7 @@ Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`�
 不改变正在执行的任务及其他会话。
 
 <details>
-<summary>完整配置参考（来自 dev）</summary>
+<summary>完整配置参考（v1.1.0）</summary>
 
 配置保存为 camelCase，同时也接受 snake_case 输入。
 
@@ -192,7 +207,7 @@ paos agent
 
 **1. 为托管 Runtime 安装 Dora**
 
-v1.0.0 的兼容基线为 Dora CLI **0.4.1**（`dora-message` **0.7.0**）。Linux/macOS：
+v1.1.0 沿用 Dora CLI **0.4.1**（`dora-message` **0.7.0**）兼容基线。Linux/macOS：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -278,6 +293,7 @@ PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical
 
 | 版本 | 日期 | 更新 |
 | --- | --- | --- |
+| **v1.1.0** | 2026-10-09 | 集中式 Provider 管理、直接 OpenAI Responses 与新网关接入、Skill Runtime 打包和启动改进，以及默认关闭的受治理交互基础。 |
 | **v1.0.0** | 2026-08-30 | Initial stable release of PhyAgentOS. |
 | **v0.2.3** | 2026-08-27 | Physical Execution Skill 可独立安装和管理，经显式激活冻结到 AgentTask，并通过受治理的 Query、Action、Session Tool API 生命周期执行，支持恢复和按版本限定的经验。 |
 | **v0.2.2** | 2026-08-21 | 将 Physical Execution 执行统一到 Query/Action Tool API，并增加 AgentTask 聚合、可校验 Skill Runtime、Resource Registry 接入和 move-arm-by-ee Skill，同时保留 Agent 验证与演化能力。 |

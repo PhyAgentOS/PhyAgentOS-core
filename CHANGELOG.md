@@ -2,6 +2,50 @@
 
 All notable changes to PhyAgentOS are documented here. Categories follow Keep a Changelog.
 
+## [v1.1.0] - 2026-10-09
+
+Provider management, Skill Runtime and governed interactions. Changes since v1.0.0.
+
+### Added
+
+- Centralized provider management with configuration, testing, authentication,
+  model discovery, saved model selection and per-session runtime overrides.
+- Direct OpenAI Responses API support, including tool calls, multimodal input,
+  reasoning effort and integration with the Forge verifier.
+- Requesty, Cheaper Inference and API Route as OpenAI-compatible gateways.
+- `directory_tar_gz` Forge Node packages for executables with bundled runtime
+  dependencies and validated internal relative symbolic links.
+- An opt-in interaction foundation connecting AgentTask, Session, multi-step
+  decisions, independent root verification and one deduplicated experience
+  episode, backed by frozen bindings, a persistent Runner and a Supervisor.
+
+### Changed
+
+- Skill profiles support startup timeouts and `required_tools` overrides; startup
+  hooks receive profile, Python and Skill context for LIBERO 0.3.4 prerequisites.
+- Custom and Responses providers support configurable timeouts and retries,
+  with improved `max_completion_tokens` compatibility.
+- Failed model completions return explicit errors while retaining user input
+  and completed tool exchanges without storing error text as assistant history.
+- Ordinary and interactive tasks reject new Query, Action and Session intents
+  after cancellation is persisted or the task leaves the executing state.
+
+### Fixed
+
+- Preserve valid cron jobs when individual records are malformed; quarantine
+  unreadable stores and refuse to overwrite them if quarantine fails.
+- Parse Dora JSON and NDJSON status output and inject profile environments into
+  rendered dataflow nodes to avoid stale flow and daemon-environment effects.
+- Improve archive path containment, symbolic-link validation, image-path cleanup
+  and compatibility across providers.
+- Pin Runtime identity for interaction dispatch, discard late decisions after
+  cancellation, prevent automatic retransmission of uncertain operations and
+  retain resource guards until outstanding execution is reconciled.
+- Expand regression coverage and build checks; improve bilingual documentation,
+  Piper and LIBERO-10 quickstarts, and benchmark scope and result reporting.
+
+[Full comparison: v1.0.0...v1.1.0](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.0.0...v1.1.0)
+
 ## [v1.0.0] - 2026-08-30
 
 Initial stable release of PhyAgentOS.

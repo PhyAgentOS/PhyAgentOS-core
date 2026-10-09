@@ -10,13 +10,14 @@
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4264ce" alt="MIT License"></a>
     <img src="https://img.shields.io/badge/Python-3.11%2B-4264ce?logo=python&amp;logoColor=white" alt="Python 3.11 or newer">
-    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.0.0-4264ce" alt="Release v1.0.0"></a>
+    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.1.0-4264ce" alt="Release v1.1.0"></a>
     <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/stargazers"><img src="https://img.shields.io/github/stars/PhyAgentOS/PhyAgentOS-core?style=flat&amp;color=4264ce" alt="GitHub stars"></a>
   </p>
   <p><a href="README.md">English</a> · <a href="README_zh.md">简体中文</a></p>
   <p>
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
+    <a href="#release">v1.1.0</a> ·
     <a href="#quick-start">Quick Start</a> ·
     <a href="#quickstart-examples">Examples</a> ·
     <a href="#control-modes">Control Modes</a> ·
@@ -45,6 +46,20 @@
 | **Experience that improves future tasks** | Accumulate reusable workflows and scoped Lessons from verified experience, with guarded promotion and revision history. |
 | **Reusable physical capabilities** | Package environment-specific tools and runtimes as versioned Skills, keeping cognitive planning separate from robot integration. |
 
+<a id="release"></a>
+## What's new in v1.1.0
+
+**Provider management, Skill Runtime and governed interactions.** This release adds:
+
+- **Provider management:** centralized configuration, connection tests, authentication, model discovery, saved model selection, and per-session overrides.
+- **More model connections:** direct OpenAI Responses API support for tools, multimodal input, reasoning effort, and Forge verification; Requesty, Cheaper Inference, and API Route gateways.
+- **Skill Runtime updates:** `directory_tar_gz` Node packages with bundled dependencies and validated internal relative symbolic links; profile startup timeouts, `required_tools` overrides, and startup-hook context for LIBERO 0.3.4.
+- **Governed interaction foundation (opt-in):** connect AgentTask and Session to multi-step decisions, independent root verification, and one deduplicated experience episode through frozen bindings, a persistent Runner, and a Supervisor. See [scope and enablement](docs/interaction/README.md).
+- **Reliability improvements:** preserve valid cron jobs, handle Dora status and profile environments, improve archive and image-path handling, and retain conversation history on model failures. Cancellation blocks new execution intents, late decisions are discarded, and uncertain operations retain guards until reconciliation without automatic retransmission.
+- **Guides and validation:** expanded regression and build checks, bilingual documentation, Piper and LIBERO-10 quickstarts, and clearer benchmark scope and results.
+
+See the [full changelog](CHANGELOG.md) and [changes since v1.0.0](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.0.0...v1.1.0).
+
 <a id="quick-start"></a>
 ## Quickstart · How to get started
 
@@ -53,7 +68,7 @@ Start with a model-backed CLI conversation, then connect a robot or simulator Sk
 ### 1. Install and initialize
 
 ```bash
-git clone https://github.com/PhyAgentOS/PhyAgentOS-core.git
+git clone --branch v1.1.0 https://github.com/PhyAgentOS/PhyAgentOS-core.git
 cd PhyAgentOS-core
 python -m venv .venv
 source .venv/bin/activate
@@ -78,7 +93,7 @@ Docker/secret input, process overrides and session commands (`/provider`, `/mode
 Session switches affect subsequent turns only and leave running tasks and other sessions unchanged.
 
 <details>
-<summary>Full configuration reference (from dev)</summary>
+<summary>Full configuration reference (v1.1.0)</summary>
 
 The configuration file is serialized in camelCase; snake_case keys are also accepted.
 
@@ -193,7 +208,7 @@ A **Physical Execution Skill** packages a workflow and its runtime requirements.
 
 **1. Install Dora for managed runtimes**
 
-The v1.0.0 compatibility baseline is Dora CLI **0.4.1** (`dora-message` **0.7.0**). On Linux/macOS:
+v1.1.0 retains the Dora CLI **0.4.1** (`dora-message` **0.7.0**) compatibility baseline. On Linux/macOS:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -283,6 +298,7 @@ documents Bundle layout, local validation, immutable publication order, and Regi
 
 | Version | Date | Update |
 | --- | --- | --- |
+| **v1.1.0** | 2026-10-09 | Centralized provider management, direct OpenAI Responses and new gateways, Skill Runtime packaging and startup improvements, and an opt-in governed interaction foundation. |
 | **v1.0.0** | 2026-08-30 | Initial stable release of PhyAgentOS. |
 | **v0.2.3** | 2026-08-27 | Physical Execution Skills can be installed and managed independently, activated into immutable AgentTask bindings, and used through governed Query, Action, and Session Tool API lifecycles with recovery and version-scoped experience. |
 | **v0.2.2** | 2026-08-21 | Unified Physical Execution execution on the Query/Action Tool API and added AgentTask aggregation, a verifiable Skill Runtime, Resource Registry integration, and the move-arm-by-ee Skill while retaining Agent verification and evolution. |
