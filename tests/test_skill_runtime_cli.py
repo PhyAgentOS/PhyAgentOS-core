@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
@@ -35,9 +37,10 @@ def test_forge_node_command_exposes_distribution_lifecycle() -> None:
         assert command in result.stdout
 
 
-def test_skill_distribution_commands_accept_static_index() -> None:
-    runner = CliRunner()
+@pytest.mark.parametrize("force_color", [None, "1"])
+def test_skill_distribution_commands_accept_static_index(force_color: str | None) -> None:
+    runner = CliRunner(env={"FORCE_COLOR": force_color})
     for command in ("search", "install", "update"):
         result = runner.invoke(app, ["skill", command, "--help"])
         assert result.exit_code == 0
-        assert "--index" in result.stdout
+        assert "--index" in unstyle(result.stdout)

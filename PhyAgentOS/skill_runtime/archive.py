@@ -241,19 +241,21 @@ class ArchiveValidator:
                                 )
                             output.write(chunk)
                             digest.update(chunk)
-                    if written != member.size or (
-                        expected_files is not None
-                        and expected_files[path.as_posix()][1] is not None
-                        and written != expected_files[path.as_posix()][1]
-                    ):
-                        raise ArchiveError(f"file size mismatch: {path.as_posix()}")
-                    if (
-                        expected_files is not None
-                        and digest.hexdigest() != expected_files[path.as_posix()][0]
-                    ):
-                        raise ArchiveError(f"file sha256 mismatch: {path.as_posix()}")
-                    safe_mode = member.mode & 0o755
-                    os.chmod(target, safe_mode or 0o600, follow_symlinks=False)
+                        if written != member.size or (
+                            expected_files is not None
+                            and expected_files[path.as_posix()][1] is not None
+                            and written != expected_files[path.as_posix()][1]
+                        ):
+                            raise ArchiveError(f"file size mismatch: {path.as_posix()}")
+                        if (
+                            expected_files is not None
+                            and digest.hexdigest() != expected_files[path.as_posix()][0]
+                        ):
+                            raise ArchiveError(f"file sha256 mismatch: {path.as_posix()}")
+                        safe_mode = member.mode & 0o755
+                        # Keep permissions tied to the file we created, without
+                        # requiring platform support for chmod on symlinks.
+                        os.fchmod(output.fileno(), safe_mode or 0o600)
                 resolved_root = os.path.realpath(destination)
                 for path, target_name in sorted(links.items()):
                     link_path = destination.joinpath(*PurePosixPath(path).parts)

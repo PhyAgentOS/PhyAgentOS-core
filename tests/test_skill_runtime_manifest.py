@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import stat
 import sys
 import tarfile
 from pathlib import Path
@@ -264,6 +266,36 @@ def test_archive_validator_safely_extracts_direct_archive_without_manifest(
     )
 
     assert (tmp_path / "direct-out/gateway").read_bytes() == b"binary"
+
+
+@pytest.mark.parametrize(
+    ("archive_mode", "expected_mode"),
+    [(0o755, 0o755), (0o644, 0o644), (0o7777, 0o755), (0, 0o600)],
+)
+def test_archive_permissions_without_symlink_chmod_support(
+    tmp_path: Path, monkeypatch, archive_mode: int, expected_mode: int,
+) -> None:
+    original_chmod = os.chmod
+
+    def chmod_without_symlink_support(path, mode, *, follow_symlinks=True, **kwargs):
+        if not follow_symlinks:
+            raise NotImplementedError("chmod: follow_symlinks unavailable on this platform")
+        return original_chmod(path, mode, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", chmod_without_symlink_support)
+    archive = tmp_path / "permissions.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        member = tarfile.TarInfo("gateway")
+        member.size = len(b"binary")
+        member.mode = archive_mode
+        tar.addfile(member, io.BytesIO(b"binary"))
+
+    destination = tmp_path / "out"
+    ArchiveValidator().extract(archive, destination, verify_manifest=False)
+
+    extracted = destination / "gateway"
+    assert extracted.read_bytes() == b"binary"
+    assert stat.S_IMODE(extracted.stat().st_mode) == expected_mode
 
 
 def test_static_package_index_resolves_direct_skill_and_node(tmp_path: Path) -> None:
