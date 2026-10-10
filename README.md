@@ -25,6 +25,7 @@
     <a href="#robot-skills">Robot Skills</a> ·
     <a href="#documentation">Documentation</a>
   </p>
+  <p><a href="docs/news/gosim-shenzhen-2026.md"><b>GOSIM Shenzhen 2026 Spotlight · October 16–17 · Meet us in Shenzhen</b></a></p>
 </div>
 
 ---
@@ -294,7 +295,10 @@ documents Bundle layout, local validation, immutable publication order, and Regi
 | Inspect benchmark values and provenance | [Benchmark](docs/benchmarks.md) |
 | Browse all documentation | [Documentation index](docs/README.md) |
 
+<a id="news"></a>
 ## News
+
+**2026-10-10 · GOSIM Shenzhen 2026:** PhyAgentOS has been selected for Spotlight and will present in the Open Source Robotics track. [Read the announcement and event details](docs/news/gosim-shenzhen-2026.md).
 
 | Version | Date | Update |
 | --- | --- | --- |
