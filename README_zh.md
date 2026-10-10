@@ -25,6 +25,7 @@
     <a href="#robot-skills">运行机器人技能</a> ·
     <a href="#documentation">文档导航</a>
   </p>
+  <p><a href="docs/news/gosim-shenzhen-2026_zh.md"><b>GOSIM Shenzhen 2026 Spotlight · 10 月 16–17 日 · 深圳现场见</b></a></p>
 </div>
 
 ---
@@ -289,7 +290,10 @@ PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical
 | 查看测评数值与来源 | [Benchmark](docs/benchmarks.md) |
 | 浏览全部文档 | [文档索引](docs/README.md) |
 
+<a id="news"></a>
 ## News · 最新动态
+
+**2026-10-10 · GOSIM Shenzhen 2026：** PhyAgentOS 入选 Spotlight，并将在开源机器人分论坛做主题分享。[查看活动公告与现场信息](docs/news/gosim-shenzhen-2026_zh.md)。
 
 | 版本 | 日期 | 更新 |
 | --- | --- | --- |
