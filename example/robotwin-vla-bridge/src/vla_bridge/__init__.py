@@ -12,6 +12,11 @@ Routes (dora input ids in parentheses):
   it into PolicyCommand start/pause for lerobot_infer's lifecycle channel.
 """
 
-from .main import main
+def main(*args, **kwargs):
+    """Load the Dora runtime only when the executable entry point is used."""
+    from .main import main as runtime_main
+
+    return runtime_main(*args, **kwargs)
+
 
 __all__ = ["main"]

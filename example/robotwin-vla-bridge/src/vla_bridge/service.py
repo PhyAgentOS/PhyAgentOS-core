@@ -7,9 +7,9 @@ query handlers on that same thread, so plain attribute access is safe.
 - 段（segment）= 一次决策授权的执行区间（`steps` 步），走完自动冻结并开检查点（C1）；
 - stop = hold：不下发动作 → libero 侧零仿真时间（观测与步 1:1），策略节点同时 pause；
 - C2 事件（策略停摆 / 失速 / 连续非法动作）由本模块的确定性计数器判定，命中即冻结 → 开检查点；
-- 快照只放**可观测**的量：candidate_id / queue_depth 在消息契约里拿不到（策略节点
-  每 tick 只发一条无元数据的 action，节点是二进制的、不改），只给步数推算的
-  `candidate_epoch_est`（并在 observation_note 里写明这是推算）。
+- 快照暴露桥接器实际观测到的最新候选动作；candidate_id / queue_depth 仍然在消息
+  契约里拿不到（策略节点每 tick 只发一条无元数据的 action，节点是二进制的、不改），
+  因此 `candidate_epoch_est` 仍只是步数推算，并在 observation_note 里明确标注。
 
 检查点纪律只对 **decide() 起头的段**（supervised）生效：`set_mode` 起头的自发透传
 （piper 档案、S3 学生基线）不检测、不冻结 —— 保证基线可复现。
