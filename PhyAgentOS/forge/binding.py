@@ -110,8 +110,9 @@ class ForgeSkillBindingResolver:
                 f"active Forge runtime is {runtime.skill_name!r}, not {skill_name!r}"
             )
         manifest = self.catalog.get(skill_name)
+        from PhyAgentOS.forge.benchmark.binding import verified_extension as benchmark_extension
         from PhyAgentOS.forge.interaction.binding import verified_extension
-        extension = verified_extension(manifest)
+        extension = verified_extension(manifest) or benchmark_extension(manifest)
         if manifest.version != runtime.skill_version:
             raise ForgeSkillBindingError("installed Skill changed after Runtime startup")
         try:

@@ -300,6 +300,7 @@ class ForgeConfig(Base):
     execution_timeout_s: float = Field(default=300.0, gt=0)
     evidence: ForgeEvidenceConfig = Field(default_factory=ForgeEvidenceConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
+    benchmark: InteractionConfig = Field(default_factory=InteractionConfig)
 
 DEFAULT_RESOURCE_REGISTRY_URL = "https://paos-resource-manager.dev.x-era.com"
 

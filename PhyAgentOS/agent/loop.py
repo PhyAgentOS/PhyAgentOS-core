@@ -277,6 +277,17 @@ class AgentLoop:
                         content="Interaction task: " + json.dumps(summary, ensure_ascii=False),
                         metadata={"interaction_task_id": task_id}))
                 interaction.supervisor.notify = notify_interaction
+            benchmark = self.forge_task_coordinator.benchmark
+            if benchmark.supervisor is not None and benchmark.supervisor.notify is None:
+                async def notify_benchmark(task_id, summary):
+                    task = self.forge_task_coordinator.get_task(task_id)
+                    origin = task.origin_session_key or "cli:direct"
+                    channel, _, chat_id = origin.partition(":")
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=channel, chat_id=chat_id or "direct",
+                        content="Benchmark task: " + json.dumps(summary, ensure_ascii=False),
+                        metadata={"benchmark_task_id": task_id}))
+                benchmark.supervisor.notify = notify_benchmark
             await self.forge_task_coordinator.reconcile_nonterminal()
             self._forge_reconciled = True
         if self.experience is not None:
@@ -436,6 +447,7 @@ class AgentLoop:
         self._running = True
         if self.forge_task_coordinator is not None:
             self.forge_task_coordinator.interaction.long_lived = True
+            self.forge_task_coordinator.benchmark.long_lived = True
         await self._connect_mcp()
         logger.info("Agent loop started")
 
@@ -556,6 +568,9 @@ class AgentLoop:
     async def close_mcp(self) -> None:
         """Persist interaction shutdown before closing its transport."""
         if self.forge_task_coordinator is not None:
+            benchmark = self.forge_task_coordinator.benchmark.supervisor
+            if benchmark is not None:
+                await benchmark.shutdown()
             supervisor = self.forge_task_coordinator.interaction.supervisor
             if supervisor is not None:
                 await supervisor.shutdown()
@@ -573,6 +588,7 @@ class AgentLoop:
         self._running = False
         if self.forge_task_coordinator is not None:
             self.forge_task_coordinator.interaction.closing = True
+            self.forge_task_coordinator.benchmark.closing = True
         if self.experience is not None:
             self.experience.stop()
         if (
@@ -816,6 +832,7 @@ class AgentLoop:
         """Process a message directly (for CLI or cron usage)."""
         if self.forge_task_coordinator is not None:
             self.forge_task_coordinator.interaction.long_lived = self._running
+            self.forge_task_coordinator.benchmark.long_lived = self._running
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)

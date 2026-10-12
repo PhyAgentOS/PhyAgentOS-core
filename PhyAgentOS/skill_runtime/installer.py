@@ -125,6 +125,8 @@ class SkillInstaller:
                 raise InstallerError("installed Skill skill_document must be SKILL.md")
             from PhyAgentOS.forge.interaction.binding import install_receipt
             install_receipt(manifest, sha256_file(archive), verified=verify_archive_manifest)
+            from PhyAgentOS.forge.benchmark.binding import install_receipt as install_benchmark
+            install_benchmark(manifest, sha256_file(archive), verified=verify_archive_manifest)
             try:
                 with SkillOperationLock(self.state_store.root, manifest.name):
                     target = self.root / manifest.name

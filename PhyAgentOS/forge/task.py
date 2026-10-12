@@ -230,7 +230,7 @@ class AgentTaskStore:
                 """
             )
 
-    def create(self, record: AgentTaskRecord) -> AgentTaskRecord:
+    def create(self, record: AgentTaskRecord, *, extension_event: str | None = None) -> AgentTaskRecord:
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
@@ -243,6 +243,8 @@ class AgentTaskStore:
                 )
             self._insert(connection, record)
             self._event(connection, record.task_id, "task_created", {})
+            if extension_event is not None:
+                self._event(connection, record.task_id, extension_event, {})
             connection.commit()
         return record
 
@@ -391,6 +393,8 @@ class AgentTaskCoordinator:
         self.store = store or AgentTaskStore(self.workspace)
         from PhyAgentOS.forge.interaction.service import InteractionService
         self.interaction = InteractionService(self)
+        from PhyAgentOS.forge.benchmark.service import BenchmarkService
+        self.benchmark = BenchmarkService(self)
         self.max_replans = max(0, int(max_replans))
         self.replan_timeout_s = max(0.1, float(replan_timeout_s))
 
@@ -407,6 +411,7 @@ class AgentTaskCoordinator:
         verification: TaskVerificationContract,
         activation_id: str | None = None,
         origin_session_key: str | None = None,
+        benchmark_plan: dict | None = None,
     ) -> AgentTaskRecord | Any:
         """Create synchronously only for an explicitly unbound coordinator.
 
@@ -420,8 +425,11 @@ class AgentTaskCoordinator:
                 verification=verification,
                 activation_id=activation_id,
                 origin_session_key=origin_session_key,
+                benchmark_plan=benchmark_plan,
             )
-        if verification.mode != "off" and self.verifier is None:
+        if benchmark_plan is not None and self.binding_resolver is None:
+            raise AgentTaskError("benchmark requires a bound Runtime")
+        if verification.mode != "off" and self.verifier is None and benchmark_plan is None:
             raise AgentTaskError(
                 "non-off AgentTask verification requires the verification service"
             )
@@ -450,8 +458,11 @@ class AgentTaskCoordinator:
         verification: TaskVerificationContract,
         activation_id: str | None = None,
         origin_session_key: str | None = None,
+        benchmark_plan: dict | None = None,
     ) -> AgentTaskRecord:
-        if verification.mode != "off" and self.verifier is None:
+        if benchmark_plan is not None and self.binding_resolver is None:
+            raise AgentTaskError("benchmark requires a bound Runtime")
+        if verification.mode != "off" and self.verifier is None and benchmark_plan is None:
             raise AgentTaskError(
                 "non-off AgentTask verification requires the verification service"
             )
@@ -499,10 +510,14 @@ class AgentTaskCoordinator:
             origin_session_key=origin_session_key,
         )
         await self.interaction.freeze(task)
+        await self.benchmark.freeze(task, benchmark_plan)
         if binding is not None and self.runtime_task_binding_ids is not None:
             self.runtime_task_binding_ids.add(binding.binding_id)
         try:
-            self.store.create(task)
+            if self.benchmark.path.exists() and self.benchmark.store.binding(task_id):
+                self.store.create(task, extension_event="benchmark_bound")
+            else:
+                self.store.create(task)
             if self.interaction.path.exists() and self.interaction.store.binding(task_id):
                 self.store.update(task_id, lambda current: None, event_type="interaction_bound")
         except Exception:
@@ -521,7 +536,10 @@ class AgentTaskCoordinator:
         return self.store.get(task_id)
 
     def begin_revision(self, task_id: str, *, reason: str) -> AgentTaskRecord:
+        if self.benchmark.managed(task_id):
+            raise AgentTaskError("benchmark rounds are not PlanRevisions; automatic replanning is disabled")
         self.interaction.assert_settled(task_id)
+        self.benchmark.assert_settled(task_id)
         task = self.store.get(task_id)
         if task.status != AgentTaskStatus.AWAITING_REPLAN:
             raise AgentTaskError("a new PlanRevision requires awaiting_replan status")
@@ -734,6 +752,8 @@ class AgentTaskCoordinator:
         ownership: Literal["task", "shared"] = "task",
     ) -> dict[str, Any]:
         from PhyAgentOS.forge.interaction.client import trusted_runtime
+        if self.benchmark.managed(task_id) and trusted_runtime(self, task_id) is None:
+            return await self.benchmark.start(task_id, tool_id, arguments, ownership)
         if self.interaction.managed(task_id) and trusted_runtime(self, task_id) is None:
             return await self.interaction.start(task_id, tool_id, arguments, ownership)
         if ownership not in {"task", "shared"}:
@@ -829,6 +849,10 @@ class AgentTaskCoordinator:
 
     async def stop_session(self, task_id: str, invocation_id: str) -> dict[str, Any]:
         from PhyAgentOS.forge.interaction.client import trusted_runtime
+        if self.benchmark.managed(task_id) and trusted_runtime(self, task_id) is None:
+            self.require_session_invocation(task_id, invocation_id)
+            await self.benchmark.cancel(task_id, "session_stop_requested")
+            return {"ok": True, "data": {"status": "requested"}}
         if self.interaction.managed(task_id) and trusted_runtime(self, task_id) is None:
             self.require_session_invocation(task_id, invocation_id)
             await self.interaction.cancel(task_id, "session_stop_requested")
@@ -852,6 +876,8 @@ class AgentTaskCoordinator:
         return response
 
     async def cancel_task(self, task_id: str, *, reason: str) -> AgentTaskRecord:
+        if self.benchmark.managed(task_id):
+            return await self.benchmark.cancel(task_id, reason)
         if self.interaction.managed(task_id):
             return await self.interaction.cancel(task_id, reason)
         task = self.store.get(task_id)
@@ -912,6 +938,7 @@ class AgentTaskCoordinator:
 
     async def finalize_task(self, task_id: str) -> AgentTaskRecord:
         await self.interaction.validate_finalization(task_id)
+        await self.benchmark.validate_finalization(task_id)
         task = self.store.get(task_id)
         if task.terminal:
             return task
@@ -934,7 +961,7 @@ class AgentTaskCoordinator:
         await self._capture_after(task_id)
         task = self.store.get(task_id)
         if task.cancellation_requested:
-            status = AgentTaskStatus.CANCELLED if self.interaction.managed(task_id) else _cancel_terminal_status(task)
+            status = AgentTaskStatus.CANCELLED if (self.interaction.managed(task_id) or self.benchmark.managed(task_id)) else _cancel_terminal_status(task)
             result = self.store.update(
                 task_id,
                 lambda current: setattr(current, "status", status),
@@ -957,7 +984,7 @@ class AgentTaskCoordinator:
             )
             self._schedule_experience(result)
             return result
-        if self.verifier is None:
+        if self.verifier is None and not self.benchmark.managed(task_id):
             return self._verification_error(
                 task_id, "semantic verification is enabled but verifier is unavailable"
             )
@@ -968,20 +995,25 @@ class AgentTaskCoordinator:
             else "[]"
         )
         try:
-            verdict, _request, attempt = await self.verifier.verify_agent_task(
-                task,
-                events=self.store.events(task_id),
-                lessons=lessons,
-                source="auto",
-                mode="apply",
-            )
+            if self.benchmark.managed(task_id):
+                from PhyAgentOS.forge.benchmark.evidence import verify
+                verdict, _request, attempt = verify(self.benchmark, task_id)
+            else:
+                verdict, _request, attempt = await self.verifier.verify_agent_task(
+                    task,
+                    events=self.store.events(task_id),
+                    lessons=lessons,
+                    source="auto",
+                    mode="apply",
+                )
         except Exception as exc:
             return self._verification_error(
                 task_id, str(exc) or type(exc).__name__
             )
 
         await self.interaction.validate_finalization(task_id)
-        if self.interaction.managed(task_id) and self.store.get(task_id).cancellation_requested:
+        await self.benchmark.validate_finalization(task_id)
+        if (self.interaction.managed(task_id) or self.benchmark.managed(task_id)) and self.store.get(task_id).cancellation_requested:
             return await self.finalize_task(task_id)
 
         def mutate(current: AgentTaskRecord) -> None:
@@ -1018,6 +1050,7 @@ class AgentTaskCoordinator:
 
     def _verification_error(self, task_id: str, message: str) -> AgentTaskRecord:
         self.interaction.assert_settled(task_id)
+        self.benchmark.assert_settled(task_id)
         task = self.store.get(task_id)
         status = (
             AgentTaskStatus.SUCCEEDED
@@ -1049,10 +1082,12 @@ class AgentTaskCoordinator:
 
     async def reconcile_nonterminal(self) -> AgentTaskRecord | None:
         """Repair local execution facts from Gateway GETs without redispatching POSTs."""
+        if self.benchmark.supervisor is not None:
+            await self.benchmark.supervisor.recover()
         if self.interaction.supervisor is not None:
             await self.interaction.supervisor.recover()
         task = self.store.active()
-        if task is not None and self.interaction.managed(task.task_id):
+        if task is not None and (self.interaction.managed(task.task_id) or self.benchmark.managed(task.task_id)):
             return task
         if task is None:
             return None
@@ -1107,6 +1142,9 @@ class AgentTaskCoordinator:
 
     async def cancel_action(self, task_id: str, invocation_id: str):
         self.require_action_invocation(task_id, invocation_id)
+        if self.benchmark.managed(task_id):
+            await self.benchmark.cancel(task_id, "action_cancel_requested")
+            return {"ok": True, "data": {"status": "requested"}}
         if self.interaction.managed(task_id):
             await self.interaction.cancel(task_id, "action_cancel_requested")
             return {"ok": True, "data": {"status": "requested"}}
@@ -1136,6 +1174,7 @@ class AgentTaskCoordinator:
         semantics: Literal["query", "action", "session"],
     ) -> BoundToolSpec:
         self.interaction.guard_call(task_id, tool_id, semantics)
+        self.benchmark.guard_call(task_id, tool_id, semantics)
         task = self._require_executable(task_id)
         binding = task.primary_skill_binding
         if binding is None and self.binding_resolver is None:
@@ -1268,6 +1307,8 @@ class AgentTaskCoordinator:
             return enriched
 
     async def _capture_before(self, task_id: str) -> None:
+        if self.benchmark.managed(task_id):
+            return
         if self.interaction.managed(task_id):
             return  # Initial executor snapshot is recorded before the first proposal.
         task = self.store.get(task_id)
@@ -1299,6 +1340,11 @@ class AgentTaskCoordinator:
         self.store.update(task_id, mutate, event_type="before_evidence_captured")
 
     async def _capture_after(self, task_id: str) -> None:
+        if self.benchmark.managed(task_id):
+            if not self.get_task(task_id).cancellation_requested:
+                from PhyAgentOS.forge.benchmark.evidence import write_evidence
+                write_evidence(self.benchmark, task_id)
+            return
         if self.interaction.managed(task_id):
             from PhyAgentOS.forge.interaction.evidence import write_task_evidence
             write_task_evidence(self, task_id)
@@ -1378,14 +1424,15 @@ class AgentTaskCoordinator:
 
     def _schedule_experience(self, task: AgentTaskRecord) -> None:
         self.interaction.assert_settled(task.task_id)
+        self.benchmark.assert_settled(task.task_id)
         if (
             task.terminal
             and task.primary_skill_binding is not None
             and self.runtime_task_binding_ids is not None
-            and not any(
+            and (self.benchmark.managed(task.task_id) or not any(
                 item.semantics in {"action", "session"} and item.status == "unknown"
                 for item in task.execution_records
-            )
+            ))
         ):
             self.runtime_task_binding_ids.discard(task.primary_skill_binding.binding_id)
         if self.experience is not None:

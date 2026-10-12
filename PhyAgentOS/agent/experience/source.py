@@ -153,6 +153,20 @@ class AgentTaskOutcomeSource:
             criteria_statuses = {
                 item: "unknown" for item in task.verification.success_criteria
             }
+        benchmark_evaluation = None
+        benchmark = getattr(self.coordinator, "benchmark", None)
+        if benchmark is not None and benchmark.managed(task.task_id):
+            benchmark.assert_settled(task.task_id)
+            benchmark_evaluation = {"evaluation_complete": False}
+            if task.status.value == "succeeded":
+                from PhyAgentOS.forge.benchmark.evidence import checked_report
+                report = checked_report(benchmark, task.task_id)
+                benchmark_evaluation = {
+                    "report_ref": task.after_snapshot_ref,
+                    "evaluation_complete": True,
+                    "rounds": report["rounds"],
+                    "environment_all_successful": report["environment_all_successful"],
+                }
         interaction_refs = []
         service = getattr(self.coordinator, "interaction", None)
         if service is not None and service.managed(task.task_id):
@@ -168,6 +182,7 @@ class AgentTaskOutcomeSource:
                 redact_text(item) for item in task.verification.success_criteria
             ],
             final_verdict=inferred_verdict,
+            benchmark_evaluation=benchmark_evaluation,
             criteria_statuses={
                 redact_text(criterion): status
                 for criterion, status in criteria_statuses.items()

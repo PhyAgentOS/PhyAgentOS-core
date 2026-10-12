@@ -50,6 +50,16 @@ class LineageOutcome(ExperienceModel):
     evidence_refs: list[str] = Field(default_factory=list)
 
 
+class BenchmarkEvaluationOutcome(ExperienceModel):
+    """Archive metadata, never a claim that the environmental workflow succeeded."""
+
+    version: Literal["benchmark_evaluation_outcome_v1"] = "benchmark_evaluation_outcome_v1"
+    report_ref: str | None = None
+    evaluation_complete: bool = False
+    environment_all_successful: bool = False
+    rounds: list[dict] = Field(default_factory=list)
+
+
 class TaskOutcomeEnvelope(ExperienceModel):
     version: Literal["task_outcome_envelope_v1"] = "task_outcome_envelope_v1"
     task_id: str
@@ -68,13 +78,16 @@ class TaskOutcomeEnvelope(ExperienceModel):
     agent_task_ref: str | None = None
     tool_invocation_refs: list[str] = Field(default_factory=list)
     completed_at: datetime = Field(default_factory=utc_now)
+    benchmark_evaluation: BenchmarkEvaluationOutcome | None = None
 
     @property
     def learnable(self) -> bool:
-        return self.successful or self.final_verdict in {"failure", "replan_required"}
+        return self.benchmark_evaluation is not None or self.successful or self.final_verdict in {"failure", "replan_required"}
 
     @property
     def successful(self) -> bool:
+        if self.benchmark_evaluation is not None:
+            return False  # Evaluation completeness must never promote a successful workflow.
         return self.final_verdict == "success" and bool(self.criteria_statuses) and all(
             status == "satisfied" for status in self.criteria_statuses.values()
         )

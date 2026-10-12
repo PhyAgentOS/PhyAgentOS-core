@@ -45,6 +45,8 @@ def read_contract(root: Path) -> dict | None:
         if (root / RECEIPT).exists():
             raise ValueError("installed interaction sidecar disappeared")
         return None
+    if (root / "benchmark.yaml").exists():
+        raise ValueError("a Skill cannot declare both interaction and benchmark")
     value = yaml.safe_load(path.read_text())
     if not isinstance(value, dict) or set(value) != FIELDS or value["protocol"] != PROTOCOL:
         raise ValueError("unsupported interaction sidecar")

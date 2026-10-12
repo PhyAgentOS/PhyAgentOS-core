@@ -90,3 +90,7 @@ For a reproducible release, attach the exact Skill bundle/profile, Core revision
 The Chinese figures are unmodified originals. English figures translate the same 30 rows, preserving model labels, success rates, time and token values, ordering, and source categories. The tables above provide the exact-value reference; missing values are not treated as zero. Source labels do not establish exact model/checkpoint identities.
 
 中文图使用未经修改的原图。英文图翻译相同的 30 条结果，保留模型名称、成功率、耗时、Token 消耗、顺序及来源分类。精确数值以上方表格为准，未提供的数值不视为零。来源命名不代表已核实精确模型或 checkpoint 身份。
+
+## Governed benchmark integration
+
+See [Benchmark session foundation](benchmark-foundation.md) for AgentTask / EpisodeSubtask scheduling, experiment-local RSI lessons, the optional Skill contract, and fake-environment acceptance tests.

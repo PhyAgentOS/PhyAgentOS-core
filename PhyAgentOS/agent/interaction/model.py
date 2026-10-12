@@ -38,6 +38,12 @@ class ProviderDecider:
         data = {
             k: context[k] for k in ("goal", "observation", "proposal_schema", "decision_schema")
         }
+        if "lessons" in context:
+            data["lessons"] = context["lessons"]
+            data["lessons_digest"] = context["lessons_digest"]
+        user_content = json.dumps(data, ensure_ascii=False, allow_nan=False)
+        if context.get("media"):
+            user_content = [{"type": "text", "text": user_content}, *context["media"]]
         response = await self._provider.chat(
             messages=[
                 {
@@ -50,7 +56,7 @@ class ProviderDecider:
                         "Do not return usage, credentials, run identifiers, code, commands or analysis."
                     ),
                 },
-                {"role": "user", "content": json.dumps(data, ensure_ascii=False, allow_nan=False)},
+                {"role": "user", "content": user_content},
             ],
             tools=None,
             model=self.model,

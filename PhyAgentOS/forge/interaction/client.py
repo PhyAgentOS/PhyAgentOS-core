@@ -199,6 +199,10 @@ def check_transport_dispatch(client, method, path):
     coordinator, task_id, runtime = scope
     if runtime.client is not client:
         raise RuntimeError("interaction attempted an unpinned transport")
+    if coordinator.benchmark.managed(task_id):
+        from PhyAgentOS.forge.benchmark.client import check_dispatch
+        check_dispatch(coordinator, task_id, client)
+        return
     current = coordinator.binding_resolver.runtime_registry.current()
     if current is None or (
         current.runtime_instance_id,

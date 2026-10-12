@@ -105,7 +105,7 @@ class ForgeToolQueryTool(Tool):
                     task_id, tool_id, arguments, timeout_ms=timeout_ms
                 )
             )
-        if self.coordinator.interaction.restricted():
+        if self.coordinator.interaction.restricted() or self.coordinator.benchmark.restricted():
             return _json({"ok": False, "error": {"type": "interaction", "message": "unbound diagnostics are disabled for interaction"}})
         return await _call(
             lambda: self.client.invoke_query_tool(
@@ -162,6 +162,8 @@ class _ActionReadTool(Tool):
         async def read() -> dict[str, Any]:
             # Reject cross-task identifiers before disclosing Gateway state.
             self.coordinator.require_action_invocation(task_id, invocation_id)
+            if self.coordinator.benchmark.managed(task_id):
+                return await self.coordinator.benchmark.read_invocation(task_id, invocation_id, "action", self.operation)
             if self.operation == "status":
                 response = await self.client.invocation_status(invocation_id)
             else:
@@ -271,6 +273,8 @@ class _SessionReadTool(Tool):
         async def read() -> dict[str, Any]:
             # Reject cross-task identifiers before disclosing Gateway state.
             self.coordinator.require_session_invocation(task_id, invocation_id)
+            if self.coordinator.benchmark.managed(task_id):
+                return await self.coordinator.benchmark.read_invocation(task_id, invocation_id, "session", self.operation)
             if self.coordinator.interaction.managed(task_id):
                 return await self.coordinator.interaction.read_invocation(task_id, invocation_id, "session", self.operation)
             response = (

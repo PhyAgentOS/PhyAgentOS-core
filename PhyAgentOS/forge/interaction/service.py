@@ -25,6 +25,7 @@ SAFE_TOOLS = frozenset(
         "forge_tool_session_result",
         "forge_tool_stop_session",
         "message",
+        "forge_task_subtasks",
     }
 )
 
@@ -108,7 +109,7 @@ class InteractionService:
             return True
 
     def allows(self, name):
-        return not self.restricted() or name in SAFE_TOOLS
+        return not (self.restricted() or self.coordinator.benchmark.restricted()) or name in SAFE_TOOLS
 
     @contextmanager
     def tool_call(self, name):

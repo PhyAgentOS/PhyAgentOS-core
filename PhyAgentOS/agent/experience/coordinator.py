@@ -237,6 +237,15 @@ class ExperienceCoordinator:
             return
         try:
             episode = self.store.get_episode_by_root(root_task_id)
+            if episode.outcome.benchmark_evaluation is not None:
+                # Archive exactly one root episode. Local lesson support is case-based;
+                # it cannot become global distinct-root support or a successful workflow.
+                episode.processing_status = "processed"
+                episode.processed_at = utc_now()
+                self.store.update_episode(episode)
+                self.store.finish_job(root_task_id)
+                self.store.record_event("benchmark_evaluation_archived", root_task_id)
+                return
             assessment = await self.analyzer.assess(
                 episode,
                 candidates=self.store.list_candidates(active_only=True),

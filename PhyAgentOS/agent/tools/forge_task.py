@@ -53,19 +53,22 @@ class ForgeTaskCreateTool(Tool):
                     "description": "Primary activate_skill result from this session turn",
                 },
                 "verification": _verification_schema(),
+                "benchmark_plan": {"type": "object", "description": "Frozen round/case manifest for a benchmark Skill"},
             },
             "required": ["task_description", "activation_id", "verification"],
             "additionalProperties": False,
         }
 
     async def execute(
-        self, task_description: str, activation_id: str, verification: dict[str, Any]
+        self, task_description: str, activation_id: str, verification: dict[str, Any],
+        benchmark_plan: dict | None = None
     ) -> str:
         task = self.coordinator.create_task(
             task_description=task_description,
             activation_id=activation_id,
             verification=TaskVerificationContract.model_validate(verification),
             origin_session_key=self.session_key,
+            benchmark_plan=benchmark_plan,
         )
         if inspect.isawaitable(task):
             task = await task
@@ -94,6 +97,10 @@ class ForgeTaskGetTool(Tool):
         summary = interaction.summary(task_id) if interaction is not None else None
         if summary is not None:
             response["interaction"] = summary
+        benchmark = getattr(self.coordinator, "benchmark", None)
+        summary = benchmark.summary(task_id) if benchmark is not None else None
+        if summary is not None:
+            response["benchmark"] = summary
         return json.dumps(response, ensure_ascii=False)
 
 
@@ -175,6 +182,7 @@ def build_forge_task_tools(coordinator: AgentTaskCoordinator) -> list[Tool]:
     return [
         ForgeTaskCreateTool(coordinator),
         ForgeTaskGetTool(coordinator),
+        ForgeTaskSubtasksTool(coordinator),
         ForgeTaskBeginRevisionTool(coordinator),
         ForgeTaskFinalizeTool(coordinator),
         ForgeTaskCancelTool(coordinator),
@@ -233,3 +241,27 @@ __all__ = [
     "ForgeTaskGetTool",
     "build_forge_task_tools",
 ]
+
+
+class ForgeTaskSubtasksTool(Tool):
+    name = "forge_task_subtasks"
+    description = "Read benchmark EpisodeSubtasks or one subtask with pagination; no execution authority."
+    parameters = {"type": "object", "properties": {
+        "task_id": {"type": "string"}, "subtask_id": {"type": "string"},
+        "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+        "required": ["task_id"], "additionalProperties": False}
+
+    def __init__(self, coordinator):
+        self.coordinator = coordinator
+
+    async def execute(self, task_id, subtask_id=None, offset=0, limit=100):
+        service = self.coordinator.benchmark
+        if not service.managed(task_id):
+            raise ValueError("task has no benchmark subtasks")
+        if subtask_id:
+            data = service.store.get("subtask", subtask_id)
+            if data is None or data["task_id"] != task_id:
+                raise ValueError("subtask does not belong to task")
+        else:
+            data = service.store.children(task_id, offset=offset, limit=limit)
+        return json.dumps({"ok": True, "data": data}, ensure_ascii=False)
