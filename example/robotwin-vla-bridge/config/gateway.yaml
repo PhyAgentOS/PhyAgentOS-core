@@ -1,0 +1,698 @@
+# robotwin-benchmark / gpt6_pi05 gateway: GPT-6 supervises pi0.5 on RoboTwin.
+# Providers: benchmark.controller + policy.runner (as g05_external), vla.bridge (sole action writer),
+# and one image_vision per camera (head / left_wrist / right_wrist).
+host: 127.0.0.1
+port: 19132
+joint_order: []
+image_input_ids: []
+readiness:
+  require_proprio_state: false
+  require_images: false
+tools:
+  enabled: true
+  lease_ttl_ms: 300000
+  invoke_timeout_ms: 25200000
+  request_input_id: tool_request
+  response_output_id: tool_response
+  specs:
+  - tool_id: robotwin.benchmark.describe
+    implementation_id: robotwin-benchmark.benchmark
+    endpoint_id: benchmark.controller
+    operation: describe
+    semantics: query
+    description: 'Read the live benchmark capability whitelist (suite, policy_id, task table, joint/camera identifiers,
+      defaults and limits) directly from the node. Query before planning a run; never invent suites, episode ranges,
+      or limits.
+
+      '
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties: {}
+    output_schema:
+      type: object
+      additionalProperties: true
+      properties:
+        benchmark:
+          type: string
+        suite:
+          type: string
+        policy_id:
+          type: string
+        num_tasks:
+          type: integer
+          minimum: 0
+        tasks:
+          type: array
+        joint_names:
+          type: array
+        camera_ids:
+          type: array
+        defaults:
+          type: object
+        limits:
+          type: object
+    readiness: []
+  - tool_id: robotwin.benchmark.run
+    implementation_id: robotwin-benchmark.benchmark
+    endpoint_id: benchmark.controller
+    operation: run
+    semantics: session
+    description: Run one RoboTwin batch through the pi0.5 policy loop supervised by vla.*. One Session = one batch;
+      with hold_on_episode_start every episode opens at a C0 checkpoint and advances only after a vla.decide/vla.set_mode.
+      The seed cursor starts at 100000*(1+seed) per batch and advances by one per accepted or skipped scene, so
+      a batch with init_state_ids [0,1,2] uses consecutive initialization-valid seeds. stop takes effect at the
+      episode boundary. Always fetch the terminal result.
+    input_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - suite
+      properties:
+        suite:
+          enum:
+          - robotwin
+        task_ids:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            minimum: 0
+        init_state_ids:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            minimum: 0
+          maxItems: 5
+        num_runs:
+          type: integer
+          minimum: 1
+          maximum: 1
+        max_steps:
+          type: integer
+          minimum: 1
+          maximum: 1800
+        seed:
+          type: integer
+          minimum: 0
+    output_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - run_id
+      - status
+      - completed_episodes
+      - total_episodes
+      - success_rate
+      - result_file
+      - failure_summary
+      properties:
+        run_id:
+          type: string
+        status:
+          enum:
+          - succeeded
+          - failed
+          - partial
+          - stopped
+        completed_episodes:
+          type: integer
+          minimum: 0
+        total_episodes:
+          type: integer
+          minimum: 1
+        success_rate:
+          type:
+          - number
+          - 'null'
+          minimum: 0
+          maximum: 1
+        result_file:
+          type: string
+        failure_summary:
+          type:
+          - string
+          - 'null'
+    readiness: []
+  - tool_id: robotwin.policy.describe
+    implementation_id: robotwin-benchmark.policy
+    endpoint_id: policy.runner
+    operation: describe
+    semantics: query
+    description: Confirm the policy model or external G05 connection initialized successfully before running a batch.
+    input_schema:
+      type: object
+      properties: {}
+      additionalProperties: false
+    output_schema:
+      type: object
+      required:
+      - policy_id
+      - backend
+      - ready
+      - running
+      - action_dim
+      properties:
+        policy_id:
+          type: string
+        backend:
+          type: string
+        ready:
+          type: boolean
+        running:
+          type: boolean
+        action_dim:
+          type: integer
+      additionalProperties: false
+    readiness: []
+  - tool_id: vla.set_mode
+    implementation_id: robotwin-gpt6.mux
+    endpoint_id: vla.bridge
+    operation: set_mode
+    semantics: query
+    description: 'Spontaneous passthrough switch (no segment budget, no C2 detection; use vla.decide for checkpoint
+      discipline). policy/student = the pi0.5 14-D absolute joint targets are forwarded to RoboTwin; agent/stop
+      = the bridge holds: actions are dropped, RoboTwin takes zero sim time because it advances only on action messages.
+      The held action is latched and replayed when forwarding resumes. eef is not available.'
+    input_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - mode
+      properties:
+        mode:
+          enum:
+          - policy
+          - agent
+          - student
+          - edit
+          - stop
+    output_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - mode
+      - changed
+      - policy_command
+      - request_id
+      properties:
+        mode:
+          enum:
+          - student
+          - edit
+          - eef
+          - stop
+        changed:
+          type: boolean
+        policy_command:
+          enum:
+          - start
+          - pause
+        request_id:
+          type: string
+    readiness: []
+    robot_frame_profile: &id001
+      robot_id: robotwin_aloha_agilex
+      base_frame: world
+      tool_frame: none
+      frames: {}
+      directions: {}
+  - tool_id: vla.decide
+    implementation_id: robotwin-gpt6.mux
+    endpoint_id: vla.bridge
+    operation: decide
+    semantics: query
+    description: 'The checkpoint decision, the ONLY entry that opens a supervised segment. Modes: student (forward
+      pi0.5''s 14-D absolute joint targets unchanged), edit (same, plus a joint-space offset in RADIANS added to
+      the named arm joints, ramped in over the first 5 steps and then held until the segment ends; at most 0.1 rad
+      per joint per segment and 0.3 rad per joint per episode; left_gripper/right_gripper open|closed override the
+      gripper target, 1=open 0=closed), stop (freeze: RoboTwin takes zero sim time; stop PARKS the episode, resume
+      with student/edit or vla.set_mode). eef is rejected for this profile because RoboTwin qpos proprio carries
+      no end-effector pose. Every segment has a step budget (1..10 native steps); when it is exhausted (C1) or a
+      C2 event fires (policy_starved / no_progress / invalid_actions) the bridge freezes and opens the next checkpoint.
+      Rejected decisions return a structured retryable error.'
+    input_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - mode
+      properties:
+        mode:
+          enum:
+          - student
+          - edit
+          - stop
+          - policy
+          - agent
+        steps:
+          type: integer
+          minimum: 1
+          maximum: 10
+          description: Segment budget in native RoboTwin steps (1..10). stop takes none.
+        edit:
+          type: object
+          additionalProperties: false
+          properties:
+            delta_joints:
+              type: object
+              additionalProperties: false
+              description: Joint offsets in radians keyed by arm joint name (fl_* = left arm, fr_* = right arm;
+                joint7 is the gripper and not allowed here). Read the current values in vla.get_status.last_joint_positions.
+              properties:
+                fl_joint1:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fl_joint2:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fl_joint3:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fl_joint4:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fl_joint5:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fl_joint6:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fr_joint1:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fr_joint2:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fr_joint3:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fr_joint4:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fr_joint5:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+                fr_joint6:
+                  type: number
+                  minimum: -0.1
+                  maximum: 0.1
+            left_gripper:
+              enum:
+              - keep
+              - open
+              - closed
+            right_gripper:
+              enum:
+              - keep
+              - open
+              - closed
+        reason:
+          type: string
+        assessment:
+          type: object
+          additionalProperties: true
+    output_schema:
+      type: object
+      additionalProperties: true
+      required:
+      - accepted
+      - mode
+      - policy_command
+      - request_id
+      - decision
+      properties:
+        accepted:
+          type: boolean
+        mode:
+          enum:
+          - student
+          - edit
+          - eef
+          - stop
+        policy_command:
+          enum:
+          - start
+          - pause
+        request_id:
+          type: string
+        segment:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        checkpoint:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        checkpoint_closed:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        decision:
+          type: object
+          additionalProperties: true
+        edit_step_bias:
+          type: array
+          items:
+            type: number
+    readiness: []
+    robot_frame_profile: *id001
+  - tool_id: vla.get_status
+    implementation_id: robotwin-gpt6.mux
+    endpoint_id: vla.bridge
+    operation: get_status
+    semantics: query
+    description: 'Read the mux mode, policy phase, action counters (exact step counters: RoboTwin consumes one action
+      per step), the current segment, the open checkpoint (trigger C0/C1/C2/C3 and reason), the checkpoint history
+      tail, joint_names, last_joint_positions (14-D qpos, radians; grippers 0=closed 1=open), and the latest
+      observed pi0.5 joint-abs candidate. When candidate.freshness=pending the action has not executed; otherwise it
+      is historical context, not a guaranteed future action. Poll this after every decision and whenever the episode
+      looks stuck.'
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties: {}
+    output_schema:
+      type: object
+      additionalProperties: true
+      properties:
+        mode:
+          enum:
+          - student
+          - edit
+          - eef
+          - stop
+        policy_id:
+          type: string
+        proprio_gate:
+          enum:
+          - age
+          - seen
+        policy_last_status:
+          type: object
+        policy_status_age_ms:
+          type:
+          - integer
+          - 'null'
+        policy_phase_hint:
+          type: string
+        proprio_age_ms:
+          type:
+          - integer
+          - 'null'
+        proprio_fresh:
+          type: boolean
+        counters:
+          type: object
+        checkpoints_enabled:
+          type: boolean
+        supervised:
+          type: boolean
+        episode:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        segment:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        checkpoint:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        checkpoint_history:
+          type: array
+        cumulative_edit_units:
+          type: array
+          items:
+            type: number
+        last_eef_pos:
+          type:
+          - array
+          - 'null'
+        last_decision:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        joint_names:
+          type: array
+        last_joint_positions:
+          type:
+          - array
+          - 'null'
+        candidate:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        cumulative_edit_joint_rad:
+          type: object
+    readiness: []
+    robot_frame_profile: *id001
+  - tool_id: vision.get_frame
+    implementation_id: image.reader.head
+    endpoint_id: image.vision.head
+    operation: get_frame
+    semantics: query
+    description: 'Capture the latest head camera (RoboTwin `head_camera`, the pi0.5 cam_high input): the overhead
+      view of both arms and the table, 320x240 RGB, and return the path of a JPEG on disk plus size, frame seq and
+      age. Read the file at image_path with your image tool. At a checkpoint the sim is FROZEN, so pass max_age_ms
+      generously (e.g. 60000). At C0 (vla.get_status.episode.steps == 0) the frame on disk belongs to the PREVIOUS
+      episode; decide C0 without the camera.'
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        max_age_ms:
+          type: integer
+          minimum: 1
+          maximum: 600000
+          description: 'Reject frames older than this (default 500). At a checkpoint the sim is FROZEN, so the newest
+            frame stays the newest frame and its wall-clock age grows only with your own thinking time — pass this
+            generously (e.g. 60000) instead of retrying against a 5 s limit. One case must never be "fixed" by raising
+            it: at C0 (`vla.get_status.episode.steps == 0`) no frame exists for the episode that has not stepped,
+            and the newest announced frame on disk is the PREVIOUS episode''s layout, which is small-aged and would
+            be served silently. Check the status first and decide C0 without the camera.'
+        downscale:
+          oneOf:
+          - type: 'null'
+          - type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              type: integer
+              minimum: 1
+          description: Optional [width, height]; must not upscale the 320x240 source.
+    output_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - image_path
+      - width
+      - height
+      - frame_seq
+      - frame_age_ms
+      properties:
+        image_path:
+          type: string
+        width:
+          type: integer
+        height:
+          type: integer
+        source_width:
+          type: integer
+        source_height:
+          type: integer
+        frame_seq:
+          type: integer
+        captured_mono_ns:
+          type: integer
+        capture_timestamp_ns:
+          type:
+          - integer
+          - 'null'
+        frame_age_ms:
+          type: integer
+        depth_valid_ratio:
+          type:
+          - number
+          - 'null'
+    readiness: []
+    robot_frame_profile: *id001
+  - tool_id: vision.get_frame_left_wrist
+    implementation_id: image.reader.left_wrist
+    endpoint_id: image.vision.left_wrist
+    operation: get_frame
+    semantics: query
+    description: 'Capture the latest LEFT wrist camera (pi0.5 cam_left_wrist): gripper-to-object relation of the
+      left arm, 320x240 RGB, and return the path of a JPEG on disk plus size, frame seq and age. Read the file at
+      image_path with your image tool. At a checkpoint the sim is FROZEN, so pass max_age_ms generously (e.g. 60000).
+      At C0 (vla.get_status.episode.steps == 0) the frame on disk belongs to the PREVIOUS episode; decide C0 without
+      the camera.'
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        max_age_ms:
+          type: integer
+          minimum: 1
+          maximum: 600000
+          description: 'Reject frames older than this (default 500). At a checkpoint the sim is FROZEN, so the newest
+            frame stays the newest frame and its wall-clock age grows only with your own thinking time — pass this
+            generously (e.g. 60000) instead of retrying against a 5 s limit. One case must never be "fixed" by raising
+            it: at C0 (`vla.get_status.episode.steps == 0`) no frame exists for the episode that has not stepped,
+            and the newest announced frame on disk is the PREVIOUS episode''s layout, which is small-aged and would
+            be served silently. Check the status first and decide C0 without the camera.'
+        downscale:
+          oneOf:
+          - type: 'null'
+          - type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              type: integer
+              minimum: 1
+          description: Optional [width, height]; must not upscale the 320x240 source.
+    output_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - image_path
+      - width
+      - height
+      - frame_seq
+      - frame_age_ms
+      properties:
+        image_path:
+          type: string
+        width:
+          type: integer
+        height:
+          type: integer
+        source_width:
+          type: integer
+        source_height:
+          type: integer
+        frame_seq:
+          type: integer
+        captured_mono_ns:
+          type: integer
+        capture_timestamp_ns:
+          type:
+          - integer
+          - 'null'
+        frame_age_ms:
+          type: integer
+        depth_valid_ratio:
+          type:
+          - number
+          - 'null'
+    readiness: []
+    robot_frame_profile: *id001
+  - tool_id: vision.get_frame_right_wrist
+    implementation_id: image.reader.right_wrist
+    endpoint_id: image.vision.right_wrist
+    operation: get_frame
+    semantics: query
+    description: 'Capture the latest RIGHT wrist camera (pi0.5 cam_right_wrist): gripper-to-object relation of the
+      right arm, 320x240 RGB, and return the path of a JPEG on disk plus size, frame seq and age. Read the file
+      at image_path with your image tool. At a checkpoint the sim is FROZEN, so pass max_age_ms generously (e.g.
+      60000). At C0 (vla.get_status.episode.steps == 0) the frame on disk belongs to the PREVIOUS episode; decide
+      C0 without the camera.'
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        max_age_ms:
+          type: integer
+          minimum: 1
+          maximum: 600000
+          description: 'Reject frames older than this (default 500). At a checkpoint the sim is FROZEN, so the newest
+            frame stays the newest frame and its wall-clock age grows only with your own thinking time — pass this
+            generously (e.g. 60000) instead of retrying against a 5 s limit. One case must never be "fixed" by raising
+            it: at C0 (`vla.get_status.episode.steps == 0`) no frame exists for the episode that has not stepped,
+            and the newest announced frame on disk is the PREVIOUS episode''s layout, which is small-aged and would
+            be served silently. Check the status first and decide C0 without the camera.'
+        downscale:
+          oneOf:
+          - type: 'null'
+          - type: array
+            minItems: 2
+            maxItems: 2
+            items:
+              type: integer
+              minimum: 1
+          description: Optional [width, height]; must not upscale the 320x240 source.
+    output_schema:
+      type: object
+      additionalProperties: false
+      required:
+      - image_path
+      - width
+      - height
+      - frame_seq
+      - frame_age_ms
+      properties:
+        image_path:
+          type: string
+        width:
+          type: integer
+        height:
+          type: integer
+        source_width:
+          type: integer
+        source_height:
+          type: integer
+        frame_seq:
+          type: integer
+        captured_mono_ns:
+          type: integer
+        capture_timestamp_ns:
+          type:
+          - integer
+          - 'null'
+        frame_age_ms:
+          type: integer
+        depth_valid_ratio:
+          type:
+          - number
+          - 'null'
+    readiness: []
+    robot_frame_profile: *id001
+  providers:
+  - endpoint_id: benchmark.controller
+    input_id: benchmark_tool_in
+    output_id: benchmark_tool_out
+  - endpoint_id: policy.runner
+    input_id: policy_tool_in
+    output_id: policy_tool_out
+  - endpoint_id: vla.bridge
+    input_id: vla_tool_in
+    output_id: vla_tool_out
+  - endpoint_id: image.vision.head
+    input_id: image_head_tool_in
+    output_id: image_head_tool_out
+  - endpoint_id: image.vision.left_wrist
+    input_id: image_left_tool_in
+    output_id: image_left_tool_out
+  - endpoint_id: image.vision.right_wrist
+    input_id: image_right_tool_in
+    output_id: image_right_tool_out
