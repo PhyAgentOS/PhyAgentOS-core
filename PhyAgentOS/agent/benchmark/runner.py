@@ -143,9 +143,10 @@ class EpisodeRunner:
                         usage=decision.get("usage"),
                         finished_at=time.time(),
                     )
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
                     self.store.update(
-                        "model", attempt_id, status="cancelled", finished_at=time.time()
+                        "model", attempt_id, status="cancelled", finished_at=time.time(),
+                        usage=getattr(exc, "usage", None)
                     )
                     self.store.update("decision", key, status="discarded")
                     raise

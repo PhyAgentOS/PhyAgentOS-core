@@ -64,3 +64,12 @@ experiment still needs the planned larger task set and controlled repeats.
 Known limitations of this attempt include task-local orchestration outside the
 PAOS core API, dependency on the installed RoboTwin/PAOS runtime, and a
 mechanical evidence summary that still needs broader validation.
+
+## Integration status
+
+This is retained historical research code, not the default real-benchmark entry point.
+Use [the governed RoboTwin smoke](../../docs/robotwin-benchmark-deployment.md) for new runs.
+Incomplete/native-infrastructure results are now rejected before lesson generation.
+The legacy runner uses a read-only unresolved-task check; it no longer refers to the
+unpublished `task_maintenance.py --fix` helper or silently rewrites task state.
+The four-arm schedule and unequal second-attempt policy remain historical limitations.

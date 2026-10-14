@@ -296,7 +296,25 @@ def verification_contract(calls: list[ToolCall]) -> tuple[str | None, list[str],
     return None, [], ""
 
 
+def require_valid_episode(result: dict[str, Any]) -> None:
+    """Reject incomplete/infra evidence before it can become a learnable failure."""
+    if (result.get('status') != 'succeeded' or result.get('total_episodes') != 1
+            or result.get('completed_episodes') != 1 or result.get('success_rate') not in (0, 1)):
+        raise ValueError('A completed single RoboTwin episode is required; infrastructure results are not lessons')
+    episodes = result.get('episodes')
+    if not isinstance(episodes, list) or len(episodes) != 1 or not isinstance(episodes[0], dict):
+        raise ValueError('Missing authoritative episode record')
+    episode = episodes[0]
+    if (episode.get('error_code') or episode.get('error_message')
+            or episode.get('termination') not in ('success', 'failed')
+            or type(episode.get('success')) is not bool
+            or episode['success'] != (result['success_rate'] == 1)
+            or (episode['termination'] == 'success') != episode['success']):
+        raise ValueError('Invalid/inconsistent native episode outcome')
+
+
 def benchmark_succeeded(result: dict[str, Any]) -> bool:
+    require_valid_episode(result)
     total = result.get("total_episodes")
     completed = result.get("completed_episodes")
     return bool(

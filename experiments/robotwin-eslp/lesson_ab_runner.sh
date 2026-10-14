@@ -105,7 +105,7 @@ run_episode() {
   local arm=$1
   local phase=$2
   stop_skill
-  "$PY" "$TOOLS/task_maintenance.py" "$HOME/.PhyAgentOS/workspace/.paos/agent_tasks/tasks.sqlite3" --fix >>"$LOG_DIR/maintenance.log" 2>&1
+  "$PY" "$TOOLS/assert_idle.py" "$HOME/.PhyAgentOS/workspace/.paos/agent_tasks/tasks.sqlite3" >>"$LOG_DIR/maintenance.log" 2>&1 || return 1
   paos skill start "$SKILL" --profile "$PROFILE" >>"$LOG_DIR/runtime.log" 2>&1
   sleep 30
   local result_path=""
@@ -140,6 +140,11 @@ run_episode() {
     printf '{"lane":"%s","task":"%s","arm":"%s","phase":"%s","status":"missing_result"}\n' "$LANE" "$TASK_NAME" "$arm" "$phase" >> "$TASK_DIR/results/events.jsonl"
     return 1
   fi
+  PYTHONPATH="$TOOLS" "$PY" - "$result_path" <<'PYCODE' || return 1
+import json, sys
+from robotwin_evidence import require_valid_episode
+require_valid_episode(json.load(open(sys.argv[1])))
+PYCODE
   cp "$result_path" "$TASK_DIR/results/${phase}_${arm}.json"
   cp "$WORKSPACE/sessions/$session.jsonl" "$TASK_DIR/sessions/${phase}_${arm}.jsonl"
   local carrier=none

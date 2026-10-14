@@ -1,5 +1,10 @@
 # RoboTwin VLM＋VLA 可运行实验基线（2026-10-13）
 
+> 本文保留 2026-10-13 的部署与实验记录。新增单回合入口、修正后的参数/计数约定与停止流程见
+> [真实 benchmark 部署说明](robotwin-benchmark-deployment.md)。下文文件哈希与测试数对应历史快照，
+> 不代表后续修正的代码版本。历史批次新增要求：设置共享的 `RSI_WORKER_LEASE_DIR`。
+
+
 ## 本分支用途
 
 保存现阶段实际部署过的 PAOS＋RoboTwin **DeepSeek VLM＋π0.5 VLA** 代码，供团队审阅、复用和继续排查。基于 `feature/benchmark` 的 `cbf956b0e5e176a185cda9264f93c2850e4e1c3d`，集成 candidate-aware bridge、真实私有适配器、任务内冻结经验及 v12 校验/停止修复。

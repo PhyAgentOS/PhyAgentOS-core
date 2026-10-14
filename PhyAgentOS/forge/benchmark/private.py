@@ -19,7 +19,7 @@ class PrivateBenchmarkTransport(httpx.AsyncBaseTransport):
 
 
 class PrivateBenchmarkDeployment:
-    def __init__(self, *, transport, workers, decide, artifacts, experiences=None,
+    def __init__(self, *, transport, workers, decide, artifacts, case_experiences=None,
                  control_timeout_s=300, poll_interval_s=0.2):
         if type(transport) is not PrivateBenchmarkTransport:
             raise ValueError("explicit private adapter transport required")
@@ -30,7 +30,12 @@ class PrivateBenchmarkDeployment:
         self.decide, self.artifacts = decide, artifacts
         self.reflect = self.validate_lesson = None
         self.control_timeout_s, self.poll_interval_s = control_timeout_s, poll_interval_s
-        self._experiences = json.loads(json.dumps(experiences or {}))
+        self._experiences = json.loads(json.dumps(case_experiences or {}, allow_nan=False))
+        if not isinstance(self._experiences, dict) or any(
+            not isinstance(key, str) or not key or not isinstance(value, list)
+            for key, value in self._experiences.items()
+        ):
+            raise ValueError("case_experiences must map case keys to frozen lists")
         self._experiences_digest = digest(self._experiences)
 
     def authorize(self, runtime):
@@ -42,14 +47,5 @@ class PrivateBenchmarkDeployment:
             raise RuntimeError("frozen episodic experience changed")
 
     def experience_for(self, case):
-        environment = case.get("environment", {})
-        arm = environment.get("arm")
-        if arm == "none":
-            return []
-        if arm != "fixed":
-            raise ValueError("unsupported frozen-experience arm")
-        task = environment.get("task_name")
-        experience = self._experiences.get(task)
-        if not experience or experience.get("task_name") != task:
-            raise ValueError("missing task-local frozen episodic experience")
-        return [copy.deepcopy(experience)]
+        """Optional host-owned context keyed by frozen case identity, independent of domain."""
+        return copy.deepcopy(self._experiences.get(case["case_key"], []))

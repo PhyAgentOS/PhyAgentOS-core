@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+
+from owned_io import owned_call
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import yaml
 from PhyAgentOS.agent.experience.activation import SkillActivationManager
 from PhyAgentOS.agent.experience.store import ExperienceStore
 from PhyAgentOS.config.schema import ForgeConfig
+from PhyAgentOS.forge.benchmark.evidence import checked_report
 from PhyAgentOS.forge.benchmark.private import PrivateBenchmarkDeployment, PrivateBenchmarkTransport
 from PhyAgentOS.forge.binding import ForgeSkillBindingResolver
 from PhyAgentOS.forge.interaction.contracts import digest
@@ -28,6 +31,7 @@ from scripts.package_skill import package
 from controller import DeepSeekDecider, RoboTwinAdapter, Runtime
 from fixed_runner import TASKS, pair_schedule, sha256
 from prescreen_runner import save_json
+from reservation import WorkerReservation
 
 
 def selected_pairs(task, repetitions=None):
@@ -113,7 +117,24 @@ def proposal_schema():
             'left_gripper': {'enum': ['keep', 'open', 'closed']},
             'right_gripper': {'enum': ['keep', 'open', 'closed']}}, 'additionalProperties': False}},
         'required': ['mode', 'steps', 'reason', 'assessment'], 'additionalProperties': False,
-        'allOf': [{'if': {'properties': {'mode': {'const': 'edit'}}}, 'then': {'required': ['edit']}}]}
+        'allOf': [{'if': {'properties': {'mode': {'const': 'edit'}}}, 'then': {'required': ['edit'], 'properties': {'steps': {'maximum': 5}}}}]}
+
+
+def case_experiences(cases, experiences=None):
+    """Keep RoboTwin arm/task semantics out of the generic Core deployment."""
+    frozen = {}
+    for case in cases:
+        environment = case['environment']
+        if environment['arm'] == 'none':
+            continue
+        if environment['arm'] != 'fixed':
+            raise ValueError('unsupported frozen-experience arm')
+        task = environment['task_name']
+        experience = (experiences or {}).get(task)
+        if not experience or experience.get('task_name') != task:
+            raise ValueError('missing task-local frozen episodic experience')
+        frozen[case['case_key']] = [experience]
+    return frozen
 
 
 class Experiment:
@@ -187,7 +208,7 @@ class Experiment:
         self.coordinator.benchmark.closing = False
         self.supervisor = self.coordinator.benchmark.enable_private_adapter(PrivateBenchmarkDeployment(
             transport=self.transport, workers=[self.args.task], decide=self.decider,
-            artifacts=self.adapter.artifacts, experiences=experiences))
+            artifacts=self.adapter.artifacts, case_experiences=case_experiences(cases, experiences)))
         save_json(self.runtime.root / 'CURRENT.json', {'phase': phase, 'task_id': task.task_id,
             'episodes': len(cases), 'started_at': time.time()})
         await self.coordinator.start_session(task.task_id, 'benchmark.run', {})
@@ -202,6 +223,8 @@ class Experiment:
                 'outcomes': [{'outcome': child['outcome'], 'reason': child.get('reason')} for child in children]}))
         invalid = [child for child in children if child['outcome'] not in {'success', 'failure'}]
         if invalid:
+            if getattr(self.args, 'mode', None) == 'smoke':
+                raise RuntimeError('smoke_infrastructure_invalid; no automatic retry')
             if attempt == 2 or any(child['case']['environment'].get('infra_attempt', 1) >= 2 for child in invalid):
                 raise RuntimeError('infrastructure_retry_limit_reached')
             retry_cases = []
@@ -212,6 +235,13 @@ class Experiment:
                 case['environment']['infra_attempt'] = 2
                 retry_cases.append(case)
             children += await self.run_root(retry_cases, phase + '_infra_retry', experiences, attempt=2)
+        else:
+            if self.coordinator.get_task(task.task_id).status.value != 'succeeded':
+                raise RuntimeError('core_evaluation_verification_failed')
+            report_path = self.runtime.root / (phase + '_CORE_REPORT.json')
+            payload = json.loads(report_path.read_text())
+            payload['benchmark_report'] = checked_report(self.coordinator.benchmark, task.task_id)
+            save_json(report_path, payload)
         return children
 
     def valid_directory(self, trial):
@@ -260,9 +290,9 @@ class Experiment:
                     raise RuntimeError('experience_source_failed_or_timed_out')
                 await asyncio.sleep(5)
             experience = import_experience(source, self.runtime.root, self.args.task, self.runtime.reference['scene'])
-            await asyncio.to_thread(self.launch_policy)
+            await owned_call(self.launch_policy)
         else:
-            await asyncio.to_thread(self.launch_policy)
+            await owned_call(self.launch_policy)
             await self.run_root([self.case('development_a1', 'none', 3101, development=True)], 'development')
             experience = await self.freeze(self.valid_directory('development_a1'))
         experiences = {self.args.task: experience}
@@ -340,6 +370,11 @@ class Experiment:
 
 async def main(args):
     experiment = None
+    lease_dir = getattr(args, 'lease_dir', None) or os.environ.get('RSI_WORKER_LEASE_DIR')
+    if not lease_dir:
+        raise ValueError('Set --lease-dir or RSI_WORKER_LEASE_DIR to a shared durable host reservation directory')
+    lease = WorkerReservation(lease_dir, args.root, [args.gateway_port, args.policy_port])
+    lease.acquire()
     try:
         experiment = Experiment(args)
         await experiment.run()
@@ -355,9 +390,15 @@ async def main(args):
                 if experiment.supervisor:
                     await experiment.supervisor.shutdown()
             finally:
-                await experiment.decider.client.close()
-                await experiment.client.close()
-                await asyncio.to_thread(experiment.runtime.close)
+                try:
+                    await experiment.decider.client.close()
+                    await experiment.client.close()
+                finally:
+                    await owned_call(experiment.runtime.close)
+                    cleanup = json.loads((experiment.runtime.root / 'CLEANUP.json').read_text())
+                    lease.release_after_cleanup(cleanup)
+        else:
+            lease.release()
 
 
 if __name__ == '__main__':
@@ -376,4 +417,5 @@ if __name__ == '__main__':
     parser.add_argument('--repetitions', type=int, nargs='+')
     parser.add_argument('--import-task-root')
     parser.add_argument('--resume-task-root')
+    parser.add_argument('--lease-dir')
     asyncio.run(main(parser.parse_args()))

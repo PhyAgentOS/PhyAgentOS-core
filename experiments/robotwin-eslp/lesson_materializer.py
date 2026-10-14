@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from robotwin_evidence import as_dict, load_tool_calls, read_session_records, tool_outputs
+from robotwin_evidence import as_dict, load_tool_calls, read_session_records, tool_outputs, require_valid_episode
 
 
 def recursively_find(value: Any, suffix: str) -> list[Any]:
@@ -198,6 +198,9 @@ def main() -> None:
     args = parser.parse_args()
 
     result = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    require_valid_episode(result)
+    if result["success_rate"] != 0:
+        raise ValueError("ESLP failure carriers require a valid native failure")
     calls = load_tool_calls(args.session)
     rationales = reasoning_facts(args.session)
     facts = checkpoint_facts(calls)

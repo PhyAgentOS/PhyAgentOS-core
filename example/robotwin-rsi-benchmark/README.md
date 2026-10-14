@@ -1,5 +1,12 @@
 # PAOS benchmark core + candidate-aware RoboTwin (experimental)
 
+For a new installation, start with the [single-episode deployment guide](../../docs/robotwin-benchmark-deployment.md)
+and `smoke.py --config /absolute/local-smoke.json --root /absolute/new-run --check`.
+Use `--run` for one real episode without historical references or experience generation.
+The batch descriptions below are the retained 2026-10-13 research protocol; they are not the default smoke.
+All batch runs now require a shared host `RSI_WORKER_LEASE_DIR` (or `experiment.py --lease-dir`).
+
+
 Current runnable VLM+VLA branch snapshot and deployment prerequisites:
 [2026-10-13 runtime notes](../../docs/robotwin-runtime-20261013.md).
 This is not the upcoming pure-VLM+IK implementation or proof of RSI benefit.

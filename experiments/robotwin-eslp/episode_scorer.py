@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from robotwin_evidence import as_dict, load_tool_calls, tool_outputs
+from robotwin_evidence import as_dict, load_tool_calls, tool_outputs, require_valid_episode
 
 
 def assistant_text(calls: list[Any]) -> str:
@@ -23,6 +23,7 @@ def main() -> None:
     args = parser.parse_args()
     calls = load_tool_calls(args.session)
     result = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    require_valid_episode(result)
     decisions = []
     last_counters = {}
     for call in calls:

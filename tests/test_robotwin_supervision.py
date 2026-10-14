@@ -54,9 +54,10 @@ def test_proposal_schema_rejects_wrong_gripper_and_extra_authority():
 
 
 @pytest.mark.asyncio
-async def test_bridge_native_query_semantics_are_respected():
+async def test_bridge_native_query_semantics_are_respected(tmp_path):
     from controller import RoboTwinAdapter
-    adapter = RoboTwinAdapter(None)
+    from types import SimpleNamespace
+    adapter = RoboTwinAdapter(SimpleNamespace(root=tmp_path))
     adapter.tools = [{'tool_id': 'vla.decide', 'semantics': 'query', 'endpoint_id': 'vla', 'operation': 'decide'}]
     routes = []
     async def native(route, arguments=None):
@@ -71,7 +72,7 @@ async def test_bridge_native_query_semantics_are_respected():
 async def test_native_phase_only_status_does_not_break_observation(tmp_path):
     from types import SimpleNamespace
     from controller import RoboTwinAdapter
-    runtime = SimpleNamespace(reference={'scene': {'instruction': 'turn left switch'}}, description='switch task')
+    runtime = SimpleNamespace(root=tmp_path, reference={'scene': {'instruction': 'turn left switch'}}, description='switch task')
     adapter = RoboTwinAdapter(runtime)
     episode = {'native_invocation': 'native', 'ready': True, 'snapshot': {'state': 'ready'}}
     routes = []

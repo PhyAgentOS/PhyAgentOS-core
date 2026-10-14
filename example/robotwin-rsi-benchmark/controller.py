@@ -1,9 +1,12 @@
 import asyncio
+
+from owned_io import owned_call
 import copy
 import json
 import os
 from pathlib import Path
 import signal
+import socket
 import time
 from urllib.error import HTTPError
 
@@ -19,9 +22,12 @@ from fixed_runner import FixedRunner, PYTHON, initial_identity, sha256
 from prescreen_runner import request_json, save_json, validate_result
 from supervision import Supervisor
 from response_validation import decision_object, decision_template, validation_feedback
+from model_config import ProviderUsage, model_config
 
 
 def validate_native_decision(proposal):
+    if proposal['mode'] == 'edit' and proposal.get('steps', 5) > 5:
+        raise ValueError('Edit segments are limited to five native steps')
     if proposal['mode'] == 'student' and 'edit' in proposal:
         raise ValueError('student takes no edit block; regenerate without edit rather than submitting it')
 
@@ -31,6 +37,7 @@ class Runtime(FixedRunner):
         super().prepare_home()
         for name, entrypoint in [('vla_bridge', 'vla_bridge.main'), ('image_vision', 'image_vision.main')]:
             script = self.skill_root / 'nodes' / name / (name + '.sh')
+            script.unlink(missing_ok=True)  # Do not follow a copied launcher symlink into the source installation.
             script.write_text('#!/usr/bin/env bash\nset -euo pipefail\n'
                 'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
                 'exec "$ROOT/.venv/bin/python" -c "from ' + entrypoint + ' import main; main()" "$@"\n')
@@ -38,11 +45,11 @@ class Runtime(FixedRunner):
 
     def __init__(self, args):
         super().__init__(args)
-        self.env['PYTHONPATH'] = os.environ['RSI_CORE'] + os.pathsep + str(args.root)
+        self.env['PYTHONPATH'] = str(getattr(args, 'core', None) or os.environ.get('RSI_CORE') or Path(__file__).resolve().parents[2]) + os.pathsep + str(args.root)
 
     def command(self, command, log, timeout):
         if command[0] == 'paos':
-            command = [PYTHON, '-m', 'PhyAgentOS.cli.commands', *command[1:]]
+            command = [getattr(self.args, 'agent_python', None) or PYTHON, '-m', 'PhyAgentOS.cli.commands', *command[1:]]
         return super().command(command, log, timeout)
 
     def executor_processes(self):
@@ -86,11 +93,18 @@ class Runtime(FixedRunner):
 
     def close(self):
         stop_error = None
+        executor_proven = False
+        policy_error = None
         try:
-            self.stop_skill()
+            state_path = self.state / 'run/skills' / (self.skill + '.json')
+            if state_path.exists():
+                self.stop_executor()
+            elif self.executor_processes():
+                raise RuntimeError('owned_executor_has_no_runtime_state')
+            executor_proven = True
         except Exception as error:
             stop_error = str(error)
-        finally:
+        try:
             if self.policy_process and self.policy_process.poll() is None:
                 os.killpg(self.policy_process.pid, signal.SIGTERM)
                 try:
@@ -98,14 +112,26 @@ class Runtime(FixedRunner):
                 except Exception:
                     os.killpg(self.policy_process.pid, signal.SIGKILL)
                     self.policy_process.wait(timeout=10)
+        except Exception as error:
+            policy_error = str(error)
+        finally:
             save_json(self.root / 'CLEANUP.json', {'own_policy_exited': self.policy_process is None or
                 self.policy_process.poll() is not None, 'skill_stop_error': stop_error,
+                'policy_stop_error': policy_error, 'executor_shutdown_proven': executor_proven,
                 'shared_models_untouched': True})
 
 
 class RoboTwinAdapter:
     def __init__(self, runtime):
         self.runtime = runtime
+        # A new process cannot reconstruct native invocation authority from the
+        # diagnostic files. Refuse reuse before any native request, even after
+        # an apparently clean prior run; reconciliation is an operator action.
+        owner = runtime.root / 'ADAPTER_OWNER.json'
+        with owner.open('x') as output:
+            json.dump({'pid': os.getpid(), 'host': socket.gethostname(),
+                'started_at': time.time(), 'automatic_resume': False,
+                'recovery': 'Stop and reconcile the original owned runtime before a new batch.'}, output)
         self.artifacts = ObservationArtifacts()
         self.roots, self.episodes, self.receipts, self.invocations = {}, {}, {}, {}
         self.active = None
@@ -117,7 +143,7 @@ class RoboTwinAdapter:
 
     async def native(self, route, arguments=None):
         try:
-            return await asyncio.to_thread(request_json, self.runtime.api, route, arguments)
+            return await owned_call(request_json, self.runtime.api, route, arguments)
         except HTTPError as error:
             body = error.read().decode('utf-8', errors='replace')
             detail = {'route': route, 'status': error.code, 'body': body}
@@ -172,7 +198,7 @@ class RoboTwinAdapter:
             raise RuntimeError('cross-task episode refused')
         directory = self.runtime.root / environment['trial']
         directory.mkdir()
-        task_id, _ = await asyncio.to_thread(self.runtime.prepare_trial, directory, 'none', environment['seed'])
+        task_id, _ = await owned_call(self.runtime.prepare_trial, directory, 'none', environment['seed'])
         self.tools = (await self.native('/tools'))['data']['tools']
         await self.action('vla.set_mode', {'mode': 'stop'})
         native_arguments = {'suite': 'robotwin', 'task_ids': [task_id], 'init_state_ids': [0],
@@ -199,7 +225,16 @@ class RoboTwinAdapter:
                         self.runtime.args.max_steps, self.runtime.description)
         ledger = raw['metrics']['scene_seed_ledger']
         scene = {key: ledger[0][key] for key in ('task_id', 'init_state_id', 'scene_seed', 'instruction')}
-        if len(ledger) != 1 or scene != self.runtime.reference['scene']:
+        if len(ledger) != 1:
+            raise RuntimeError('scene_or_instruction_drift')
+        if getattr(self.runtime.args, 'mode', None) == 'smoke':
+            expected = self.runtime.reference['scene']
+            if any(scene[key] != expected[key] for key in ('task_id', 'init_state_id', 'instruction')):
+                raise RuntimeError('scene_or_instruction_drift')
+            # A smoke establishes its own observed identity; it is not a matched screening comparison.
+            self.runtime.reference['scene'] = scene
+            save_json(self.runtime.root / 'SMOKE_SCENE.json', scene)
+        elif scene != self.runtime.reference['scene']:
             raise RuntimeError('scene_or_instruction_drift')
         events = [json.loads(line) for line in (self.runtime.root / 'policy_audit.jsonl').read_text().splitlines()]
         events = [event for event in events if event.get('trial_id') == directory.name]
@@ -208,7 +243,7 @@ class RoboTwinAdapter:
         identity = initial_identity(events)
         reference_path = self.runtime.root / 'RUNTIME_INITIAL_REFERENCE.json'
         if not reference_path.exists():
-            if not episode['environment']['development']:
+            if not episode['environment']['development'] and getattr(self.runtime.args, 'mode', None) != 'smoke':
                 raise RuntimeError('formal_episode_cannot_establish_runtime_reference')
             save_json(reference_path, {'initial_observation': identity,
                 'screening_equal': identity == self.runtime.reference['initial_observation'],
@@ -271,7 +306,7 @@ class RoboTwinAdapter:
         for label, frames in frame_groups:
             for camera, frame in frames.items():
                 references.append(self.artifacts.register(scope, observation, label + '_' + camera,
-                    Path(frame['path']).read_bytes(), 'image/jpeg'))
+                    Path(frame['path']).read_bytes(), frame['mime_type']))
         observation['artifacts'] = references
         episode['ready'] = True
         return self.save(episode, state='ready', observation=observation)
@@ -325,7 +360,7 @@ class RoboTwinAdapter:
                             await asyncio.sleep(0.5)
                     except Exception as error:
                         native_stop_error = f'{type(error).__name__}: {error}'
-                proof = await asyncio.to_thread(self.runtime.stop_executor)
+                proof = await owned_call(self.runtime.stop_executor)
                 proof.update(native_invocation=episode['native_invocation'], native_status=native_status,
                     native_stop_error=native_stop_error,
                     native_terminal_before_shutdown=bool(episode.get('terminal')) or bool(native_status and
@@ -440,9 +475,8 @@ No experience means use current/previous observation only. Keep JSON concise; no
 
 class DeepSeekDecider:
     def __init__(self, runtime, adapter):
-        config = json.loads((runtime.state / 'config.rsi.ds.json').read_text())['providers']['custom']
-        self.client = AsyncOpenAI(api_key=config.get('apiKey', config.get('api_key')),
-            base_url=config.get('apiBase', config.get('api_base')), max_retries=0,
+        self.model, api_key, endpoint = model_config(runtime)
+        self.client = AsyncOpenAI(api_key=api_key, base_url=endpoint, max_retries=0,
             http_client=httpx.AsyncClient(trust_env=False, timeout=240))
         self.runtime, self.adapter = runtime, adapter
 
@@ -455,26 +489,34 @@ class DeepSeekDecider:
         messages = [{'role': 'system', 'content': INSTRUCTIONS},
             {'role': 'user', 'content': [{'type': 'text', 'text': encoded}, *context['media']]}]
         log = episode['directory'] / 'REQUEST_AUDIT.jsonl'
-        usage_total = 0
+        usage_ledger = ProviderUsage()
         last_error = None
         feedback = None
         deadline = time.monotonic() + 540
         for attempt, budget in enumerate((8192, 8192, 8192, 16384), 1):
-            request_id = str(time.time_ns())
-            with log.open('a') as output:
-                output.write(json.dumps({'event': 'request', 'request_id': request_id, 'model': 'deepseek-flash',
-                    'max_tokens': budget, 'attempt': attempt, 'context': data,
-                    'repair_feedback': feedback,
-                    'image_references': context['observation']['artifacts']}, ensure_ascii=False) + '\n')
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            async with asyncio.timeout(min(240, remaining)):
-                response = await self.client.chat.completions.create(model='deepseek-flash', messages=messages,
-                    max_tokens=budget, temperature=0.3, response_format={'type': 'json_object'})
+            request_id = str(time.time_ns())
+            with log.open('a') as output:
+                output.write(json.dumps({'event': 'request', 'request_id': request_id, 'model': self.model,
+                    'max_tokens': budget, 'attempt': attempt, 'context': data,
+                    'repair_feedback': feedback,
+                    'image_references': context['observation']['artifacts']}, ensure_ascii=False) + '\n')
+            usage_ledger.start()
+            try:
+                async with asyncio.timeout(min(240, remaining)):
+                    response = await self.client.chat.completions.create(model=self.model, messages=messages,
+                        max_tokens=budget, temperature=0.3, response_format={'type': 'json_object'})
+            except BaseException as error:
+                error.usage = usage_ledger.snapshot()
+                with log.open('a') as output:
+                    output.write(json.dumps({'event': 'request_error', 'request_id': request_id,
+                        'error_type': type(error).__name__, 'usage': error.usage}) + '\n')
+                raise
             choice = response.choices[0]
-            usage = response.usage.model_dump() if response.usage else {}
-            usage_total += usage.get('total_tokens', 0)
+            usage = response.usage.model_dump() if response.usage else None
+            usage_ledger.record(usage)
             with log.open('a') as output:
                 output.write(json.dumps({'event': 'response', 'request_id': request_id,
                     'returned_model': response.model, 'finish_reason': choice.finish_reason,
@@ -485,7 +527,7 @@ class DeepSeekDecider:
                 validate_assessment(decision['proposal'], episode['supervisor'].status)
                 validate_native_decision(decision['proposal'])
                 episode['supervisor'].delivered_binding = episode['supervisor'].binding()
-                decision['usage'] = {'total_tokens': usage_total}
+                decision['usage'] = usage_ledger.snapshot()
                 return decision
             except (ValueError, KeyError, TypeError, ValidationError) as error:
                 feedback = validation_feedback(error)
@@ -496,6 +538,6 @@ class DeepSeekDecider:
                 messages = [messages[0], messages[1],
                     {'role': 'assistant', 'content': (choice.message.content or '<empty response>')[:12000]},
                     {'role': 'user', 'content': json.dumps(feedback, ensure_ascii=False)}]
-        error = RuntimeError('DeepSeek invalid after bounded feedback retries:' + str(last_error))
-        error.usage = {'total_tokens': usage_total}
+        error = RuntimeError('Model output invalid after bounded feedback retries:' + str(last_error))
+        error.usage = usage_ledger.snapshot()
         raise error

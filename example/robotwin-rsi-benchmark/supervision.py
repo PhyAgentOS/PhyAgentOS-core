@@ -20,6 +20,8 @@ def validate_assessment(arguments, status):
         raise ValueError('This joint-space supervisor permits only student or edit decisions')
     if type(arguments.get('steps')) is not int or not 1 <= arguments['steps'] <= 10:
         raise ValueError('Decision must execute a bounded segment of 1..10 native steps')
+    if mode == 'edit' and arguments['steps'] > 5:
+        raise ValueError('Edit segments are limited to five native steps')
     assessment = arguments.get('assessment')
     if not isinstance(assessment, dict):
         raise ValueError('Structured outcome and next-intent assessment is required')
@@ -111,7 +113,7 @@ class Supervisor:
         if not mime or len(content) > 10_000_000:
             raise ValueError('Unsupported or oversized checkpoint image')
         self.frames[camera] = {'camera': camera, 'path': str(path),
-            'sha256': hashlib.sha256(content).hexdigest(), 'frame_seq': output.get('frame_seq'),
+            'sha256': hashlib.sha256(content).hexdigest(), 'frame_seq': output.get('frame_seq'), 'mime_type': mime,
             'data_url': 'data:' + mime + ';base64,' + base64.b64encode(content).decode()}
 
     def packet(self):

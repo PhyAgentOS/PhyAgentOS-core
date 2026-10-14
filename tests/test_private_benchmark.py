@@ -11,7 +11,7 @@ from PhyAgentOS.forge.benchmark.private import PrivateBenchmarkDeployment, Priva
 def deployment():
     transport = PrivateBenchmarkTransport(None)
     return PrivateBenchmarkDeployment(transport=transport, workers=['worker'], decide=None, artifacts=None,
-        experiences={'turn_switch': {'task_name': 'turn_switch', 'reflection': 'conditional'}})
+        case_experiences={'fixed-case': [{'reflection': 'conditional'}]})
 
 
 def test_private_transport_identity_and_no_network():
@@ -26,13 +26,12 @@ def test_private_transport_identity_and_no_network():
 
 def test_task_scope_no_lesson_and_frozen_copy():
     deployed = deployment()
-    assert deployed.experience_for({'environment': {'task_name': 'turn_switch', 'arm': 'none'}}) == []
-    case = {'environment': {'task_name': 'turn_switch', 'arm': 'fixed'}}
+    assert deployed.experience_for({'case_key': 'none-case'}) == []
+    case = {'case_key': 'fixed-case'}
     memory = deployed.experience_for(case)
     memory[0]['reflection'] = 'mutated'
     assert deployed.experience_for(case)[0]['reflection'] == 'conditional'
-    with pytest.raises(ValueError, match='task-local'):
-        deployed.experience_for({'environment': {'task_name': 'press_stapler', 'arm': 'fixed'}})
+    assert deployed.experience_for({'case_key': 'different-case'}) == []
 
 
 @pytest.mark.asyncio

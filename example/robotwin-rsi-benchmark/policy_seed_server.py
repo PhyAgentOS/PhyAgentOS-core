@@ -87,6 +87,7 @@ def main():
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--control', type=Path, required=True)
     parser.add_argument('--audit', type=Path, required=True)
+    parser.add_argument('--model-config', type=Path, help='Explicit pi0.5 checkpoint/config JSON')
     args = parser.parse_args()
     sys.path.insert(0, str(args.xpolicy_root))
     sys.path.insert(0, str(args.xpolicy_root.parent))
@@ -99,6 +100,8 @@ def main():
         'checkpoint_num': 29999, 'train_config_name': 'pi05_base_aloha_full_sim_arx-x5_seed_0',
         'repo_id': 'RoboTwin_lerobot_v30', 'policy_name': 'Pi_05',
     }
+    if args.model_config:
+        config = json.loads(args.model_config.read_text())
     model = make_seeded_model(Model)(config, args.control, args.audit)
     server = PolicyServer(model, PolicyServerConfig(host='127.0.0.1', port=args.port))
     print(f'SEEDED_POLICY_READY port={args.port}', flush=True)

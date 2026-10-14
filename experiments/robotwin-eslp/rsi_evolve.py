@@ -51,6 +51,7 @@ from PhyAgentOS.config.loader import load_config
 from robotwin_evidence import (
     as_dict,
     benchmark_succeeded,
+    require_valid_episode,
     build_lineage,
     load_tool_calls,
     session_task_summary,
@@ -168,6 +169,7 @@ async def main() -> int:
 
     calls = load_tool_calls(args.session)
     result = json.loads(Path(args.result).read_text(encoding="utf-8"))
+    require_valid_episode(result)
     task_summary = session_task_summary(args.session)
     if not task_summary:
         raise SystemExit(f"session {args.session} carries no user prompt")

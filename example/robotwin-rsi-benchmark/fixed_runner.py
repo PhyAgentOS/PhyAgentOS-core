@@ -18,6 +18,7 @@ from selected_runner import SelectedRunner, require_free_port
 from session_audit import audit_session, outputs_of, records_and_calls
 from response_validation import reflection_object
 from supervision import VERSION
+from model_config import model_config
 
 
 BASE = Path(os.environ.get('RSI_BASE', '/data6/lvqinhan/rsi'))
@@ -120,41 +121,52 @@ class FixedRunner(SelectedRunner):
         self.skill = 'robotwin-rsi-fixed-' + args.task.replace('_', '-')
         self.skill_root = self.state / 'skills' / self.skill
         self.api = f'http://127.0.0.1:{args.gateway_port}'
-        self.source_home = BASE / 'parallel10/homes/L02'
+        self.source_home = Path(getattr(args, 'source_home', None) or BASE / 'parallel10/homes/L02')
+        self.source_skill = getattr(args, 'source_skill', 'robotwin-rsi-l02')
+        self.profile = getattr(args, 'profile', PROFILE)
+        self.xpolicy = Path(getattr(args, 'xpolicy', None) or XPOLICY)
+        self.policy_python = str(getattr(args, 'policy_python', None) or POLICY_PYTHON)
+        self.vlm_model = getattr(args, 'vlm_model', None) or os.environ.get('RSI_VLM_MODEL')
         self.policy_process = None
-        self.reference = json.loads((args.root / 'screening_reference.json').read_text())[args.task]
-        self.description = json.loads((XPOLICY.parent / 'description/task_instruction' / (args.task + '.json')).read_text())['full_description']
+        self.description = json.loads((self.xpolicy.parent / 'description/task_instruction' / (args.task + '.json')).read_text())['full_description']
+        self.reference = ({'scene': {'task_id': None, 'init_state_id': 0, 'instruction': self.description},
+                           'initial_observation': None} if getattr(args, 'mode', None) == 'smoke' else
+                          json.loads((args.root / 'screening_reference.json').read_text())[args.task])
         self.env = dict(os.environ, HOME=str(self.home), CUDA_VISIBLE_DEVICES=str(args.simulation_gpu),
             G05_SERVER_URL=f'ws://127.0.0.1:{args.policy_port}')
-        self.env['PYTHONPATH'] = str(args.root) + os.pathsep + '/data7/home/lvqinhan/workspace/paos-smoke-tree'
+        self.env['PYTHONPATH'] = str(args.root) + os.pathsep + str(Path(__file__).resolve().parents[2])
         temporary = self.home / 'tmp'
         temporary.mkdir(parents=True)
         self.env.update(TMPDIR=str(temporary), TEMP=str(temporary), TMP=str(temporary))
         self.base_skill = (args.root / 'BASE_SKILL.md').read_text().replace('EXPERIMENT_SKILL', self.skill)
         self.carrier = ''
         self.prepare_home()
-        self.schedule = pair_schedule(args.task)
-        save_json(self.root / 'MANIFEST.json', {**vars(args), 'root': str(args.root), 'model': 'deepseek-flash',
-            'arms': ['none', 'fixed'], 'planned_formal_trials': 2 * len(args.repetitions) if getattr(args, 'repetitions', None) else 24, 'development_seed': 3101,
-            'schedule': self.schedule, 'online_lesson_update': False, 'profile_name_is_legacy_not_model': PROFILE,
+        self.schedule = [] if getattr(args, 'mode', None) == 'smoke' else pair_schedule(args.task)
+        save_json(self.root / 'MANIFEST.json', {**vars(args), 'root': str(args.root), 'model': self.vlm_model,
+            'arms': ['none'] if getattr(args, 'mode', None) == 'smoke' else ['none', 'fixed'], 'planned_formal_trials': 1 if getattr(args, 'mode', None) == 'smoke' else (2 * len(args.repetitions) if getattr(args, 'repetitions', None) else 24),
+            'development_seed': None if getattr(args, 'mode', None) == 'smoke' else 3101,
+            'schedule': self.schedule, 'online_lesson_update': False, 'profile_name_is_legacy_not_model': self.profile,
             'reference_scene': self.reference['scene'], 'initial_observation': self.reference['initial_observation'],
-            'lesson_injection': 'frozen_task_local_skill_document', 'automatic_evolution_enabled': False,
+            'lesson_injection': 'core_case_scoped_episodic_context', 'automatic_evolution_enabled': False,
             'supervision_version': VERSION, 'raw_images_in_main_decision': True,
             'unbounded_release': False, 'full_future_chunk_visible': False, 'eef_supported': False})
 
     def prepare_home(self):
-        source = self.source_home / '.PhyAgentOS/skills/robotwin-rsi-l02'
+        source = self.source_home / '.PhyAgentOS/skills' / self.source_skill
         self.skill_root.mkdir(parents=True)
-        profile_dir = self.skill_root / 'profiles' / PROFILE
-        shutil.copytree(source / 'profiles' / PROFILE, profile_dir)
+        profile_dir = self.skill_root / 'profiles' / self.profile
+        shutil.copytree(source / 'profiles' / self.profile, profile_dir)
         for name in ['nodes', 'scripts']:
             if (source / name).exists():
                 shutil.copytree(source / name, self.skill_root / name, symlinks=True)
-        shutil.copytree(self.args.root / 'bridge_src', self.skill_root / 'nodes/vla_bridge/src', dirs_exist_ok=True)
+        bridge_source = self.skill_root / 'nodes/vla_bridge/src'
+        if bridge_source.is_symlink():
+            bridge_source.unlink()
+        shutil.copytree(self.args.root / 'bridge_src', bridge_source, dirs_exist_ok=True)
         manifest = yaml.safe_load((source / 'skill.yaml').read_text())
-        manifest.update(name=self.skill, gateway_url=self.api, description='DeepSeek candidate-aware pi0.5 Lesson ablation')
-        manifest['profiles'] = {PROFILE: manifest['profiles'][PROFILE]}
-        manifest['profiles'][PROFILE]['startup_timeout_s'] = 150
+        manifest.update(name=self.skill, gateway_url=self.api, description='Candidate-aware VLM and pi0.5 benchmark runtime')
+        manifest['profiles'] = {self.profile: manifest['profiles'][self.profile]}
+        manifest['profiles'][self.profile]['startup_timeout_s'] = 150
         (self.skill_root / 'skill.yaml').write_text(yaml.safe_dump(manifest, sort_keys=False))
         (self.skill_root / 'SKILL.md').write_text(self.base_skill)
         gateway_path = profile_dir / 'gateway.yaml'
@@ -174,10 +186,12 @@ class FixedRunner(SelectedRunner):
         cache.mkdir()
         for name in ['nodes', 'bundles']:
             (cache / name).symlink_to(self.source_home / '.PhyAgentOS/forge_runtime' / name, target_is_directory=True)
-        config = json.loads((self.source_home / '.PhyAgentOS/config.rsi.ds.json').read_text())
-        config['agents']['defaults'].update(workspace=str(self.workspace), model='deepseek-flash',
+        config_path = Path(getattr(self.args, 'model_config', None) or self.source_home / '.PhyAgentOS/config.rsi.ds.json')
+        config = json.loads(config_path.read_text())
+        self.vlm_model = self.vlm_model or config['agents']['defaults']['model']
+        config['agents']['defaults'].update(workspace=str(self.workspace), model=self.vlm_model,
                                            max_tokens=8192, maxToolIterations=600, temperature=0.3)
-        config['agents']['evolution']['enabled'] = False
+        config['agents'].setdefault('evolution', {})['enabled'] = False
         save_json(self.state / 'config.rsi.ds.json', config)
         (self.state / 'config.rsi.ds.json').chmod(0o600)
         save_json(self.root / 'policy_control.json', {'trial_id': 'bootstrap', 'policy_seed': 3101})
@@ -186,10 +200,13 @@ class FixedRunner(SelectedRunner):
         require_free_port(self.args.policy_port)
         env = dict(self.env, CUDA_VISIBLE_DEVICES=str(self.args.policy_gpu), XLA_PYTHON_CLIENT_PREALLOCATE='false')
         with (self.root / 'policy_server.log').open('a') as output:
-            self.policy_process = subprocess.Popen([POLICY_PYTHON, str(self.args.root / 'policy_seed_server_gpu_safe.py'),
-                '--xpolicy-root', str(XPOLICY), '--port', str(self.args.policy_port),
-                '--control', str(self.root / 'policy_control.json'), '--audit', str(self.root / 'policy_audit.jsonl')],
-                cwd=XPOLICY, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            policy_command = [self.policy_python, str(self.args.root / 'policy_seed_server_gpu_safe.py'),
+                '--xpolicy-root', str(self.xpolicy), '--port', str(self.args.policy_port),
+                '--control', str(self.root / 'policy_control.json'), '--audit', str(self.root / 'policy_audit.jsonl')]
+            if getattr(self.args, 'policy_config', None):
+                policy_command += ['--model-config', str(self.args.policy_config)]
+            self.policy_process = subprocess.Popen(policy_command,
+                cwd=self.xpolicy, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         save_json(self.root / 'POLICY_PID.json', {'pid': self.policy_process.pid, 'owned_by_this_runner': True})
         deadline = time.monotonic() + 420
         while time.monotonic() < deadline:
@@ -218,11 +235,15 @@ class FixedRunner(SelectedRunner):
         (self.skill_root / 'SKILL.md').write_text(self.base_skill + carrier, encoding='utf-8')
         (trial_dir / 'activated_skill.md').write_text(self.base_skill + carrier, encoding='utf-8')
         save_json(self.root / 'policy_control.json', {'trial_id': trial_dir.name, 'policy_seed': seed})
-        profile_dir = self.skill_root / 'profiles' / PROFILE
+        profile_dir = self.skill_root / 'profiles' / self.profile
         benchmark_path = profile_dir / 'benchmark.yaml'
         benchmark = yaml.safe_load(benchmark_path.read_text())
         benchmark.update(record_dir=str(trial_dir / 'videos'), result_dir=str(trial_dir / 'native_results'),
-                         task_ids=[self.reference['scene']['task_id']], max_steps=self.args.max_steps)
+                         max_steps=self.args.max_steps)
+        # Smoke resolves the task ID from the live describe query after startup.
+        # Keep the installed profile's valid defaults until the explicit Session request.
+        if self.reference['scene']['task_id'] is not None:
+            benchmark['task_ids'] = [self.reference['scene']['task_id']]
         benchmark_path.write_text(yaml.safe_dump(benchmark, sort_keys=False))
         for camera in ['head', 'left_wrist', 'right_wrist']:
             path = profile_dir / ('image_vision_' + camera + '.yaml')
@@ -231,13 +252,16 @@ class FixedRunner(SelectedRunner):
             config['outputs']['keep_last'] = 512
             path.write_text(yaml.safe_dump(config, sort_keys=False))
         require_free_port(self.args.gateway_port)
-        self.command(['paos', 'skill', 'start', self.skill, '--profile', PROFILE], trial_dir / 'lifecycle.log', 210)
+        self.command(['paos', 'skill', 'start', self.skill, '--profile', self.profile], trial_dir / 'lifecycle.log', 210)
         runtime = json.loads((self.state / 'run/skills' / (self.skill + '.json')).read_text())
         if runtime.get('status') != 'running' or runtime.get('gateway_url') != self.api:
             raise RuntimeError('runtime_not_ready')
         tools = request_json(self.api, '/tools')['data']['tools']
         capabilities = query_tool(self.api, tools, 'robotwin.benchmark.describe')
         entry = resolve_task(capabilities['tasks'], self.args.task, self.description)
+        if getattr(self.args, 'mode', None) == 'smoke':
+            self.reference['scene']['task_id'] = entry['task_id']
+            self.reference['scene']['instruction'] = entry['language']
         policy = query_tool(self.api, tools, 'robotwin.policy.describe')
         if policy.get('ready') is not True or policy.get('action_dim') != 14:
             raise RuntimeError('policy_not_ready')
@@ -321,8 +345,8 @@ All groups follow these same rules. Historical advice is conditional, not proven
                 self.command([PYTHON, str(self.args.root / 'audited_paos.py'), 'agent', '--session', session,
                     '-c', str(self.state / 'config.rsi.ds.json'), '--no-markdown', '-m', prompt], trial_dir / 'agent.log', 7200)
                 result_paths = list((trial_dir / 'native_results').glob('robotwin_*.json'))
-                current = (self.state / 'forge_runtime/environments' / self.skill / PROFILE / 'current').resolve()
-                result_paths.extend((current / 'launch/profiles' / PROFILE / 'results').glob('robotwin_*.json'))
+                current = (self.state / 'forge_runtime/environments' / self.skill / self.profile / 'current').resolve()
+                result_paths.extend((current / 'launch/profiles' / self.profile / 'results').glob('robotwin_*.json'))
                 result_paths = list({path.resolve() for path in result_paths})
                 if len(result_paths) != 1:
                     raise RuntimeError('expected_exactly_one_native_result')
@@ -380,20 +404,19 @@ All groups follow these same rules. Historical advice is conditional, not proven
         from openai import AsyncOpenAI
         import httpx
 
-        config = json.loads((self.state / 'config.rsi.ds.json').read_text())['providers']['custom']
-        client = AsyncOpenAI(api_key=config.get('apiKey', config.get('api_key')),
-            base_url=config.get('apiBase', config.get('api_base')), max_retries=1,
+        model, api_key, endpoint = model_config(self)
+        client = AsyncOpenAI(api_key=api_key, base_url=endpoint, max_retries=0,
             http_client=httpx.AsyncClient(trust_env=False, timeout=180))
         messages = [{'role': 'system', 'content': 'Summarize task-local robot experience as one JSON object. '
             'Use only supplied evidence, distinguish observed facts from untested recovery hypotheses. '
             'No invented object geometry, causal claims or joint signs. Include task_steps, failure_step_or_unknown, '
             'observed_evidence, conditional_recovery, applicability, uncertainty. Under 900 Chinese characters.'},
             {'role': 'user', 'content': json.dumps(evidence, ensure_ascii=False)}]
-        save_json(self.root / 'frozen/REFLECTION_INPUT.json', {'model': 'deepseek-flash', 'messages': messages})
+        save_json(self.root / 'frozen/REFLECTION_INPUT.json', {'model': model, 'messages': messages})
         try:
             last_error = None
             for attempt, token_budget in enumerate((8192, 16384), 1):
-                response = await client.chat.completions.create(model='deepseek-flash', messages=messages,
+                response = await client.chat.completions.create(model=model, messages=messages,
                     max_tokens=token_budget, temperature=0.3, response_format={'type': 'json_object'})
                 choice = response.choices[0]
                 save_json(self.root / f'frozen/REFLECTION_RAW_a{attempt}.json', {

@@ -75,6 +75,7 @@ def decider_fixture(tmp_path, outputs):
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason='stop')],
             usage=SimpleNamespace(model_dump=lambda: {'total_tokens': 100}), model='deepseek-flash')
     decider = DeepSeekDecider.__new__(DeepSeekDecider)
+    decider.model = 'test-multimodal'
     decider.adapter = SimpleNamespace(active='one', episodes={'one': episode})
     decider.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     return context, valid, supervisor, calls, decider
@@ -94,7 +95,7 @@ async def test_repair_receives_precise_error_and_same_images_without_fabricated_
     assert calls[1]['messages'][1] == calls[0]['messages'][1]
     assert calls[1]['messages'][2]['content'] == json.dumps(invalid)
     assert result['proposal'] == valid['proposal']
-    assert result['usage'] == {'total_tokens': 200}
+    assert result['usage'] == {'total_tokens': 200, 'provider_calls': 2}
     assert supervisor.delivered_binding == supervisor.binding()
     audit = [json.loads(line) for line in (tmp_path / 'REQUEST_AUDIT.jsonl').read_text().splitlines()]
     assert any(row['event'] == 'validation_error' for row in audit)
@@ -107,7 +108,7 @@ async def test_exhaustion_bounded_without_default_release(tmp_path):
     with pytest.raises(RuntimeError, match='bounded feedback retries') as captured:
         await decider(context)
     assert len(calls) == 4
-    assert captured.value.usage == {'total_tokens': 400}
+    assert captured.value.usage == {'total_tokens': 400, 'provider_calls': 4}
     assert supervisor.delivered_binding is None
 
 
