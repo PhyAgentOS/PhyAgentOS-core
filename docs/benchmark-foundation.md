@@ -1,20 +1,23 @@
-# Governed benchmark sessions (fake deployment foundation)
+# Governed benchmark sessions
 
 A root `AgentTask` represents one entire benchmark experiment. It owns one Forge
 Session. Rounds contain flat `EpisodeSubtask` records, each with its own attempt,
 worker slot, world epoch, observation versions, model attempts and DecisionSteps.
 A PlanRevision is **not** an environmental episode. Benchmark roots cannot replan.
 
-This is an opt-in core integration, verified against an in-process executor through
-the real Forge Tool API client and AgentTaskCoordinator. It does not deploy RoboTwin,
-its VLA bridge, Minecraft, GPU workers, or a production isolation/authentication layer.
+This opt-in Core integration has an in-process reference executor, verified through
+the real Forge Tool API client and AgentTaskCoordinator. An experimental
+[RoboTwin private deployment adapter](robotwin-benchmark-deployment.md) connects it
+to a separately installed physical runtime. Core itself does not install RoboTwin,
+GPU workers, or a production isolation/authentication layer.
 
 ## Entry points
 
 `forge.benchmark.enabled` defaults to `false`. Enabling it does not authorize network
 execution. The first deployment adapter is explicitly injected
 `InProcessBenchmarkDeployment`, restricted to `httpx.MockTransport`. A separately
-reviewed trusted deployment adapter is required for a real Gateway.
+host-injected trusted deployment adapter is required for a real Gateway; the
+RoboTwin example uses `PrivateBenchmarkDeployment` for that purpose.
 
 Activate an installed benchmark Skill, then use the existing public task tools:
 
@@ -223,3 +226,15 @@ in two rounds, a local lesson supported by two failures affecting the next round
 independent root completion, one formal episode, cancellation, unknown delivery,
 stop/404 failures, recovery, duplicate ownership, binding changes, direct-call and
 diagnostic rejection, tampered evidence, lesson support and scoped media.
+
+## Experimental real RoboTwin deployment
+
+A host-injected private adapter is now available in `forge/benchmark/private.py`.
+It retains the existing Core protocol and defaults to no episodic context. Optional
+frozen context is keyed by case identity; environment-specific arm/task semantics
+belong in the deployment example. The existing in-process fake suite remains available.
+
+See [RoboTwin deployment](robotwin-benchmark-deployment.md) for a single real episode,
+explicit prerequisites, manual crash reconciliation and validation boundaries.
+In reports, `model_calls` counts Core decision callbacks; `provider_calls` separately
+reports actual provider requests when the adapter supplies them. Unknown usage stays null.

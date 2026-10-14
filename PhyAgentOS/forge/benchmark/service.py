@@ -225,6 +225,18 @@ class BenchmarkService(InteractionService):
         self.supervisor = BenchmarkSupervisor(self, notify=notify)
         return self.supervisor
 
+    def enable_private_adapter(self, deployment, *, notify=None):
+        from PhyAgentOS.agent.benchmark.supervisor import BenchmarkSupervisor
+        from .private import PrivateBenchmarkDeployment
+
+        if type(deployment) is not PrivateBenchmarkDeployment:
+            raise RuntimeError("explicit private adapter deployment required")
+        runtime = self.coordinator.binding_resolver.runtime_registry.current()
+        deployment.authorize(runtime)
+        self.deployment, self.long_lived = deployment, True
+        self.supervisor = BenchmarkSupervisor(self, notify=notify)
+        return self.supervisor
+
     async def start(self, task_id, tool_id, arguments, ownership):
         if self.supervisor is None or self.deployment is None:
             raise RuntimeError("benchmark control-plane deployment not authorized")

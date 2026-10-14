@@ -176,6 +176,15 @@ def checked_report(service, task_id):
                 "accounted_episodes": len(group),
                 "decision_steps": len(steps),
                 "provider_total_tokens": tokens,
+                # One decision callback may make several provider requests (e.g. JSON repair).
+                # Absent provider accounting stays unknown, rather than assuming one request.
+                "provider_calls": (
+                    sum(usage["provider_calls"] for usage in usages)
+                    if all(isinstance(usage, dict)
+                           and type(usage.get("provider_calls")) is int
+                           and usage["provider_calls"] >= 0 for usage in usages)
+                    else None
+                ),
                 "success_rate": counts["success"] / len(plan["cases"]),
                 "native_scores": [c.get("native_score") for c in group],
                 "model_calls": sum(c["model_calls"] for c in group),

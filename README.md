@@ -1,3 +1,7 @@
+> **Branch scope (2026-10-13):** experimental RoboTwin VLM+VLA runtime, not a validated RSI result or pure-VLM+IK implementation. See [runtime, prerequisites and known limitations](docs/robotwin-runtime-20261013.md). The upstream benchmark figures below are not results of this branch's lesson experiment.
+
+[Experimental real RoboTwin deployment](docs/robotwin-benchmark-deployment.md): one-episode `smoke.py` entry point.
+
 <div align="center">
   <img src="docs/imgs/logo_en.png" alt="PhyAgentOS" width="460">
   <h3>Recursive Self-Improvement Infrastructure for Physical Agents</h3>

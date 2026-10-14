@@ -1,3 +1,7 @@
+> **本分支范围（2026-10-13）：** RoboTwin VLM＋VLA实验运行基线，不代表已验证RSI有效，也不是后续纯VLM＋IK实现。详见[环境、启动与已知问题](docs/robotwin-runtime-20261013.md)。下方沿用的上游benchmark图表不是本分支lesson实验的结果。
+
+[真实 RoboTwin benchmark 实验性部署](docs/robotwin-benchmark-deployment.md)：`smoke.py` 单回合入口。
+
 <div align="center">
   <img src="docs/imgs/logo_en.png" alt="PhyAgentOS" width="460">
   <h3>面向具身智能体的递归自进化基础设施</h3>

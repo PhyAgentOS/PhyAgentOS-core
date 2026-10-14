@@ -1,0 +1,18 @@
+{
+  "source_home": "/srv/paos/prepared-home",
+  "source_skill": "robotwin-benchmark",
+  "profile": "gpt6_pi05",
+  "xpolicy": "/srv/robotwin/XPolicyLab",
+  "policy_python": "/srv/robotwin/XPolicyLab/policy/Pi_05/openpi/.venv/bin/python",
+  "policy_config": "/srv/paos/config/pi05.json",
+  "model_config": "/srv/paos/config/agent.json",
+  "vlm_model": "deepseek-flash",
+  "task": "press_stapler",
+  "max_steps": 400,
+  "policy_seed": 102,
+  "gateway_port": 19791,
+  "policy_port": 18991,
+  "policy_gpu": 0,
+  "simulation_gpu": 1,
+  "lease_dir": "/srv/paos/worker-reservations"
+}

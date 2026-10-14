@@ -1,0 +1,34 @@
+# vla_bridge (robotwin gpt6_pi05): sole action writer between robotwin_policy and robotwin_benchmark.
+# action_space joint_abs: 14-D absolute qpos targets passed through; edit = ramped joint offset (rad).
+# hold_on_episode_start: every episode opens at C0 and waits for the first vla.decide.
+endpoint_id: vla.bridge
+policy_id: robotwin_policy
+initial_mode: policy
+action_space: joint_abs
+action_joints: [fl_joint1, fl_joint2, fl_joint3, fl_joint4, fl_joint5, fl_joint6, fl_joint7, fr_joint1, fr_joint2, fr_joint3, fr_joint4, fr_joint5, fr_joint6, fr_joint7]
+gripper_joints: [fl_joint7, fr_joint7]
+gripper_policy_scale: 1.0
+proprio_gate: seen
+checkpoints: enabled
+mode_vocabulary: decision
+max_segment_steps: 10
+max_eef_segment_steps: 5
+edit_ramp_steps: 5
+edit_max_joint_rad: 0.1
+max_cumulative_edit_joint_rad: 0.3
+stall_window_steps: 60
+stall_min_displacement_m: 0.005
+# joint_abs 的失速判据：窗口里是臂关节角（rad），不是米制位移。
+# 实测标定：真停摆 0.004~0.014 rad / 60 步；正常推进 >= 0.18 rad / 60 步。
+# 阈值取 0.05 rad（约真停摆中位 10 倍，正常推进 1/4），留双侧裕量。
+stall_min_joint_rad: 0.05
+starvation_timeout_ms: 120000
+hold_on_episode_start: true
+# 放行后仍跑 C2 检测：set_mode(student) 放行后 episode 步进仍被监督，
+# 失速即冻结并开检查点，VLM 有机会接手。
+detect_on_released_segments: true
+# C2 冷却 60 步：避免「冻结→decide(student)→1 步→再次冻结」死循环。
+c2_cooldown_steps: 60
+counters_log_every: 250
+registration:
+  enabled: true

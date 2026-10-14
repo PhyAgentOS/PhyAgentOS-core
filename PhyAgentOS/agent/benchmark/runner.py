@@ -126,6 +126,7 @@ class EpisodeRunner:
                         "step_id": key,
                         "status": "started",
                         "lessons_digest": child["lessons_digest"],
+                        "episodic_experience_digest": digest(context.get("episodic_experience", [])),
                         "started_at": time.time(),
                     },
                     create=True,
@@ -142,9 +143,10 @@ class EpisodeRunner:
                         usage=decision.get("usage"),
                         finished_at=time.time(),
                     )
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as exc:
                     self.store.update(
-                        "model", attempt_id, status="cancelled", finished_at=time.time()
+                        "model", attempt_id, status="cancelled", finished_at=time.time(),
+                        usage=getattr(exc, "usage", None)
                     )
                     self.store.update("decision", key, status="discarded")
                     raise
@@ -231,6 +233,9 @@ class EpisodeRunner:
                 ]
             },
         }
+        if hasattr(self.deployment, "experience_for"):
+            context["episodic_experience"] = self.deployment.experience_for(child["case"])
+            context["episodic_experience_digest"] = digest(context["episodic_experience"])
         artifacts = snapshot["observation"].get("artifacts", [])
         if artifacts:
             resolver = self.deployment.artifacts
@@ -313,5 +318,6 @@ class EpisodeRunner:
                     return True
                 await asyncio.sleep(self.deployment.poll_interval_s)
         except Exception as exc:
-            self.update(state="unknown", reason=f"reconciliation: {type(exc).__name__}: {exc}")
+            self.update(state="unknown", reconciliation_reason=f"{type(exc).__name__}: {exc}",
+                        reason=self.child.get("reason") or f"reconciliation: {type(exc).__name__}: {exc}")
         return False

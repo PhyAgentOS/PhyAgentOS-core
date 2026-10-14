@@ -43,11 +43,13 @@ class SkillActivationManager:
         max_lessons_per_skill: int = 8,
         runtime_availability_provider: Callable[[str], bool] | None = None,
         binding_resolver: ForgeSkillBindingResolver | None = None,
+        installed_skills_dir: Path | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.skills = SkillsLoader(
             self.workspace,
             runtime_availability_provider=runtime_availability_provider,
+            installed_skills_dir=installed_skills_dir,
         )
         self.store = store
         self.max_lessons_per_skill = max(1, int(max_lessons_per_skill))

@@ -191,9 +191,13 @@ class FakeBenchmark:
 
 
 async def system(
-    tmp_path, monkeypatch, *, decide=None, rounds=2, reflect=True, profile_tools=False
+    tmp_path, monkeypatch, *, decide=None, rounds=2, reflect=True, profile_tools=False, private=False
 ):
     bundle = grid_bundle(tmp_path / "source")
+    if private:
+        manifest = yaml.safe_load((bundle / "skill.yaml").read_text())
+        manifest["gateway_url"] = "http://benchmark.private"
+        (bundle / "skill.yaml").write_text(yaml.safe_dump(manifest))
     (bundle / "interaction.yaml").unlink()
     (bundle / "benchmark.yaml").write_text(
         yaml.safe_dump(
@@ -229,13 +233,24 @@ async def system(
     )
     monkeypatch.setattr("PhyAgentOS.agent.skills.get_config_path", lambda: tmp_path / "config.json")
     fake = FakeBenchmark()
-    client = ForgeToolClient("http://fake.invalid", transport=httpx.MockTransport(fake))
+    base_url = "http://benchmark.private" if private else "http://fake.invalid"
+    if private:
+        from PhyAgentOS.forge.benchmark.private import PrivateBenchmarkTransport
+
+        class FixtureAdapter:
+            async def handle(self, request):
+                return fake(request)
+
+        transport = PrivateBenchmarkTransport(FixtureAdapter())
+    else:
+        transport = httpx.MockTransport(fake)
+    client = ForgeToolClient(base_url, transport=transport)
     runtime = ActiveSkillRuntime(
         "grid",
         "1.0.0",
         "local",
         "runtime_1",
-        "http://fake.invalid",
+        base_url,
         "gateway_1",
         client,
         set(),
@@ -268,7 +283,7 @@ async def system(
         activation_id=activated.activation_id,
         origin_session_key="cli:test",
         benchmark_plan={
-            "cases": [{"case_key": "a"}, {"case_key": "b"}],
+            "cases": [{"case_key": key, "environment": {"arm": "none"} if private else {}} for key in ("a", "b")],
             "rounds": rounds,
             "parallelism": 2,
         },
@@ -314,6 +329,12 @@ async def system(
             "rationale": "workflow principle supported by two isolated failures",
         }
 
+    if private:
+        from PhyAgentOS.forge.benchmark.private import PrivateBenchmarkDeployment
+        supervisor = coordinator.benchmark.enable_private_adapter(PrivateBenchmarkDeployment(
+            transport=transport, workers=["worker-a", "worker-b"], decide=decide or default_decide,
+            artifacts=None, control_timeout_s=0.2))
+        return coordinator, task, fake, supervisor, registry
     supervisor = coordinator.benchmark.enable_in_process(
         InProcessBenchmarkDeployment(
             workers=["worker-a", "worker-b"],
