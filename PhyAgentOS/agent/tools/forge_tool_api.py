@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from time import monotonic
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -46,9 +47,24 @@ async def _call(operation: Callable[[], Awaitable[dict[str, Any]]]) -> str:
         return _json({"ok": False, "error": {"type": "runtime", "message": str(exc)}})
 
 
+_CONTEXT_CACHE_TTL_S = 30.0
+
+
 class ForgeToolContextTool(Tool):
-    def __init__(self, client: ForgeToolClient) -> None:
+    """Read-only ToolSpec/context reader with a short-lived, revision-scoped cache."""
+
+    def __init__(
+        self,
+        client: ForgeToolClient,
+        *,
+        revision_getter: Callable[[], str | None] | None = None,
+    ) -> None:
         self.client = client
+        self._revision_getter = revision_getter or (
+            lambda: getattr(client, "runtime_revision", None)
+        )
+        # (tool_id, runtime revision) -> (fetched_at, response payload)
+        self._cache: dict[tuple[str, str | None], tuple[float, dict[str, Any]]] = {}
 
     @property
     def name(self) -> str:
@@ -62,14 +78,34 @@ class ForgeToolContextTool(Tool):
     def parameters(self) -> dict[str, Any]:
         return _single_schema("tool_id")
 
+    def _revision(self) -> str | None:
+        revision = self._revision_getter()
+        return None if revision is None else str(revision)
+
     async def execute(self, tool_id: str) -> str:
+        key = (tool_id, self._revision())
+        now = monotonic()
+        cached = self._cache.get(key)
+        if cached is not None and now - cached[0] < _CONTEXT_CACHE_TTL_S:
+            return _json(cached[1])
+        # Drop this tool's entries for retired revisions and expired entries.
+        for existing in list(self._cache):
+            fetched_at = self._cache[existing][0]
+            if existing[0] == tool_id or now - fetched_at >= _CONTEXT_CACHE_TTL_S:
+                del self._cache[existing]
+
         async def describe() -> dict[str, Any]:
             spec, context = await asyncio.gather(
                 self.client.get_tool(tool_id), self.client.get_tool_context(tool_id)
             )
             return {"ok": True, "data": {"tool": spec["data"], "context": context["data"]}}
 
-        return await _call(describe)
+        result = await _call(describe)
+        payload = json.loads(result)
+        # Only read-only ToolSpec/context responses are cached; action results never pass here.
+        if payload.get("ok") is True:
+            self._cache[key] = (monotonic(), payload)
+        return result
 
 
 class ForgeToolQueryTool(Tool):

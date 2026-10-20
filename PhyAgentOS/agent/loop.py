@@ -85,6 +85,7 @@ class _ToolCallRun:
     hint: str
     parallel_safe: bool
     result: str | None = None
+    blocked_reason: str | None = None
 
 
 class _TurnCancelledError(asyncio.CancelledError):
@@ -96,6 +97,82 @@ class _TurnCancelledError(asyncio.CancelledError):
 
 
 _MAX_PARALLEL_TOOL_CALLS = 4
+_DUPLICATE_ACTION_LIMIT = 3
+_ACTION_TOOL_NAMES = frozenset({
+    "forge_tool_start_action",
+    "forge_tool_cancel_action",
+    "forge_task_create",
+})
+_ACTION_TOOL_PREFIXES = ("motion.", "gripper.")
+_EVIDENCE_INCOMPLETE_MARKER = "Evidence Bundle is incomplete"
+
+
+def _normalized_arguments(arguments: object) -> str:
+    """Canonical JSON for duplicate detection, independent of key order/spacing."""
+    return json.dumps(
+        arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _is_action_tool(name: str, tool: object = None) -> bool:
+    """Classification for duplicate-action suppression.
+
+    The registry exposes no Tool semantics, so the explicit names are always
+    treated as actions. Prefixed motion/gripper tools only qualify when a Tool
+    wrapper exposes ``semantics == "action"``; query tools with the same prefix
+    must not be suppressed.
+    """
+    if name in _ACTION_TOOL_NAMES:
+        return True
+    if name.startswith(_ACTION_TOOL_PREFIXES):
+        return getattr(tool, "semantics", None) == "action"
+    return False
+
+
+def _evidence_incomplete_hint(runs: list[_ToolCallRun]) -> str | None:
+    """Build a read-only recovery hint when finalize reports missing evidence."""
+    for run in runs:
+        if run.call.name != "forge_task_finalize" or not run.result:
+            continue
+        try:
+            payload = json.loads(run.result)
+        except (TypeError, ValueError):
+            continue
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            continue
+        errors = data.get("evidence_errors")
+        if not isinstance(errors, list):
+            continue
+        missing: list[str] = []
+        for error in errors:
+            if not isinstance(error, str):
+                continue
+            _, marker, tail = error.partition(_EVIDENCE_INCOMPLETE_MARKER)
+            if not marker:
+                continue
+            missing.extend(
+                part.strip() for part in tail.lstrip(": ").split(",") if part.strip()
+            )
+        if not missing:
+            continue
+        task_id = data.get("task_id")
+        target = f"task_id={task_id!s}" if task_id else "the task_id"
+        return (
+            f"Finalize stopped: Evidence Bundle is incomplete ({', '.join(dict.fromkeys(missing))}). "
+            "Do not resubmit the same Action and do not replay finalize with the same evidence. "
+            f"Use read-only tools first: forge_task_get({target}) to inspect status, "
+            "evidence_errors, before_snapshot_ref and after_snapshot_ref; "
+            "forge_tool_action_status and forge_tool_action_result to confirm terminal state; "
+            "forge_tool_context and forge_tool_query to inspect live observation state. "
+            "Missing evidence comes from the Gateway observation streams (/ws/images, /ws/state); "
+            "the agent cannot create it."
+        )
+    return None
 
 
 def _tool_call_batches(runs: list[_ToolCallRun]) -> list[list[_ToolCallRun]]:
@@ -544,6 +621,28 @@ class AgentLoop:
         # selection. Session commands only replace the next turn's selection.
         provider = runtime.provider if runtime else self.provider
         model = runtime.model if runtime else self.model
+        # A turn may repeat the same action across model calls. Only the
+        # currently repeating action key accumulates; a different action key
+        # starts a new run. Read/query calls never touch this state.
+        action_counts: dict[str, int] = {}
+        last_action_key: str | None = None
+
+        def duplicate_action_reason(tool_call: ToolCallRequest, tool: object) -> str | None:
+            nonlocal last_action_key
+            if not _is_action_tool(tool_call.name, tool):
+                return None
+            key = tool_call.name + "\x00" + _normalized_arguments(tool_call.arguments)
+            if key != last_action_key:
+                action_counts.clear()
+                last_action_key = key
+            count = action_counts.get(key, 0) + 1
+            action_counts[key] = count
+            if count < _DUPLICATE_ACTION_LIMIT:
+                return None
+            return (
+                f"identical action already submitted {count - 1} times; "
+                "query status or finalize instead"
+            )
 
         async def emit(
             event_type: AgentEventType,
@@ -671,6 +770,7 @@ class AgentLoop:
                             parallel_safe=bool(
                                 tool is not None and tool.parallel_safe
                             ),
+                            blocked_reason=duplicate_action_reason(tool_call, tool),
                         ))
 
                     async def execute_run(run: _ToolCallRun) -> None:
@@ -683,12 +783,22 @@ class AgentLoop:
                                 "tool_call_id": run.call.id,
                             },
                         )
-                        result = await self.tools.execute(
-                            run.call.name, run.call.arguments
-                        )
-                        run.result = self.tool_results.limit(
-                            run.call.id, run.call.name, result
-                        )
+                        if run.blocked_reason is not None:
+                            run.result = self.tool_results.limit(
+                                run.call.id,
+                                run.call.name,
+                                json.dumps(
+                                    {"blocked": True, "reason": run.blocked_reason},
+                                    ensure_ascii=False,
+                                ),
+                            )
+                        else:
+                            result = await self.tools.execute(
+                                run.call.name, run.call.arguments
+                            )
+                            run.result = self.tool_results.limit(
+                                run.call.id, run.call.name, result
+                            )
                         await emit(
                             AgentEventType.TOOL_PROGRESS,
                             f"{run.hint} (done)",
@@ -741,6 +851,9 @@ class AgentLoop:
                         messages = append_results(messages)
                         raise
                     messages = append_results(messages)
+                    evidence_hint = _evidence_incomplete_hint(runs)
+                    if evidence_hint is not None:
+                        messages.append({"role": "user", "content": evidence_hint})
                 else:
                     clean = self._strip_think(response_content)
                     # Error responses never reach here: they raise above, before

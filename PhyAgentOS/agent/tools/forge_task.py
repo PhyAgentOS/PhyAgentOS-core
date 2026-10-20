@@ -41,7 +41,12 @@ class ForgeTaskCreateTool(Tool):
     def description(self) -> str:
         return (
             "Create the single active AgentTask before a task-bound Forge Tool sequence. "
-            "This records planning and verification context but does not execute the robot."
+            "This records planning and verification context but does not execute the robot. "
+            "Evidence is captured in two phases: before evidence when the first bound Action "
+            "starts (confirm before_snapshot_ref and an empty evidence_errors via "
+            "forge_task_get after that Action is admitted), and after evidence when "
+            "forge_task_finalize runs after every Action is terminal. Keep observation "
+            "sources live before the first Action; the agent cannot create evidence itself."
         )
 
     @property
@@ -137,8 +142,12 @@ class ForgeTaskFinalizeTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Finalize a task after every bound Action is terminal. PAOS aggregates Tool facts "
-            "and judges the user-level verification contract."
+            "Finalize a task after every bound Action is terminal. Before calling it, confirm "
+            "with forge_task_get that before_snapshot_ref is present and evidence_errors is "
+            "empty; finalize then captures after evidence and judges the user-level "
+            "verification contract. If finalize reports an incomplete Evidence Bundle, use "
+            "read-only tools to inspect the missing kinds; do not resubmit the same Action or "
+            "replay finalize with unchanged evidence."
         )
 
     @property
