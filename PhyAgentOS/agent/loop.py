@@ -7,9 +7,11 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator, MutableSet
-from contextlib import AsyncExitStack, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -18,6 +20,7 @@ from loguru import logger
 from PhyAgentOS.agent.context import ContextBuilder
 from PhyAgentOS.agent.memory import MemoryConsolidator
 from PhyAgentOS.agent.subagent import SubagentManager
+from PhyAgentOS.agent.tool_results import ToolResultLimiter
 from PhyAgentOS.agent.tools.agent import AgentModeTool
 from PhyAgentOS.agent.tools.cron import CronTool
 from PhyAgentOS.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -32,7 +35,12 @@ from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.embodiment_registry import EmbodimentRegistry
-from PhyAgentOS.providers.base import LLMCallError, LLMProvider, StreamEvent
+from PhyAgentOS.providers.base import (
+    LLMCallError,
+    LLMProvider,
+    StreamEvent,
+    ToolCallRequest,
+)
 from PhyAgentOS.providers.providers_manager import ProvidersManager
 from PhyAgentOS.providers.service import (
     ProviderError,
@@ -55,6 +63,61 @@ if TYPE_CHECKING:
     from PhyAgentOS.forge.tool_client import ForgeToolClient
 
 
+class SessionQueueFullError(RuntimeError):
+    """Raised when a session already has too many turns waiting to run."""
+
+
+class _SessionSlot:
+    """Per-session turn lock plus the number of turns using or waiting for it."""
+
+    __slots__ = ("lock", "pending")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.pending = 0
+
+
+@dataclass
+class _ToolCallRun:
+    """One tool call in the current assistant message and its eventual result."""
+
+    call: ToolCallRequest
+    hint: str
+    parallel_safe: bool
+    result: str | None = None
+
+
+class _TurnCancelledError(asyncio.CancelledError):
+    """Cancellation carrying the partial turn so the caller can persist it."""
+
+    def __init__(self, messages: list[dict]) -> None:
+        super().__init__("turn cancelled")
+        self.messages = messages
+
+
+_MAX_PARALLEL_TOOL_CALLS = 4
+
+
+def _tool_call_batches(runs: list[_ToolCallRun]) -> list[list[_ToolCallRun]]:
+    """Group consecutive parallel-safe calls; unsafe calls are one-call batches."""
+    batches: list[list[_ToolCallRun]] = []
+    current: list[_ToolCallRun] = []
+    for run in runs:
+        if run.parallel_safe:
+            current.append(run)
+            if len(current) == _MAX_PARALLEL_TOOL_CALLS:
+                batches.append(current)
+                current = []
+            continue
+        if current:
+            batches.append(current)
+            current = []
+        batches.append([run])
+    if current:
+        batches.append(current)
+    return batches
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -68,6 +131,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _TOOL_CANCELLED_RESULT = "Tool execution cancelled"
 
     def __init__(
         self,
@@ -77,6 +141,8 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 40,
         context_window_tokens: int = 65_536,
+        max_concurrent_turns: int = 4,
+        per_session_queue_limit: int = 8,
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
@@ -100,6 +166,7 @@ class AgentLoop:
         self.channels_config = channels_config
         self.provider = provider
         self.workspace = workspace
+        self.tool_results = ToolResultLimiter(workspace)
         self.model = model or provider.get_default_model()
         self.session_runtimes: SessionRuntimes | None = None
         if provider_config is not None:
@@ -204,8 +271,15 @@ class AgentLoop:
         self._mcp_connecting = False
         self._forge_reconciled = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        # session_key -> pending /correct texts for the running turn
+        self._corrections: dict[str, list[str]] = {}
+        # session_key -> whether the turn can still consume a correction
+        self._correction_ready: dict[str, bool] = {}
         self._cancel_results: dict[str, tuple[int, int]] = {}
-        self._processing_lock = asyncio.Lock()
+        self.max_concurrent_turns = max(1, int(max_concurrent_turns))
+        self.per_session_queue_limit = max(0, int(per_session_queue_limit))
+        self._session_slots: dict[str, _SessionSlot] = {}
+        self._turn_semaphore = asyncio.Semaphore(self.max_concurrent_turns)
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -430,14 +504,21 @@ class AgentLoop:
         )
 
     @staticmethod
-    def _log_usage(usage: dict[str, int], turn_id: str) -> None:
+    def _log_usage(
+        usage: dict[str, int],
+        turn_id: str,
+        call_id: str = "-",
+        duration_s: float = 0.0,
+    ) -> None:
         """Record provider-reported usage without touching credentials."""
         logger.info(
-            "LLM usage turn={} prompt={} completion={} total={}",
+            "LLM usage turn={} call={} prompt={} completion={} total={} elapsed={:.3f}s",
             turn_id or "-",
+            call_id or "-",
             usage.get("prompt_tokens", 0),
             usage.get("completion_tokens", 0),
             usage.get("total_tokens", 0),
+            duration_s,
         )
 
     async def _run_agent_loop(
@@ -448,10 +529,13 @@ class AgentLoop:
         runtime: RuntimeSelection | None = None,
         on_event: Callable[[AgentEvent], Awaitable[None]] | None = None,
         turn_id: str = "",
+        session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop, streaming deltas and tool progress."""
         messages = initial_messages
         iteration = 0
+        model_call_count = 0
+        turn_started = time.monotonic()
         final_content = None
         finish_reason = "stop"
         tools_used: list[str] = []
@@ -481,6 +565,15 @@ class AgentLoop:
             while iteration < self.max_iterations:
                 iteration += 1
 
+                # Accept corrections from the first model call until the turn
+                # commits to an answer; see the final check below.
+                if session_key is not None:
+                    self._correction_ready[session_key] = True
+
+                # /correct texts wait in a per-session queue and only enter the
+                # context between model calls, never in the middle of a tool.
+                self._apply_corrections(messages, session_key)
+
                 tool_defs = self.tools.get_definitions()
 
                 budget_error = self._input_budget_error(
@@ -498,6 +591,9 @@ class AgentLoop:
                 reasoning_content: str | None = None
                 thinking_blocks: list[dict] | None = None
                 finish_reason = "stop"
+
+                model_call_count += 1
+                call_id = f"{turn_id or '-'}:{model_call_count}"
 
                 async for event in self._chat_stream_events(
                     provider, messages, tool_defs, model
@@ -533,7 +629,12 @@ class AgentLoop:
                     raise LLMCallError(stream_error, messages=messages)
 
                 if stream_usage:
-                    self._log_usage(stream_usage, turn_id)
+                    self._log_usage(
+                        stream_usage,
+                        turn_id,
+                        call_id=call_id,
+                        duration_s=time.monotonic() - turn_started,
+                    )
                     for key in total_usage:
                         total_usage[key] += int(stream_usage.get(key, 0))
 
@@ -553,6 +654,7 @@ class AgentLoop:
                         thinking_blocks=thinking_blocks,
                     )
 
+                    runs: list[_ToolCallRun] = []
                     for tool_call in tool_calls:
                         tools_used.append(tool_call.name)
                         if experience_session_key is not None:
@@ -562,24 +664,83 @@ class AgentLoop:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                         hint = self._tool_hint([tool_call])
                         logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                        tool = self.tools.get(tool_call.name)
+                        runs.append(_ToolCallRun(
+                            call=tool_call,
+                            hint=hint,
+                            parallel_safe=bool(
+                                tool is not None and tool.parallel_safe
+                            ),
+                        ))
+
+                    async def execute_run(run: _ToolCallRun) -> None:
                         await emit(
                             AgentEventType.TOOL_PROGRESS,
-                            hint,
-                            tool_name=tool_call.name,
-                            metadata={"phase": "start"},
+                            run.hint,
+                            tool_name=run.call.name,
+                            metadata={
+                                "phase": "start",
+                                "tool_call_id": run.call.id,
+                            },
                         )
                         result = await self.tools.execute(
-                            tool_call.name, tool_call.arguments
+                            run.call.name, run.call.arguments
+                        )
+                        run.result = self.tool_results.limit(
+                            run.call.id, run.call.name, result
                         )
                         await emit(
                             AgentEventType.TOOL_PROGRESS,
-                            f"{hint} (done)",
-                            tool_name=tool_call.name,
-                            metadata={"phase": "done"},
+                            f"{run.hint} (done)",
+                            tool_name=run.call.name,
+                            metadata={
+                                "phase": "done",
+                                "tool_call_id": run.call.id,
+                            },
                         )
-                        messages = self.context.add_tool_result(
-                            messages, tool_call.id, tool_call.name, result
-                        )
+
+                    async def run_batch(batch: list[_ToolCallRun]) -> None:
+                        if len(batch) == 1:
+                            await execute_run(batch[0])
+                            return
+                        batch_tasks = [
+                            asyncio.create_task(execute_run(run)) for run in batch
+                        ]
+                        try:
+                            await asyncio.gather(*batch_tasks)
+                        except asyncio.CancelledError:
+                            # Cancel the whole batch and wait for each task so
+                            # no tool keeps running after the turn is gone.
+                            for task in batch_tasks:
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(
+                                *batch_tasks, return_exceptions=True
+                            )
+                            raise
+
+                    def append_results(current_messages: list[dict]) -> list[dict]:
+                        for run in runs:
+                            if run.result is None:
+                                run.result = self._TOOL_CANCELLED_RESULT
+                            current_messages = self.context.add_tool_result(
+                                current_messages,
+                                run.call.id,
+                                run.call.name,
+                                run.result,
+                            )
+                        return current_messages
+
+                    try:
+                        for batch in _tool_call_batches(runs):
+                            await run_batch(batch)
+                    except asyncio.CancelledError:
+                        # Completed results stay; unfinished calls, including
+                        # batches never started, get an explicit result so the
+                        # assistant tool_calls message stays complete.
+                        messages = append_results(messages)
+                        raise
+                    messages = append_results(messages)
                 else:
                     clean = self._strip_think(response_content)
                     # Error responses never reach here: they raise above, before
@@ -590,7 +751,20 @@ class AgentLoop:
                         thinking_blocks=thinking_blocks,
                     )
                     final_content = clean
+                    if self._apply_corrections(messages, session_key):
+                        # The user corrected this turn before it ended: keep
+                        # going inside the same turn instead of replying now.
+                        final_content = None
+                        continue
+                    # Close the window before anything else can await: a
+                    # correction arriving from here on is refused instead of
+                    # being queued and dropped by the finally block.
+                    if session_key is not None:
+                        self._correction_ready[session_key] = False
                     break
+
+            if session_key is not None:
+                self._correction_ready[session_key] = False
 
             if final_content is None and iteration >= self.max_iterations:
                 logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -604,12 +778,22 @@ class AgentLoop:
                 AgentEventType.TURN_DONE,
                 finish_reason=finish_reason,
                 usage=dict(total_usage),
+                metadata={
+                    "duration_s": round(time.monotonic() - turn_started, 3),
+                    "model_call_count": model_call_count,
+                },
             )
             return final_content, tools_used, messages
         except asyncio.CancelledError:
-            with suppress(Exception):
+            with suppress(asyncio.CancelledError, Exception):
                 await emit(AgentEventType.CANCELLED)
-            raise
+            raise _TurnCancelledError(messages) from None
+        finally:
+            # Corrections belong to this turn only. Anything not consumed by
+            # the last model call must not leak into a later turn.
+            if session_key is not None:
+                self._corrections.pop(session_key, None)
+                self._correction_ready.pop(session_key, None)
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -630,11 +814,13 @@ class AgentLoop:
                 await self._handle_stop(msg)
             elif cmd == "/restart":
                 await self._handle_restart(msg)
+            elif cmd == "/correct" or cmd.startswith("/correct "):
+                await self._handle_correct(msg)
             elif response := self._runtime_command(msg):
                 await self.bus.publish_outbound(response)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
-                self._register_active_task(msg.session_key, task)
+                self._register_active_task(self._session_key_for_turn(msg), task)
 
     async def _cancel_session_side_effects(self, session_key: str) -> tuple[int, int]:
         """Cancel subagents and the Forge AgentTask bound to a session.
@@ -656,7 +842,8 @@ class AgentLoop:
 
     async def _handle_stop(self, msg: InboundMessage, *, notify: bool = True) -> None:
         """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
+        session_key = self._session_key_for_turn(msg)
+        tasks = self._active_tasks.pop(session_key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
         for t in tasks:
             try:
@@ -665,11 +852,11 @@ class AgentLoop:
                 pass
         if cancelled:
             sub_cancelled, forge_cancelled = self._cancel_results.pop(
-                msg.session_key, (0, 0)
+                session_key, (0, 0)
             )
         else:
             sub_cancelled, forge_cancelled = await self._cancel_session_side_effects(
-                msg.session_key
+                session_key
             )
         local_stopped = cancelled + sub_cancelled
         if not notify:
@@ -687,6 +874,32 @@ class AgentLoop:
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
+
+    async def _handle_correct(self, msg: InboundMessage, *, notify: bool = True) -> str:
+        """Queue a correction for the running turn instead of starting a new one.
+
+        The text reaches the model only between model calls (see
+        ``_apply_corrections``); tools already running are never interrupted.
+        Without an active turn there is nothing to correct, so the message is
+        not turned into an implicit new turn.
+        """
+        session_key = self._session_key_for_turn(msg)
+        text = msg.content.strip()[len("/correct"):].strip()
+        if not text:
+            content = "Usage: /correct <text>"
+        elif not self._has_active_turn(session_key):
+            content = "No active task to correct. Send the message normally to start a turn."
+        elif not self._correction_ready.get(session_key):
+            content = "The current turn is finishing; send this as a normal message instead."
+        else:
+            self._corrections.setdefault(session_key, []).append(text)
+            content = "Correction received; it will be applied at the next safe point."
+        if notify:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content,
+                metadata={"correction_ack": True},
+            ))
+        return content
 
     async def _handle_restart(self, msg: InboundMessage) -> None:
         """Restart the process in-place via os.execv."""
@@ -716,6 +929,83 @@ class AgentLoop:
 
         task.add_done_callback(_cleanup)
 
+    def _has_active_turn(self, session_key: str) -> bool:
+        """True when this session has a turn that has not finished yet."""
+        return any(not task.done() for task in self._active_tasks.get(session_key, []))
+
+    def _apply_corrections(
+        self, messages: list[dict], session_key: str | None,
+    ) -> bool:
+        """Insert queued corrections as user messages and clear the queue.
+
+        Called only between model requests, so a correction never interrupts a
+        running tool. Returns True when anything was inserted.
+        """
+        if session_key is None:
+            return False
+        texts = self._corrections.pop(session_key, [])
+        for text in texts:
+            messages.append({
+                "role": "user",
+                "content": f"User correction: {text}",
+            })
+        return bool(texts)
+
+    def _session_slot(self, session_key: str) -> _SessionSlot:
+        """Return the slot for one session, creating it on first use."""
+        slot = self._session_slots.get(session_key)
+        if slot is None:
+            slot = _SessionSlot()
+            self._session_slots[session_key] = slot
+        return slot
+
+    def _release_session_slot(self, session_key: str, slot: _SessionSlot) -> None:
+        """Drop the slot once no turn uses or waits for it."""
+        slot.pending -= 1
+        if slot.pending <= 0 and self._session_slots.get(session_key) is slot:
+            del self._session_slots[session_key]
+
+    @staticmethod
+    def _session_key_for_turn(msg: InboundMessage) -> str:
+        """Resolve the same session key ``_process_message`` will use."""
+        if msg.channel == "system" and msg.session_key_override is None:
+            channel, chat_id = (
+                msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
+            )
+            return f"{channel}:{chat_id}"
+        return msg.session_key
+
+    @asynccontextmanager
+    async def _turn_slot(self, session_key: str) -> AsyncIterator[None]:
+        """Serialize one session's turns and bound cross-session concurrency.
+
+        Lock order is fixed: session lock, then the global semaphore. A turn
+        that would wait beyond ``per_session_queue_limit`` is rejected before
+        it queues. Cancellation at either wait releases only what was acquired.
+        """
+        slot = self._session_slot(session_key)
+        slot.pending += 1
+        if slot.pending > self.per_session_queue_limit + 1:
+            self._release_session_slot(session_key, slot)
+            raise SessionQueueFullError(
+                f"Session {session_key} already has {self.per_session_queue_limit} "
+                "queued task(s); try again after the current turn finishes."
+            )
+        session_held = False
+        semaphore_held = False
+        try:
+            await slot.lock.acquire()
+            session_held = True
+            await self._turn_semaphore.acquire()
+            semaphore_held = True
+            yield
+        finally:
+            if semaphore_held:
+                self._turn_semaphore.release()
+            if session_held:
+                slot.lock.release()
+            self._release_session_slot(session_key, slot)
+
     async def _dispatch(
         self,
         msg: InboundMessage,
@@ -723,14 +1013,17 @@ class AgentLoop:
         publish: bool = True,
         on_event: Callable[[AgentEvent], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
-        """Process a message under the global lock.
+        """Process a message under its session lock and the global turn limit.
 
-        ``publish=False`` returns the reply to the caller without putting it on
+        Turns for one session stay strictly serial; different sessions may run
+        at the same time up to ``max_concurrent_turns``. ``publish=False``
+        returns the reply to the caller without putting it on
         the outbound queue; ``process_direct`` uses that so cron/heartbeat do
         not deliver the same reply twice. Streaming events go to ``on_event``
-        when given, and to the bus for CLI publishers.
+        when given, and to the bus whenever the reply itself is published.
         """
-        stream_to_bus = publish and msg.channel == "cli"
+        stream_to_bus = publish
+        turn_session_key = self._session_key_for_turn(msg)
         deferred_terminal: list[AgentEvent] = []
 
         async def _send_event(event: AgentEvent) -> None:
@@ -764,23 +1057,35 @@ class AgentLoop:
         event_callback = _publish_event if (on_event is not None or stream_to_bus) else None
 
         try:
-            async with self._processing_lock:
+            async with self._turn_slot(turn_session_key):
                 response = await self._process_message(
-                    msg, on_progress=on_progress, on_event=event_callback
+                    msg,
+                    session_key=turn_session_key,
+                    on_progress=on_progress,
+                    on_event=event_callback,
                 )
                 if publish:
                     if response is not None:
                         await self.bus.publish_outbound(response)
                 await _flush_terminal()
                 return response
+        except SessionQueueFullError as exc:
+            logger.warning("Rejected turn for session {}: {}", turn_session_key, exc)
+            reply = OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=str(exc),
+                metadata=dict(msg.metadata or {}, queue_full=True),
+            )
+            if publish:
+                await self.bus.publish_outbound(reply)
+            return reply
         except asyncio.CancelledError:
-            logger.info("Task cancelled for session {}", msg.session_key)
+            logger.info("Task cancelled for session {}", turn_session_key)
             try:
-                await self._cancel_session_side_effects(msg.session_key)
+                await self._cancel_session_side_effects(turn_session_key)
             except Exception as exc:
                 logger.warning(
                     "Session side-effect cancellation failed for {}: {}",
-                    msg.session_key,
+                    turn_session_key,
                     type(exc).__name__,
                 )
             with suppress(Exception):
@@ -917,7 +1222,11 @@ class AgentLoop:
                     experience_session_key=key,
                     on_event=on_event,
                     turn_id=turn_id,
+                    session_key=key,
                 )
+            except asyncio.CancelledError as exc:
+                self._save_cancelled_turn(session, history, exc)
+                raise
             except LLMCallError as exc:
                 return self._abort_turn(
                     session, history, exc, channel, chat_id, metadata=msg.metadata
@@ -965,6 +1274,7 @@ class AgentLoop:
                 "🍞 PhyAgentOS commands:",
                 "/new — Start a new conversation",
                 "/stop — Stop the current task",
+                "/correct <text> — Correct the running task at its next safe point",
                 "/restart — Restart the bot",
                 "/provider [list|<provider>] — Show or switch this session's provider",
                 "/model [list|<model-id>] — Show or switch this session's model",
@@ -1018,7 +1328,11 @@ class AgentLoop:
                 runtime=runtime,
                 on_event=on_event,
                 turn_id=turn_id,
+                session_key=key,
             )
+        except asyncio.CancelledError as exc:
+            self._save_cancelled_turn(session, history, exc)
+            raise
         except LLMCallError as exc:
             return self._abort_turn(
                 session, history, exc, msg.channel, msg.chat_id, metadata=msg.metadata
@@ -1038,8 +1352,16 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            metadata=self._final_reply_metadata(msg.metadata, turn_id),
         )
+
+    @staticmethod
+    def _final_reply_metadata(metadata: dict | None, turn_id: str) -> dict:
+        """Mark the one reply that ends a turn so channels can close streams."""
+        meta = dict(metadata or {})
+        meta["_turn_final"] = True
+        meta["turn_id"] = turn_id
+        return meta
 
     def _abort_turn(
         self,
@@ -1068,6 +1390,19 @@ class AgentLoop:
             channel=channel, chat_id=chat_id, content=f"LLM call failed: {exc.detail}",
             metadata=dict(metadata or {}),
         )
+
+    def _save_cancelled_turn(
+        self,
+        session: Session,
+        history: list[dict],
+        exc: asyncio.CancelledError,
+    ) -> None:
+        """Persist the partial tool exchange before cancellation propagates."""
+        messages = getattr(exc, "messages", None)
+        if messages is None:
+            return
+        self._save_turn(session, messages, 1 + len(history))
+        self.sessions.save(session)
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
@@ -1144,7 +1479,7 @@ class AgentLoop:
                 on_event=on_event,
             )
         )
-        self._register_active_task(msg.session_key, task)
+        self._register_active_task(self._session_key_for_turn(msg), task)
         try:
             response = await task
         except asyncio.CancelledError:
@@ -1160,4 +1495,7 @@ class AgentLoop:
                 raise
             logger.info("Direct turn cancelled for session {}", msg.session_key)
             return ""
+        if response is not None and response.metadata.get("queue_full"):
+            # Schedulers must skip delivery instead of announcing the refusal.
+            raise SessionQueueFullError(response.content)
         return response.content if response else ""

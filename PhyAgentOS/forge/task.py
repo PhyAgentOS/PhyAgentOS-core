@@ -252,6 +252,16 @@ class AgentTaskStore:
         with self._lock, self._connection() as connection:
             return self._get(connection, task_id)
 
+    def delete(self, task_id: str) -> None:
+        """Remove a task created during a failed bind; not a lifecycle transition."""
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM agent_task_events WHERE task_id = ?", (task_id,)
+            )
+            connection.execute("DELETE FROM agent_tasks WHERE task_id = ?", (task_id,))
+            connection.commit()
+
     def update(
         self,
         task_id: str,
@@ -504,16 +514,21 @@ class AgentTaskCoordinator:
             ),
             origin_session_key=origin_session_key,
         )
-        await self.interaction.freeze(task)
-        if binding is not None and self.runtime_task_binding_ids is not None:
-            self.runtime_task_binding_ids.add(binding.binding_id)
+        # Reserve the single slot before writing any interaction binding. A
+        # busy slot must not leave journal state behind for a task that was
+        # never created.
+        self.store.create(task)
         try:
-            self.store.create(task)
+            await self.interaction.freeze(task)
+            if binding is not None and self.runtime_task_binding_ids is not None:
+                self.runtime_task_binding_ids.add(binding.binding_id)
             if self.interaction.path.exists() and self.interaction.store.binding(task_id):
                 self.store.update(task_id, lambda current: None, event_type="interaction_bound")
         except Exception:
             if binding is not None and self.runtime_task_binding_ids is not None:
                 self.runtime_task_binding_ids.discard(binding.binding_id)
+            self._discard_interaction_binding(task_id)
+            self.store.delete(task_id)
             raise
         if self.experience is not None and origin_session_key:
             self.experience.bind_forge_task(
@@ -522,6 +537,20 @@ class AgentTaskCoordinator:
                 forge_binding=binding,
             )
         return task
+
+    def _discard_interaction_binding(self, task_id: str) -> None:
+        """Delete a journal binding written before a bind failure rolled back."""
+        store = self.interaction._store
+        if store is None:
+            if not self.interaction.path.exists():
+                return
+            store = self.interaction.store
+        try:
+            store.db.execute(
+                "DELETE FROM interaction_bindings WHERE task_id = ?", (task_id,)
+            )
+        except sqlite3.OperationalError:
+            pass  # no binding table exists, so nothing was written
 
     def get_task(self, task_id: str) -> AgentTaskRecord:
         return self.store.get(task_id)

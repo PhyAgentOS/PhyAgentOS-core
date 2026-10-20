@@ -12,6 +12,7 @@ from telegram import BotCommand, ReplyParameters, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
+from PhyAgentOS.bus.agent_events import AgentEventType
 from PhyAgentOS.bus.events import OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.channels.base import BaseChannel
@@ -21,6 +22,8 @@ from PhyAgentOS.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
+TELEGRAM_STREAM_INTERVAL = 0.35  # Min seconds between draft updates
+TELEGRAM_STREAM_MIN_CHARS = 12  # Min new characters worth one draft update
 
 
 def _strip_md(s: str) -> str:
@@ -157,6 +160,7 @@ class TelegramChannel(BaseChannel):
 
     name = "telegram"
     display_name = "Telegram"
+    supports_streaming = True
 
     # Commands registered with Telegram's command menu
     BOT_COMMANDS = [
@@ -178,6 +182,7 @@ class TelegramChannel(BaseChannel):
         self._message_threads: dict[tuple[str, int], int] = {}
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
+        self._streams: dict[tuple[str, str], dict] = {}  # (chat, thread) -> draft
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -413,6 +418,115 @@ class TelegramChannel(BaseChannel):
         except Exception:
             pass
         await self._send_text(chat_id, text, reply_params, thread_kwargs)
+
+    async def send_event(self, msg: OutboundMessage) -> None:
+        """Apply one agent event to a live draft message."""
+        event = msg.event
+        if event is None or not self._app:
+            return
+        try:
+            chat_id = int(msg.chat_id)
+        except ValueError:
+            logger.error("Invalid chat_id: {}", msg.chat_id)
+            return
+
+        thread_id = self._stream_thread(msg)
+        key = (msg.chat_id, "" if thread_id is None else str(thread_id))
+        state = self._streams.get(key)
+        if event.type == AgentEventType.TURN_STARTED:
+            self._streams[key] = {
+                "draft_id": int(time.time() * 1000) % (2**31),
+                "text": "",
+                "sent": "",
+                "last": 0.0,
+                "thread_id": thread_id,
+                "turn_id": event.turn_id,
+            }
+            return
+
+        if event.type == AgentEventType.TEXT_DELTA:
+            delta = msg.content or ""
+            if not delta:
+                return
+            if state is None or (
+                event.turn_id and state.get("turn_id")
+                and event.turn_id != state["turn_id"]
+            ):
+                state = {
+                    "draft_id": int(time.time() * 1000) % (2**31),
+                    "text": "",
+                    "sent": "",
+                    "last": 0.0,
+                    "thread_id": thread_id,
+                    "turn_id": event.turn_id,
+                }
+                self._streams[key] = state
+            state["text"] += delta
+            text = state["text"]
+            if state["sent"] and len(text) - len(state["sent"]) < TELEGRAM_STREAM_MIN_CHARS:
+                return
+            if time.monotonic() - state["last"] < TELEGRAM_STREAM_INTERVAL:
+                # Never sleep in the send worker: a terminal event must not
+                # wait behind a throttle window.
+                return
+            try:
+                await self._app.bot.send_message_draft(
+                    chat_id=chat_id,
+                    draft_id=state["draft_id"],
+                    text=text[:TELEGRAM_MAX_MESSAGE_LEN],
+                    **self._thread_kwargs(state.get("thread_id")),
+                )
+                state["sent"] = text
+                state["last"] = time.monotonic()
+            except Exception as e:
+                logger.debug("Telegram draft update failed: {}", e)
+            return
+
+        state = self._streams.pop(key, None)
+        self._stop_typing(msg.chat_id)
+        thread_id = (state or {}).get("thread_id", thread_id)
+
+        if event.type == AgentEventType.TURN_DONE:
+            text = msg.content or (state or {}).get("text", "")
+            if text:
+                reply_params, thread_kwargs = self._stream_reply_target(msg, thread_id)
+                for chunk in split_message(text, TELEGRAM_MAX_MESSAGE_LEN):
+                    await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+        elif event.type in (AgentEventType.CANCELLED, AgentEventType.ERROR):
+            # Drop the draft; only an explicit status text is persisted.
+            if msg.content:
+                await self._send_text(
+                    chat_id, msg.content, None, self._thread_kwargs(thread_id),
+                )
+
+    def _stream_thread(self, msg: OutboundMessage):
+        thread_id = msg.metadata.get("message_thread_id")
+        if thread_id is None:
+            reply_to = msg.metadata.get("message_id")
+            if reply_to is not None:
+                thread_id = self._message_threads.get((msg.chat_id, reply_to))
+        return thread_id
+
+    @staticmethod
+    def _thread_kwargs(thread_id) -> dict:
+        return {} if thread_id is None else {"message_thread_id": thread_id}
+
+    def _stream_reply_target(self, msg: OutboundMessage, fallback_thread=None):
+        """Resolve reply/thread parameters for a final streamed message."""
+        reply_to = msg.metadata.get("message_id")
+        thread_id = msg.metadata.get("message_thread_id")
+        if thread_id is None:
+            thread_id = fallback_thread
+        if thread_id is None and reply_to is not None:
+            thread_id = self._message_threads.get((msg.chat_id, reply_to))
+        thread_kwargs = self._thread_kwargs(thread_id)
+        reply_params = None
+        if self.config.reply_to_message and reply_to:
+            reply_params = ReplyParameters(
+                message_id=reply_to,
+                allow_sending_without_reply=True,
+            )
+        return reply_params, thread_kwargs
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""

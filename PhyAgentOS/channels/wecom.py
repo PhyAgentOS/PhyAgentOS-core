@@ -3,11 +3,13 @@
 import asyncio
 import importlib.util
 import os
+import time
 from collections import OrderedDict
 from typing import Any
 
 from loguru import logger
 
+from PhyAgentOS.bus.agent_events import AgentEventType
 from PhyAgentOS.bus.events import OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.channels.base import BaseChannel
@@ -15,6 +17,8 @@ from PhyAgentOS.config.paths import get_media_dir
 from PhyAgentOS.config.schema import WecomConfig
 
 WECOM_AVAILABLE = importlib.util.find_spec("wecom_aibot_sdk") is not None
+WECOM_STREAM_INTERVAL = 0.4  # Min seconds between stream chunks
+WECOM_STREAM_MIN_CHARS = 8  # Min new characters worth one chunk
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -37,6 +41,7 @@ class WecomChannel(BaseChannel):
 
     name = "wecom"
     display_name = "WeCom"
+    supports_streaming = True
 
     def __init__(self, config: WecomConfig, bus: MessageBus):
         super().__init__(config, bus)
@@ -47,6 +52,8 @@ class WecomChannel(BaseChannel):
         self._generate_req_id = None
         # Store frame headers for each chat to enable replies
         self._chat_frames: dict[str, Any] = {}
+        self._streams: dict[str, dict] = {}  # chat_id -> live stream state
+        self._stream_seq = 0
 
     async def start(self) -> None:
         """Start the WeCom bot with WebSocket long connection."""
@@ -351,3 +358,104 @@ class WecomChannel(BaseChannel):
 
         except Exception as e:
             logger.error("Error sending WeCom message: {}", e)
+
+    def _new_stream_id(self) -> str:
+        if self._generate_req_id is not None:
+            return self._generate_req_id("stream")
+        self._stream_seq += 1
+        return f"stream-{int(time.time() * 1000)}-{self._stream_seq}"
+
+    async def send_event(self, msg: OutboundMessage) -> None:
+        """Append one event to the chat's live stream, reusing its stream id."""
+        event = msg.event
+        if event is None or not self._client:
+            return
+        frame = self._chat_frames.get(msg.chat_id)
+        if not frame:
+            return
+
+        state = self._streams.get(msg.chat_id)
+        if event.type == AgentEventType.TURN_STARTED:
+            self._streams[msg.chat_id] = {
+                "stream_id": self._new_stream_id(),
+                "text": "",
+                "sent": "",
+                "last": 0.0,
+            }
+            return
+
+        if event.type == AgentEventType.TEXT_DELTA:
+            delta = msg.content or ""
+            if not delta:
+                return
+            if state is None:
+                state = {
+                    "stream_id": self._new_stream_id(),
+                    "text": "",
+                    "sent": "",
+                    "last": 0.0,
+                }
+                self._streams[msg.chat_id] = state
+            state["text"] += delta
+            pending = state["text"][len(state["sent"]):]
+            if not pending:
+                return
+            if state["sent"] and len(pending) < WECOM_STREAM_MIN_CHARS:
+                return
+            if time.monotonic() - state["last"] < WECOM_STREAM_INTERVAL:
+                # Do not sleep in the send worker; retry on the next event or
+                # include the pending tail in the terminal message.
+                return
+            try:
+                await self._client.reply_stream(
+                    frame, state["stream_id"], pending, finish=False,
+                )
+            except Exception as e:
+                logger.error("Error streaming WeCom chunk: {}", e)
+                return
+            state["last"] = time.monotonic()
+            state["sent"] = state["text"]
+            return
+
+        state = self._streams.pop(msg.chat_id, None)
+        if event.type == AgentEventType.TURN_DONE:
+            content = msg.content or ""
+            if state is None:
+                stream_id = self._new_stream_id()
+                remaining = content
+            else:
+                full = msg.metadata.get("_stream_text") or state["text"] or content
+                received = state["sent"]
+                if received and full.startswith(received):
+                    remaining = full[len(received):]
+                elif full == received:
+                    remaining = ""
+                else:
+                    remaining = content
+                if not remaining and content and not full.endswith(content):
+                    remaining = content
+                stream_id = state["stream_id"]
+            try:
+                await self._client.reply_stream(
+                    frame, stream_id, remaining, finish=True,
+                )
+            except Exception as e:
+                logger.error("Error finishing WeCom stream: {}", e)
+        elif event.type in (AgentEventType.CANCELLED, AgentEventType.ERROR):
+            if state is None:
+                # No live stream to finish: deliver the status as a normal
+                # message instead of dropping it silently.
+                await self.send(msg)
+                return
+            pending = state["text"][len(state["sent"]):]
+            status = msg.content or ""
+            if pending and status:
+                remaining = f"{pending}\n{status}"
+            else:
+                remaining = pending or status
+            try:
+                await self._client.reply_stream(
+                    frame, state["stream_id"], remaining, finish=True,
+                )
+            except Exception as e:
+                logger.error("Error finishing WeCom stream: {}", e)

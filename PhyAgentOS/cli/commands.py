@@ -5,7 +5,7 @@ import os
 import select
 import signal
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 # Force UTF-8 encoding for Windows console
@@ -237,6 +237,19 @@ async def _deliver_cron_response(job, response: str, bus) -> None:
             chat_id=job.payload.to,
             content=response,
         ))
+
+
+async def _process_direct_for_scheduler(agent, *, source: str, **kwargs) -> str | None:
+    """Run a cron/heartbeat turn; a full session queue means skip, not deliver."""
+    from loguru import logger
+
+    from PhyAgentOS.agent.loop import SessionQueueFullError
+
+    try:
+        return await agent.process_direct(**kwargs)
+    except SessionQueueFullError as exc:
+        logger.warning("{} skipped: {}", source, exc)
+        return None
 
 
 def _is_exit_command(command: str) -> bool:
@@ -604,6 +617,8 @@ def gateway(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
+        max_concurrent_turns=config.agents.defaults.max_concurrent_turns,
+        per_session_queue_limit=config.agents.defaults.per_session_queue_limit,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
@@ -638,8 +653,10 @@ def gateway(
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
         try:
-            response = await agent.process_direct(
-                reminder_note,
+            response = await _process_direct_for_scheduler(
+                agent,
+                source=f"cron:{job.id}",
+                content=reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
@@ -648,6 +665,8 @@ def gateway(
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
+        if response is None:
+            return None
         # An empty response means the message tool already delivered the
         # reply (or the turn was cancelled); do not deliver it again.
         await _deliver_cron_response(job, response, bus)
@@ -681,13 +700,15 @@ def gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
-        return await agent.process_direct(
-            tasks,
+        return await _process_direct_for_scheduler(
+            agent,
+            source="heartbeat",
+            content=tasks,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
-        )
+        ) or ""
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
@@ -740,6 +761,305 @@ def gateway(
     asyncio.run(run())
 
 
+
+
+def _is_control_command(text: str) -> bool:
+    """Commands the agent loop handles itself instead of starting a turn."""
+    lowered = text.strip().lower()
+    return (
+        lowered == "/stop"
+        or lowered.startswith("/stop ")
+        or lowered == "/correct"
+        or lowered.startswith("/correct ")
+    )
+
+
+class _InteractiveRuntime:
+    """Interactive CLI loop that keeps reading input while a turn runs.
+
+    Input typed during a turn never interrupts the model or a tool except for
+    ``/stop`` (full cancellation) and ``/correct`` (queued for the next safe
+    point). Everything else is appended locally and starts a new turn once the
+    current one finishes, in the order it was typed.
+    """
+
+    def __init__(
+        self,
+        agent_loop,
+        bus,
+        *,
+        channel: str,
+        chat_id: str,
+        markdown: bool,
+        thinking_ctx,
+        turn_control: dict,
+        read_input=None,
+    ) -> None:
+        self.agent_loop = agent_loop
+        self.bus = bus
+        self.channel = channel
+        self.chat_id = chat_id
+        self.markdown = markdown
+        self.thinking_ctx = thinking_ctx
+        self.turn_control = turn_control
+        self._read_input = read_input or _read_interactive_input_async
+        self._input_task: asyncio.Task | None = None
+        self._pending: list[str] = []
+        self._spinner_holder: list = []
+        self._turn_done = asyncio.Event()
+        self._turn_done.set()
+        self._stream = {
+            "open": False,
+            "current": "",
+            "saw_event": False,
+            "cancelled": False,
+            "think": _ThinkFilter(),
+        }
+
+    @property
+    def pending(self) -> list[str]:
+        return self._pending
+
+    def _ensure_input_task(self) -> asyncio.Task:
+        # A completed reader still holds a line the user typed at the end of
+        # the previous turn; keep it instead of starting over and losing it.
+        if self._input_task is None:
+            _flush_pending_tty_input()
+            self._input_task = asyncio.create_task(self._read_input())
+        return self._input_task
+
+    async def _take_input(self) -> str:
+        task = self._ensure_input_task()
+        try:
+            return await task
+        finally:
+            self._input_task = None
+
+    async def _publish(self, content: str) -> None:
+        from PhyAgentOS.bus.events import InboundMessage
+
+        await self.bus.publish_inbound(InboundMessage(
+            channel=self.channel,
+            sender_id="user",
+            chat_id=self.chat_id,
+            content=content,
+        ))
+
+    def _stop_message(self):
+        from PhyAgentOS.bus.events import InboundMessage
+
+        return InboundMessage(
+            channel=self.channel,
+            sender_id="user",
+            chat_id=self.chat_id,
+            content="/stop",
+        )
+
+    def _reset_turn_state(self) -> None:
+        self._turn_done.clear()
+        self._stream.update(
+            open=False,
+            current="",
+            saw_event=False,
+            cancelled=False,
+            think=_ThinkFilter(),
+        )
+
+    def _stop_spinner(self) -> None:
+        if self._spinner_holder:
+            self._spinner_holder.pop().stop()
+
+    def _close_stream_line(self) -> None:
+        if self._stream["open"]:
+            console.print()
+            self._stream["open"] = False
+
+    def _show_final(self, content: str | None) -> None:
+        visible = _visible_text(content)
+        if (
+            visible.strip()
+            and visible.strip() != self._stream["current"].strip()
+        ):
+            self._close_stream_line()
+            _print_agent_response(visible, render_markdown=self.markdown)
+        self._stream["current"] = visible
+
+    async def _handle_running_input(self, text: str) -> None:
+        if _is_control_command(text):
+            await self._publish(text)
+            return
+        if _is_exit_command(text):
+            self._pending.append(text)
+            console.print(
+                "  [dim]Exit queued; finishing the current turn first.[/dim]"
+            )
+            return
+        self._pending.append(text)
+        console.print(f"  [dim]Queued for after this turn: {text}[/dim]")
+
+    async def _run_turn(self, content: str) -> None:
+        self._reset_turn_state()
+        self.turn_control["active"] = True
+        spinner = self.thinking_ctx()
+        if hasattr(spinner, "start"):
+            spinner.start()
+            self._spinner_holder.append(spinner)
+        try:
+            await self._publish(content)
+            while not self._turn_done.is_set():
+                reader = self._ensure_input_task()
+                done_waiter = asyncio.create_task(self._turn_done.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {reader, done_waiter},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    done_waiter.cancel()
+                    try:
+                        await done_waiter
+                    except asyncio.CancelledError:
+                        pass
+                if reader in done:
+                    self._input_task = None
+                    try:
+                        text = reader.result().strip()
+                    except KeyboardInterrupt:
+                        # Ctrl+C while a turn runs: cancel it through the same
+                        # path as /stop before leaving the loop.
+                        with suppress(Exception):
+                            await self.agent_loop._handle_stop(
+                                self._stop_message(), notify=False,
+                            )
+                        raise
+                    if text:
+                        await self._handle_running_input(text)
+        finally:
+            self._stop_spinner()
+            self.turn_control["active"] = False
+
+    async def _consume_outbound(self) -> None:
+        while True:
+            try:
+                msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
+                if (msg.channel, msg.chat_id) != (self.channel, self.chat_id):
+                    # Another session's turn (subagents run as system turns)
+                    # must not close or answer this CLI turn.
+                    continue
+                event = getattr(msg, "event", None)
+                if event is not None:
+                    self._stream["saw_event"] = True
+                    if event.type != AgentEventType.TURN_STARTED:
+                        self._stop_spinner()
+                    if event.type == AgentEventType.TEXT_DELTA:
+                        if event.content:
+                            visible = self._stream["think"].feed(event.content)
+                            if visible:
+                                self._stream["current"] += visible
+                                self._stream["open"] = True
+                                console.print(
+                                    visible,
+                                    end="",
+                                    markup=False,
+                                    highlight=False,
+                                )
+                    elif event.type == AgentEventType.TOOL_PROGRESS:
+                        if event.content:
+                            self._close_stream_line()
+                            self._stream["current"] = ""
+                            console.print(f"  ↳ {event.content}", style="dim")
+                    elif event.type == AgentEventType.ERROR:
+                        # The failure reply is published before this event; it
+                        # is already visible by now.
+                        self._close_stream_line()
+                        self._turn_done.set()
+                    elif event.type == AgentEventType.CANCELLED:
+                        self._close_stream_line()
+                        console.print("\nCancelled.", style="yellow")
+                        self._stream["cancelled"] = True
+                        self._turn_done.set()
+                    elif event.type == AgentEventType.TURN_DONE:
+                        self._close_stream_line()
+                        self._turn_done.set()
+                    continue
+                if msg.metadata.get("correction_ack"):
+                    # A /correct receipt is not the turn's answer.
+                    console.print(f"  [dim]{msg.content}[/dim]")
+                    if not self.turn_control["active"]:
+                        self._turn_done.set()
+                    continue
+                if msg.metadata.get("_progress"):
+                    is_tool_hint = msg.metadata.get("_tool_hint", False)
+                    ch = self.agent_loop.channels_config
+                    if ch and is_tool_hint and not ch.send_tool_hints:
+                        pass
+                    elif ch and not is_tool_hint and not ch.send_progress:
+                        pass
+                    else:
+                        console.print(f"  [dim]↳ {msg.content}[/dim]")
+                else:
+                    self._show_final(msg.content)
+                    if not self._stream["saw_event"]:
+                        # Legacy path: a plain reply with no events.
+                        self._turn_done.set()
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+    async def run(self) -> None:
+        from PhyAgentOS.cli.providers import _interactive_model_command
+
+        bus_task = asyncio.create_task(self.agent_loop.run())
+        outbound_task = asyncio.create_task(self._consume_outbound())
+        try:
+            while True:
+                try:
+                    if self._pending:
+                        text = self._pending.pop(0)
+                        console.print(
+                            f"  [dim]Sending queued message: {text}[/dim]"
+                        )
+                    else:
+                        text = (await self._take_input()).strip()
+                    if not text:
+                        continue
+                    if _is_exit_command(text):
+                        _restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
+                    selection = await _interactive_model_command(
+                        text,
+                        self.agent_loop.session_runtimes,
+                        f"{self.channel}:{self.chat_id}",
+                    )
+                    if selection is not None:
+                        _print_agent_response(selection, render_markdown=self.markdown)
+                        continue
+                    if _is_control_command(text):
+                        # No turn to watch: run() answers these directly.
+                        self._reset_turn_state()
+                        await self._publish(text)
+                        await self._turn_done.wait()
+                        continue
+                    await self._run_turn(text)
+                except KeyboardInterrupt:
+                    _restore_terminal()
+                    console.print("\nGoodbye!")
+                    break
+                except EOFError:
+                    _restore_terminal()
+                    console.print("\nGoodbye!")
+                    break
+        finally:
+            self.agent_loop.stop()
+            tasks = [bus_task, outbound_task]
+            if self._input_task is not None:
+                self._input_task.cancel()
+                tasks.append(self._input_task)
+            outbound_task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self.agent_loop.close_mcp()
 
 
 # ============================================================================
@@ -805,6 +1125,8 @@ def agent(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
+        max_concurrent_turns=config.agents.defaults.max_concurrent_turns,
+        per_session_queue_limit=config.agents.defaults.per_session_queue_limit,
         brave_api_key=config.tools.web.search.api_key or None,
         web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
@@ -970,168 +1292,16 @@ def agent(
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
         async def run_interactive():
-            from PhyAgentOS.cli.providers import _interactive_model_command
-
-            bus_task = asyncio.create_task(agent_loop.run())
-            turn_done = asyncio.Event()
-            turn_done.set()
-            stream_state = {
-                "open": False,
-                "current": "",
-                "saw_event": False,
-                "cancelled": False,
-                "think": _ThinkFilter(),
-            }
-            spinner_holder: list = []
-
-            def _stop_spinner():
-                if spinner_holder:
-                    spinner_holder.pop().stop()
-
-            def _close_stream_line():
-                if stream_state["open"]:
-                    console.print()
-                    stream_state["open"] = False
-
-            def _print_tool_progress(content: str) -> None:
-                console.print(f"  ↳ {content}", style="dim")
-
-            def _show_final(content: str | None) -> None:
-                visible = _visible_text(content)
-                if (
-                    visible.strip()
-                    and visible.strip() != stream_state["current"].strip()
-                ):
-                    _close_stream_line()
-                    _print_agent_response(visible, render_markdown=markdown)
-                stream_state["current"] = visible
-
-            async def _consume_outbound():
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-                        event = getattr(msg, "event", None)
-                        if event is not None:
-                            stream_state["saw_event"] = True
-                            if event.type != AgentEventType.TURN_STARTED:
-                                _stop_spinner()
-                            if event.type == AgentEventType.TEXT_DELTA:
-                                if event.content:
-                                    visible = stream_state["think"].feed(event.content)
-                                    if visible:
-                                        stream_state["current"] += visible
-                                        stream_state["open"] = True
-                                        console.print(
-                                            visible,
-                                            end="",
-                                            markup=False,
-                                            highlight=False,
-                                        )
-                            elif event.type == AgentEventType.TOOL_PROGRESS:
-                                if event.content:
-                                    _close_stream_line()
-                                    stream_state["current"] = ""
-                                    _print_tool_progress(event.content)
-                            elif event.type == AgentEventType.ERROR:
-                                # The failure reply is published before this
-                                # event; it is already visible by now.
-                                _close_stream_line()
-                                turn_done.set()
-                            elif event.type == AgentEventType.CANCELLED:
-                                _close_stream_line()
-                                console.print("\nCancelled.", style="yellow")
-                                stream_state["cancelled"] = True
-                                turn_done.set()
-                            elif event.type == AgentEventType.TURN_DONE:
-                                _close_stream_line()
-                                turn_done.set()
-                            continue
-                        if msg.metadata.get("_progress"):
-                            is_tool_hint = msg.metadata.get("_tool_hint", False)
-                            ch = agent_loop.channels_config
-                            if ch and is_tool_hint and not ch.send_tool_hints:
-                                pass
-                            elif ch and not is_tool_hint and not ch.send_progress:
-                                pass
-                            else:
-                                console.print(f"  [dim]↳ {msg.content}[/dim]")
-                        else:
-                            _show_final(msg.content)
-                            if not stream_state["saw_event"]:
-                                # Legacy path: a plain reply with no events.
-                                turn_done.set()
-                    except asyncio.TimeoutError:
-                        continue
-                    except asyncio.CancelledError:
-                        break
-
-            outbound_task = asyncio.create_task(_consume_outbound())
-
-            try:
-                while True:
-                    try:
-                        _flush_pending_tty_input()
-                        user_input = await _read_interactive_input_async()
-                        command = user_input.strip()
-                        if not command:
-                            continue
-
-                        if _is_exit_command(command):
-                            _restore_terminal()
-                            console.print("\nGoodbye!")
-                            break
-
-                        selection_result = await _interactive_model_command(
-                            command, agent_loop.session_runtimes, f"{cli_channel}:{cli_chat_id}",
-                        )
-                        if selection_result is not None:
-                            _print_agent_response(selection_result, render_markdown=markdown)
-                            continue
-
-                        turn_done.clear()
-                        stream_state.update(
-                            open=False,
-                            current="",
-                            saw_event=False,
-                            cancelled=False,
-                            think=_ThinkFilter(),
-                        )
-
-                        turn_control["active"] = True
-                        spinner = _thinking_ctx()
-                        if hasattr(spinner, "start"):
-                            spinner.start()
-                            spinner_holder.append(spinner)
-                        try:
-                            await bus.publish_inbound(InboundMessage(
-                                channel=cli_channel,
-                                sender_id="user",
-                                chat_id=cli_chat_id,
-                                content=user_input,
-                            ))
-
-                            await turn_done.wait()
-                        finally:
-                            _stop_spinner()
-                            turn_control["active"] = False
-
-                    except KeyboardInterrupt:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
-                    except EOFError:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
-            finally:
-                agent_loop.stop()
-                outbound_task.cancel()
-                await asyncio.gather(
-                    bus_task,
-                    outbound_task,
-                    return_exceptions=True,
-                )
-                await agent_loop.close_mcp()
+            runtime = _InteractiveRuntime(
+                agent_loop,
+                bus,
+                channel=cli_channel,
+                chat_id=cli_chat_id,
+                markdown=markdown,
+                thinking_ctx=_thinking_ctx,
+                turn_control=turn_control,
+            )
+            await runtime.run()
 
         asyncio.run(run_interactive())
 

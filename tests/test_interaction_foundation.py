@@ -279,7 +279,7 @@ async def test_agent_reply_returns_while_supervisor_runs_and_stop_ignores_chat_l
         forge_task_coordinator=c,
         forge_tool_client=c.client,
     )
-    async with loop._processing_lock:
+    async with loop._turn_slot("cli:test"):
         answer, _, messages = await loop._run_agent_loop([])
         assert answer == "Monitoring started."
         await asyncio.wait_for(entered.wait(), 1)

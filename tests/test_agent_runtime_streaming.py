@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from typer.testing import CliRunner
 
+from PhyAgentOS.agent import loop as loop_module
 from PhyAgentOS.agent.loop import AgentLoop
 from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.bus.events import InboundMessage
@@ -164,6 +165,86 @@ async def test_stream_events_order_and_tool_progress(tmp_path, monkeypatch) -> N
         "completion_tokens": 5,
         "total_tokens": 35,
     }
+
+
+async def test_turn_done_records_duration_and_model_call_count(
+    tmp_path, monkeypatch
+) -> None:
+    provider = _StreamingProvider([
+        [
+            StreamEvent(
+                type="tool_call",
+                tool_call=ToolCallRequest(
+                    id="c1", name="read_file", arguments={"path": "a.txt"},
+                ),
+            ),
+            StreamEvent(
+                type="done",
+                finish_reason="tool_calls",
+                usage={"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+            ),
+        ],
+        [
+            StreamEvent(type="delta", content="All done"),
+            StreamEvent(
+                type="done",
+                usage={"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22},
+            ),
+        ],
+    ])
+    loop = _loop(provider, tmp_path)
+
+    async def fake_execute(name, params):
+        return "file body"
+
+    monkeypatch.setattr(loop.tools, "execute", fake_execute)
+
+    records: list[tuple[str, tuple]] = []
+
+    class _CaptureLogger:
+        def info(self, message, *args, **kwargs):
+            records.append((message, args))
+
+        def error(self, *args, **kwargs):
+            pass
+
+        def warning(self, *args, **kwargs):
+            pass
+
+        def debug(self, *args, **kwargs):
+            pass
+
+        def exception(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(loop_module, "logger", _CaptureLogger())
+
+    events: list[AgentEvent] = []
+
+    async def on_event(event: AgentEvent) -> None:
+        events.append(event)
+
+    message = InboundMessage(
+        channel="cli", chat_id="test", sender_id="user", content="read a.txt",
+        turn_id="turn-abc",
+    )
+    await loop._dispatch(message, publish=False, on_event=on_event)
+
+    done_events = [event for event in events if event.type == AgentEventType.TURN_DONE]
+    assert len(done_events) == 1
+    done = done_events[0]
+    assert done.turn_id == "turn-abc"
+    assert done.metadata["duration_s"] >= 0
+    assert done.metadata["model_call_count"] == 2
+    assert provider.calls == 2
+
+    usage_records = [
+        args for message_, args in records if message_.startswith("LLM usage")
+    ]
+    assert len(usage_records) == 2
+    assert usage_records[0][1] == "turn-abc:1"
+    assert usage_records[1][1] == "turn-abc:2"
+    assert all(args[-1] >= 0 for args in usage_records)  # elapsed seconds
 
 
 async def test_incomplete_tool_arguments_do_not_execute(tmp_path, monkeypatch) -> None:

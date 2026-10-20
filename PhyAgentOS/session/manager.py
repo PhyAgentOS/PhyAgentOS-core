@@ -1,7 +1,9 @@
 """Session management for conversation history."""
 
 import json
+import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +14,17 @@ from loguru import logger
 from PhyAgentOS.config.paths import get_legacy_sessions_dir
 from PhyAgentOS.utils.helpers import ensure_dir, safe_filename
 
+_SESSION_SUMMARY_FOOTER = (
+    "\n\nPhysical state must not be inferred from this summary. Query Forge "
+    "records (TaskStore/task queries) for the current task and action state. "
+    "Any action or task identity here is only a reference, not evidence of status."
+)
+
+
+def render_session_summary(summary: str) -> str:
+    """Wrap a stored digest in tags and append the fixed physical-state warning."""
+    return f"<session_summary>\n{summary.strip()}{_SESSION_SUMMARY_FOOTER}\n</session_summary>"
+
 
 @dataclass
 class Session:
@@ -21,8 +34,9 @@ class Session:
     Stores messages in JSONL format for easy reading and persistence.
 
     Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
+    Compression keeps older messages out of the live context: ``summary`` holds
+    a session-local digest of ``messages[:last_consolidated]`` and
+    ``get_history()`` prepends it. It never writes long-term memory.
     """
 
     key: str  # channel:chat_id
@@ -30,7 +44,8 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
-    last_consolidated: int = 0  # Number of messages already consolidated to files
+    last_consolidated: int = 0  # Messages [0:last_consolidated] replaced by summary
+    summary: str = ""  # Session-local digest of compressed messages
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -55,6 +70,10 @@ class Session:
                 break
 
         out: list[dict[str, Any]] = []
+        if self.summary and self.last_consolidated > 0:
+            # A user-role block keeps providers with a single-system-prompt
+            # converter (openai_codex) from replacing the main system prompt.
+            out.append({"role": "user", "content": render_session_summary(self.summary)})
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
             for k in ("tool_calls", "tool_call_id", "name"):
@@ -67,6 +86,7 @@ class Session:
         """Clear all messages and reset session to initial state."""
         self.messages = []
         self.last_consolidated = 0
+        self.summary = ""
         self.updated_at = datetime.now()
 
 
@@ -133,6 +153,7 @@ class SessionManager:
             metadata = {}
             created_at = None
             last_consolidated = 0
+            summary = ""
 
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -146,6 +167,7 @@ class SessionManager:
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
+                        summary = data.get("summary", "")
                     else:
                         messages.append(data)
 
@@ -154,28 +176,40 @@ class SessionManager:
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
+                summary=summary,
             )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
+        """Save a session atomically so a failed write leaves the old file intact."""
         path = self._get_session_path(session.key)
-
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        fd, temp_path = tempfile.mkstemp(
+            dir=self.sessions_dir, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                metadata_line = {
+                    "_type": "metadata",
+                    "key": session.key,
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata,
+                    "last_consolidated": session.last_consolidated,
+                    "summary": session.summary,
+                }
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            os.replace(temp_path, path)
+        except BaseException:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
         self._cache[session.key] = session
 

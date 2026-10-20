@@ -26,3 +26,4 @@ SECURITY.md
 uv.lock
 plan/
 external/
+.paos/

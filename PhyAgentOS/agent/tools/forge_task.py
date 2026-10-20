@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from contextvars import ContextVar
 from typing import Any
 
 from PhyAgentOS.agent.tools.base import Tool
@@ -25,10 +26,12 @@ def _task_response(task: AgentTaskRecord) -> str:
 class ForgeTaskCreateTool(Tool):
     def __init__(self, coordinator: AgentTaskCoordinator) -> None:
         self.coordinator = coordinator
-        self.session_key: str | None = None
+        self.session_key: ContextVar[str | None] = ContextVar(
+            "forge_task_create_session_key", default=None
+        )
 
     def set_context(self, session_key: str) -> None:
-        self.session_key = session_key
+        self.session_key.set(session_key)
 
     @property
     def name(self) -> str:
@@ -65,7 +68,7 @@ class ForgeTaskCreateTool(Tool):
             task_description=task_description,
             activation_id=activation_id,
             verification=TaskVerificationContract.model_validate(verification),
-            origin_session_key=self.session_key,
+            origin_session_key=self.session_key.get(),
         )
         if inspect.isawaitable(task):
             task = await task
