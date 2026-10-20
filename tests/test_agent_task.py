@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -16,6 +17,7 @@ from PhyAgentOS.forge.task import (
     AgentTaskError,
     AgentTaskStatus,
 )
+from PhyAgentOS.forge.tool_client import ForgeToolAPIError
 from PhyAgentOS.verification.contracts import (
     CriterionVerdict,
     RecoveryContext,
@@ -413,7 +415,8 @@ async def test_cancel_acceptance_followed_by_unknown_is_failed_not_stopped(
     invocation_id = accepted["data"]["invocation_id"]
 
     cancelling = await coordinator.cancel_task(task.task_id, reason="operator stop")
-    assert cancelling.status == AgentTaskStatus.CANCELLING
+    assert cancelling.status == AgentTaskStatus.FAILED
+    assert cancelling.execution_records[0].status == "unknown"
     assert client.cancel_calls == [invocation_id]
 
     coordinator.observe_action(
@@ -422,12 +425,11 @@ async def test_cancel_acceptance_followed_by_unknown_is_failed_not_stopped(
         {"ok": True, "data": {"phase": "unknown"}},
     )
     observed = coordinator.get_task(task.task_id)
-    assert observed.status == AgentTaskStatus.CANCELLING
+    assert observed.status == AgentTaskStatus.FAILED
     final = await coordinator.finalize_task(task.task_id)
 
     assert final.status == AgentTaskStatus.FAILED
     assert final.execution_records[0].status == "unknown"
-    assert any("Gateway URL" in item for item in final.evidence_errors)
     assert experience.completed == [task.task_id]
 
 
@@ -449,3 +451,437 @@ async def test_replan_budget_is_enforced_on_the_same_task(tmp_path) -> None:
     assert final.status == AgentTaskStatus.FAILED
     assert len(final.revisions) == 1
     assert any("replan limit reached (0)" in item for item in final.evidence_errors)
+
+
+class HangingActionClient(FakeToolClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+
+    async def invoke_action(
+        self,
+        tool_id: str,
+        arguments: dict[str, Any],
+        **_: Any,
+    ) -> dict[str, Any]:
+        self.action_calls += 1
+        self.entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("hanging Action unexpectedly returned")
+
+
+class GatedActionClient(FakeToolClient):
+    """Hold the invoke POST until the test releases the 202 response."""
+
+    def __init__(self, *, status: str = "stopped") -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.phase = status
+        self.status_calls: list[str] = []
+
+    async def invoke_action(
+        self,
+        tool_id: str,
+        arguments: dict[str, Any],
+        **_: Any,
+    ) -> dict[str, Any]:
+        self.action_calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return {
+            "ok": True,
+            "data": {
+                "tool_id": tool_id,
+                "invocation_id": f"inv_{self.action_calls}",
+                "attempt_id": f"attempt_{self.action_calls}",
+                "arguments": arguments,
+            },
+        }
+
+    async def invocation_status(self, invocation_id: str) -> dict[str, Any]:
+        self.status_calls.append(invocation_id)
+        return {"ok": True, "data": {"invocation_id": invocation_id, "phase": self.phase}}
+
+    async def invocation_result(self, invocation_id: str) -> dict[str, Any]:
+        return {"ok": True, "data": {"invocation_id": invocation_id, "phase": "running"}}
+
+
+
+class ScriptedCancelClient(FakeToolClient):
+    def __init__(self, statuses: list[str]) -> None:
+        super().__init__()
+        self._statuses = list(statuses)
+        self.status_calls: list[str] = []
+        self.result_calls: list[str] = []
+        self.cancel_started = asyncio.Event()
+        self.cancel_gate: asyncio.Event | None = None
+
+    async def cancel_invocation(self, invocation_id: str) -> dict[str, Any]:
+        self.cancel_calls.append(invocation_id)
+        self.cancel_started.set()
+        if self.cancel_gate is not None:
+            await self.cancel_gate.wait()
+        return {
+            "ok": True,
+            "data": {"invocation_id": invocation_id, "cancel_requested": True},
+        }
+
+    async def invocation_status(self, invocation_id: str) -> dict[str, Any]:
+        self.status_calls.append(invocation_id)
+        if len(self._statuses) > 1:
+            phase = self._statuses.pop(0)
+        else:
+            phase = self._statuses[0] if self._statuses else "running"
+        return {"ok": True, "data": {"invocation_id": invocation_id, "phase": phase}}
+
+    async def invocation_result(self, invocation_id: str) -> dict[str, Any]:
+        self.result_calls.append(invocation_id)
+        return {"ok": True, "data": {"invocation_id": invocation_id, "phase": "running"}}
+
+
+class UnreachableCancelClient(FakeToolClient):
+    async def cancel_invocation(self, invocation_id: str) -> dict[str, Any]:
+        self.cancel_calls.append(invocation_id)
+        raise ForgeToolAPIError("Gateway is unreachable")
+
+    async def invocation_status(self, invocation_id: str) -> dict[str, Any]:
+        raise ForgeToolAPIError("Gateway is unreachable")
+
+    async def invocation_result(self, invocation_id: str) -> dict[str, Any]:
+        raise ForgeToolAPIError("Gateway is unreachable")
+
+
+class FlakyStatusClient(ScriptedCancelClient):
+    def __init__(self) -> None:
+        super().__init__(["stopped"])
+        self.failures = 1
+
+    async def invocation_status(self, invocation_id: str) -> dict[str, Any]:
+        self.status_calls.append(invocation_id)
+        if self.failures:
+            self.failures -= 1
+            raise ForgeToolAPIError(
+                "Gateway temporarily unavailable", status_code=503, retryable=True
+            )
+        return {"ok": True, "data": {"invocation_id": invocation_id, "phase": "stopped"}}
+
+
+def _short_cancel_budget(coordinator: AgentTaskCoordinator) -> None:
+    coordinator.cancel_timeout_s = 0.2
+    coordinator.cancel_poll_interval_s = 0.01
+    coordinator.cancel_grace_s = 0.05
+
+
+async def test_cancel_before_dispatch_closes_the_gate_without_invoking(tmp_path) -> None:
+    client = FakeToolClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+
+    cancelled = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    assert cancelled.status == AgentTaskStatus.CANCELLED
+    assert cancelled.cancellation_requested is True
+    assert cancelled.execution_records == []
+    assert client.action_calls == 0
+    with pytest.raises(AgentTaskError, match="cancellation was requested"):
+        await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    assert client.action_calls == 0
+
+
+async def test_cancellation_after_intent_blocks_dispatch_before_the_post(
+    tmp_path, monkeypatch
+) -> None:
+    client = FakeToolClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    append = coordinator._append_execution
+
+    def append_then_cancel(*args: Any, **kwargs: Any):
+        record = append(*args, **kwargs)
+        coordinator.store.update(
+            task.task_id,
+            lambda current: setattr(current, "cancellation_requested", True),
+            event_type="test_cancellation_arrived",
+        )
+        return record
+
+    monkeypatch.setattr(coordinator, "_append_execution", append_then_cancel)
+
+    with pytest.raises(AgentTaskError, match="request was not resent"):
+        await coordinator.start_action(task.task_id, "motion.move_pose", {})
+
+    record = coordinator.get_task(task.task_id).execution_records[-1]
+    assert record.status == "cancelled"
+    assert client.action_calls == 0
+
+
+async def test_bare_cancelled_dispatch_leaves_unknown_without_identity(tmp_path) -> None:
+    client = HangingActionClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+
+    dispatch = asyncio.create_task(
+        coordinator.start_action(task.task_id, "motion.move_pose", {})
+    )
+    await asyncio.wait_for(client.entered.wait(), 1)
+    dispatch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+
+    record = coordinator.get_task(task.task_id).execution_records[0]
+    assert record.status == "unknown"
+    assert record.invocation_id is None
+    assert record.error is not None
+    assert "could not be confirmed" in record.error["message"]
+    assert "not resent" in record.error["message"]
+    assert client.action_calls == 1
+    assert client.cancel_calls == []
+    with pytest.raises(AgentTaskError, match="unknown remote state"):
+        await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    assert client.action_calls == 1
+
+
+async def test_cancelled_dispatch_uses_grace_identity_and_requests_stop(tmp_path) -> None:
+    client = GatedActionClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    coordinator.cancel_grace_s = 0.5
+    task = coordinator.create_task(task_description="move", verification=_contract())
+
+    dispatch = asyncio.create_task(
+        coordinator.start_action(task.task_id, "motion.move_pose", {})
+    )
+    await asyncio.wait_for(client.entered.wait(), 1)
+    dispatch.cancel()
+    await asyncio.sleep(0.01)
+    client.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+
+    record = coordinator.get_task(task.task_id).execution_records[0]
+    assert record.invocation_id == "inv_1"
+    assert record.attempt_id == "attempt_1"
+    assert record.cancel_requested is True
+    assert record.status == "stopped"
+    assert client.cancel_calls == ["inv_1"]
+    assert client.action_calls == 1
+
+
+async def test_cancel_after_accept_polls_until_gateway_terminal(tmp_path) -> None:
+    client = ScriptedCancelClient(["running", "stopped"])
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+
+    cancelling = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    record = cancelling.execution_records[0]
+    assert record.cancel_requested is True
+    assert record.status == "stopped"
+    assert client.cancel_calls == [invocation_id]
+    assert client.status_calls
+    assert cancelling.status == AgentTaskStatus.CANCELLED
+    final = await coordinator.finalize_task(task.task_id)
+    assert final.status == AgentTaskStatus.CANCELLED
+
+
+async def test_cancel_without_gateway_terminal_stays_unknown_not_stopped(tmp_path) -> None:
+    client = ScriptedCancelClient(["running"])
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    await coordinator.start_action(task.task_id, "motion.move_pose", {})
+
+    cancelling = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    record = cancelling.execution_records[0]
+    assert record.cancel_requested is True
+    assert record.status == "unknown"
+    assert record.error is not None
+    assert "not resent" in record.error["message"]
+    assert client.action_calls == 1
+    final = await coordinator.finalize_task(task.task_id)
+    assert final.status == AgentTaskStatus.FAILED
+
+
+async def test_unreachable_gateway_keeps_unknown_and_never_resends_the_action(
+    tmp_path,
+) -> None:
+    client = UnreachableCancelClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+
+    cancelling = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    record = cancelling.execution_records[0]
+    assert record.cancel_requested is True
+    assert record.status == "unknown"
+    assert record.error is not None
+    assert record.error["type"] == "CancellationUnconfirmed"
+    assert "not resent" in record.error["message"]
+    assert client.action_calls == 1
+    assert client.cancel_calls == [invocation_id]
+
+
+async def test_new_actions_are_rejected_while_the_cancel_request_is_in_flight(
+    tmp_path,
+) -> None:
+    client = ScriptedCancelClient(["stopped"])
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    client.cancel_gate = asyncio.Event()
+
+    cancellation = asyncio.create_task(
+        coordinator.cancel_task(task.task_id, reason="operator stop")
+    )
+    await asyncio.wait_for(client.cancel_started.wait(), 1)
+    with pytest.raises(AgentTaskError, match="cancellation was requested"):
+        await coordinator.start_action(task.task_id, "motion.move_pose", {"x": 0.1})
+    assert client.action_calls == 1
+
+    client.cancel_gate.set()
+    result = await asyncio.wait_for(cancellation, 1)
+    assert result.cancellation_requested is True
+    assert result.status == AgentTaskStatus.CANCELLED
+
+
+async def test_late_202_after_cancel_is_stopped_not_left_accepted(tmp_path) -> None:
+    client = GatedActionClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+
+    dispatch = asyncio.create_task(
+        coordinator.start_action(task.task_id, "motion.move_pose", {})
+    )
+    await asyncio.wait_for(client.entered.wait(), 1)
+    cancelling = await coordinator.cancel_task(task.task_id, reason="operator stop")
+    assert cancelling.status == AgentTaskStatus.CANCELLING
+    assert client.cancel_calls == []
+
+    client.release.set()
+    response = await asyncio.wait_for(dispatch, 1)
+    invocation_id = response["data"]["invocation_id"]
+
+    record = coordinator.get_task(task.task_id).execution_records[0]
+    assert record.invocation_id == invocation_id
+    assert record.cancel_requested is True
+    assert record.status == "stopped"
+    assert record.status != "accepted"
+    assert client.cancel_calls == [invocation_id]
+    assert client.action_calls == 1
+    assert coordinator.get_task(task.task_id).status == AgentTaskStatus.CANCELLED
+
+
+async def test_cancel_task_requests_stop_for_unknown_records_with_identity(tmp_path) -> None:
+    client = ScriptedCancelClient(["stopped"])
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+    coordinator.observe_action(
+        task.task_id,
+        invocation_id,
+        {"ok": True, "data": {"phase": "unknown"}},
+    )
+    assert coordinator.get_task(task.task_id).execution_records[0].status == "unknown"
+
+    result = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    record = result.execution_records[0]
+    assert record.cancel_requested is True
+    assert record.status == "stopped"
+    assert client.cancel_calls == [invocation_id]
+    assert client.action_calls == 1
+
+
+async def test_repeated_cancel_does_not_resend_an_already_requested_record(tmp_path) -> None:
+    client = ScriptedCancelClient(["stopped"])
+    coordinator = _coordinator(tmp_path, client=client)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+
+    def mark_requested(current) -> None:
+        record = next(
+            item for item in current.execution_records if item.invocation_id == invocation_id
+        )
+        record.cancel_requested = True
+
+    coordinator.store.update(
+        task.task_id, mark_requested, event_type="test_cancel_already_requested"
+    )
+    result = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    assert client.cancel_calls == []
+    assert client.status_calls == []
+    assert result.status == AgentTaskStatus.CANCELLING
+
+
+async def test_cancel_polling_retries_after_a_retryable_gateway_5xx(tmp_path) -> None:
+    client = FlakyStatusClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+
+    result = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    record = result.execution_records[0]
+    assert record.status == "stopped"
+    assert len(client.status_calls) >= 2
+    assert result.status == AgentTaskStatus.CANCELLED
+    assert client.cancel_calls == [invocation_id]
+
+
+async def test_reconcile_confirms_terminal_state_for_unknown_record_without_resending(
+    tmp_path,
+) -> None:
+    client = ScriptedCancelClient(["cancelled"])
+    coordinator = _coordinator(tmp_path, client=client)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+    coordinator.observe_action(
+        task.task_id,
+        invocation_id,
+        {"ok": True, "data": {"phase": "unknown"}},
+    )
+
+    reconciled = await coordinator.reconcile_nonterminal()
+
+    assert reconciled is not None
+    assert reconciled.execution_records[0].status == "cancelled"
+    assert client.action_calls == 1
+    assert client.cancel_calls == []
+
+
+async def test_cancel_task_reaches_cancelled_when_owned_records_are_terminal(
+    tmp_path,
+) -> None:
+    client = FakeToolClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+    coordinator.observe_action(
+        task.task_id,
+        invocation_id,
+        {"ok": True, "data": {"phase": "cancelled"}},
+    )
+
+    result = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    assert result.status == AgentTaskStatus.CANCELLED
+    assert client.cancel_calls == []

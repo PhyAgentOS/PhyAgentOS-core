@@ -141,7 +141,7 @@ async def test_dispatch_defensive_llm_handler_preserves_metadata(
         metadata={"message_id": 42, "message_thread_id": 7},
     )
 
-    async def fail(_message: InboundMessage):
+    async def fail(_message: InboundMessage, **kwargs):
         raise LLMCallError("boom")
 
     monkeypatch.setattr(loop, "_process_message", fail)

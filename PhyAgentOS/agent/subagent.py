@@ -54,13 +54,19 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        turn_id: str = "",
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         if self.tool_policy is not None and not self.tool_policy.allows("spawn"):
             raise RuntimeError("delegation is unavailable in interaction mode")
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
-        origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+        origin = {
+            "channel": origin_channel,
+            "chat_id": origin_chat_id,
+            "session_key": session_key or f"{origin_channel}:{origin_chat_id}",
+            "turn_id": turn_id,
+        }
 
         bg_task = asyncio.create_task(
             self._run_subagent(task_id, task, display_label, origin)
@@ -187,12 +193,18 @@ Result:
 
 Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
 
-        # Inject as system message to trigger main agent
+        # Inject as system message into the parent session, not the channel-level one.
+        session_key = origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
+        metadata = {}
+        if origin.get("turn_id"):
+            metadata["origin_turn_id"] = origin["turn_id"]
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
+            metadata=metadata,
+            session_key_override=session_key,
         )
 
         await self.bus.publish_inbound(msg)

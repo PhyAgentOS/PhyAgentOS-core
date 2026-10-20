@@ -7,8 +7,9 @@ import json
 import os
 import re
 import sys
-from collections.abc import MutableSet
-from contextlib import AsyncExitStack
+import uuid
+from collections.abc import AsyncIterator, MutableSet
+from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -27,10 +28,11 @@ from PhyAgentOS.agent.tools.scene_graph import SceneGraphQueryTool
 from PhyAgentOS.agent.tools.shell import ExecTool
 from PhyAgentOS.agent.tools.spawn import SpawnTool
 from PhyAgentOS.agent.tools.web import WebFetchTool, WebSearchTool
+from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.embodiment_registry import EmbodimentRegistry
-from PhyAgentOS.providers.base import LLMCallError, LLMProvider
+from PhyAgentOS.providers.base import LLMCallError, LLMProvider, StreamEvent
 from PhyAgentOS.providers.providers_manager import ProvidersManager
 from PhyAgentOS.providers.service import (
     ProviderError,
@@ -39,6 +41,7 @@ from PhyAgentOS.providers.service import (
     SessionRuntimes,
 )
 from PhyAgentOS.session.manager import Session, SessionManager
+from PhyAgentOS.utils.helpers import estimate_message_tokens, estimate_prompt_tokens_chain
 
 if TYPE_CHECKING:
     from PhyAgentOS.config.schema import (
@@ -201,6 +204,7 @@ class AgentLoop:
         self._mcp_connecting = False
         self._forge_reconciled = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._cancel_results: dict[str, tuple[int, int]] = {}
         self._processing_lock = asyncio.Lock()
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
@@ -307,16 +311,25 @@ class AgentLoop:
         chat_id: str,
         message_id: str | None = None,
         session_key: str | None = None,
+        turn_id: str = "",
     ) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
-            if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+        key = session_key or f"{channel}:{chat_id}"
+        if tool := self.tools.get("message"):
+            if hasattr(tool, "set_context"):
+                tool.set_context(
+                    channel, chat_id, message_id, session_key=key, turn_id=turn_id
+                )
+        if tool := self.tools.get("spawn"):
+            if hasattr(tool, "set_context"):
+                tool.set_context(channel, chat_id, session_key=key, turn_id=turn_id)
+        if tool := self.tools.get("cron"):
+            if hasattr(tool, "set_context"):
+                tool.set_context(channel, chat_id)
         if tool := self.tools.get("forge_task_create"):
-            tool.set_context(session_key or f"{channel}:{chat_id}")
+            tool.set_context(key)
         if tool := self.tools.get("activate_skill"):
-            tool.set_context(session_key or f"{channel}:{chat_id}")
+            tool.set_context(key, turn_id)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -336,100 +349,267 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    def _input_budget_error(
+        self,
+        provider: LLMProvider,
+        model: str,
+        messages: list[dict],
+        tool_defs: list[dict],
+    ) -> str | None:
+        """Return a failure message when the prompt cannot fit the context window."""
+        window = self.context_window_tokens
+        if window <= 0:
+            return None
+        estimated, source = estimate_prompt_tokens_chain(
+            provider, model, messages, tool_defs
+        )
+        if estimated <= 0:
+            estimated = sum(estimate_message_tokens(message) for message in messages)
+            source = "message_estimate"
+        if estimated <= 0:
+            return None
+        generation = getattr(provider, "generation", None) or getattr(
+            self.provider, "generation", None
+        )
+        reserve = int(getattr(generation, "max_tokens", 0) or 0) or 4096
+        if estimated + reserve <= window:
+            return None
+        return (
+            f"上下文超出预算: estimated prompt tokens {estimated} ({source}) + "
+            f"reserved output tokens {reserve} > context window {window}"
+        )
+
+    async def _chat_stream_events(
+        self,
+        provider: LLMProvider,
+        messages: list[dict],
+        tool_defs: list[dict],
+        model: str,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream one completion, replaying ``chat_with_retry`` when unsupported."""
+        stream = getattr(provider, "chat_stream", None)
+        if callable(stream):
+            # Match chat_with_retry's generation defaults: native stream
+            # implementations take explicit parameters.
+            generation = getattr(provider, "generation", None)
+            settings = {}
+            if generation is not None:
+                settings = {
+                    "max_tokens": generation.max_tokens,
+                    "temperature": generation.temperature,
+                    "reasoning_effort": generation.reasoning_effort,
+                }
+            async for event in stream(
+                messages=messages, tools=tool_defs, model=model, **settings
+            ):
+                yield event
+            return
+
+        response = await provider.chat_with_retry(
+            messages=messages,
+            tools=tool_defs,
+            model=model,
+        )
+        if response.finish_reason == "error":
+            yield StreamEvent(
+                type="error",
+                content=response.content,
+                finish_reason="error",
+            )
+            return
+        if response.content:
+            yield StreamEvent(type="delta", content=response.content)
+        for tool_call in response.tool_calls:
+            yield StreamEvent(type="tool_call", tool_call=tool_call)
+        yield StreamEvent(
+            type="done",
+            finish_reason=response.finish_reason,
+            usage=dict(response.usage),
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+        )
+
+    @staticmethod
+    def _log_usage(usage: dict[str, int], turn_id: str) -> None:
+        """Record provider-reported usage without touching credentials."""
+        logger.info(
+            "LLM usage turn={} prompt={} completion={} total={}",
+            turn_id or "-",
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            usage.get("total_tokens", 0),
+        )
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
         experience_session_key: str | None = None,
         runtime: RuntimeSelection | None = None,
+        on_event: Callable[[AgentEvent], Awaitable[None]] | None = None,
+        turn_id: str = "",
     ) -> tuple[str | None, list[str], list[dict]]:
-        """Run the agent iteration loop."""
+        """Run the agent iteration loop, streaming deltas and tool progress."""
         messages = initial_messages
         iteration = 0
         final_content = None
+        finish_reason = "stop"
         tools_used: list[str] = []
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         # Pin the entire turn, including retries and tool iterations, to one
         # selection. Session commands only replace the next turn's selection.
         provider = runtime.provider if runtime else self.provider
         model = runtime.model if runtime else self.model
 
-        while iteration < self.max_iterations:
-            iteration += 1
+        async def emit(
+            event_type: AgentEventType,
+            content: str | None = None,
+            **kwargs,
+        ) -> None:
+            if on_event is None:
+                return
+            await on_event(AgentEvent(
+                type=event_type,
+                content=content,
+                turn_id=turn_id or None,
+                **kwargs,
+            ))
 
-            tool_defs = self.tools.get_definitions()
+        try:
+            await emit(AgentEventType.TURN_STARTED)
 
-            response = await provider.chat_with_retry(
-                messages=messages,
-                tools=tool_defs,
-                model=model,
-            )
+            while iteration < self.max_iterations:
+                iteration += 1
 
-            if response.finish_reason == "error":
-                # A failed call is not an answer. Transient failures have already spent
-                # `chat_with_retry`'s retries here; permanent ones (a 400 the endpoint will
-                # reject again) arrive unretried on the first attempt. Either way, surfacing
-                # it beats the alternative this branch used to take: ending the turn with
-                # the provider's error text as the assistant's reply, which the session, the
-                # transcript and the caller all read as a real completion. The partial
-                # conversation rides on the exception so callers can persist what the turn
-                # did manage to do before replying.
-                logger.error(
-                    "LLM call failed, abandoning turn: {}",
-                    (response.content or "no detail")[:200],
+                tool_defs = self.tools.get_definitions()
+
+                budget_error = self._input_budget_error(
+                    provider, model, messages, tool_defs
                 )
-                raise LLMCallError(
-                    response.content or "provider returned no detail", messages=messages
-                )
+                if budget_error is not None:
+                    logger.error("Input budget exceeded: {}", budget_error)
+                    await emit(AgentEventType.ERROR, budget_error)
+                    raise LLMCallError(budget_error, messages=messages)
 
-            if response.has_tool_calls:
-                if on_progress:
-                    thought = self._strip_think(response.content)
-                    if thought:
-                        await on_progress(thought)
-                    await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                deltas: list[str] = []
+                tool_calls = []
+                stream_usage: dict[str, int] = {}
+                stream_error: str | None = None
+                reasoning_content: str | None = None
+                thinking_blocks: list[dict] | None = None
+                finish_reason = "stop"
 
-                tool_call_dicts = [
-                    tc.to_openai_tool_call()
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
+                async for event in self._chat_stream_events(
+                    provider, messages, tool_defs, model
+                ):
+                    if event.type == "delta":
+                        if event.content:
+                            deltas.append(event.content)
+                            await emit(AgentEventType.TEXT_DELTA, event.content)
+                    elif event.type == "tool_call":
+                        if event.tool_call is not None:
+                            tool_calls.append(event.tool_call)
+                    elif event.type == "usage":
+                        if event.usage:
+                            stream_usage = dict(event.usage)
+                    elif event.type == "error":
+                        stream_error = event.content or "provider returned no detail"
+                        break
+                    elif event.type == "done":
+                        finish_reason = event.finish_reason or "stop"
+                        if event.usage:
+                            stream_usage = dict(event.usage)
+                        reasoning_content = event.reasoning_content
+                        thinking_blocks = event.thinking_blocks
+                        break
 
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    if experience_session_key is not None:
-                        self.skill_activation.record_tool(
-                            experience_session_key, tool_call.name, tool_call.arguments
-                        )
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                if stream_error is not None:
+                    # A failed call is not an answer. Surface it as an error event
+                    # and let the caller persist the partial turn before replying.
+                    logger.error(
+                        "LLM call failed, abandoning turn: {}", stream_error[:200]
                     )
-            else:
-                clean = self._strip_think(response.content)
-                # Error responses never reach here: they raise above, before anything is
-                # appended or persisted. That keeps them out of session history, which is
-                # what the previous handling in this branch was protecting against (#1303).
-                messages = self.context.add_assistant_message(
-                    messages, clean, reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
+                    await emit(AgentEventType.ERROR, stream_error)
+                    raise LLMCallError(stream_error, messages=messages)
+
+                if stream_usage:
+                    self._log_usage(stream_usage, turn_id)
+                    for key in total_usage:
+                        total_usage[key] += int(stream_usage.get(key, 0))
+
+                response_content = "".join(deltas) or None
+
+                if tool_calls:
+                    if on_progress:
+                        thought = self._strip_think(response_content)
+                        if thought:
+                            await on_progress(thought)
+                        await on_progress(self._tool_hint(tool_calls), tool_hint=True)
+
+                    tool_call_dicts = [tc.to_openai_tool_call() for tc in tool_calls]
+                    messages = self.context.add_assistant_message(
+                        messages, response_content, tool_call_dicts,
+                        reasoning_content=reasoning_content,
+                        thinking_blocks=thinking_blocks,
+                    )
+
+                    for tool_call in tool_calls:
+                        tools_used.append(tool_call.name)
+                        if experience_session_key is not None:
+                            self.skill_activation.record_tool(
+                                experience_session_key, tool_call.name, tool_call.arguments
+                            )
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        hint = self._tool_hint([tool_call])
+                        logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                        await emit(
+                            AgentEventType.TOOL_PROGRESS,
+                            hint,
+                            tool_name=tool_call.name,
+                            metadata={"phase": "start"},
+                        )
+                        result = await self.tools.execute(
+                            tool_call.name, tool_call.arguments
+                        )
+                        await emit(
+                            AgentEventType.TOOL_PROGRESS,
+                            f"{hint} (done)",
+                            tool_name=tool_call.name,
+                            metadata={"phase": "done"},
+                        )
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result
+                        )
+                else:
+                    clean = self._strip_think(response_content)
+                    # Error responses never reach here: they raise above, before
+                    # anything is appended or persisted (#1303).
+                    messages = self.context.add_assistant_message(
+                        messages, clean,
+                        reasoning_content=reasoning_content,
+                        thinking_blocks=thinking_blocks,
+                    )
+                    final_content = clean
+                    break
+
+            if final_content is None and iteration >= self.max_iterations:
+                logger.warning("Max iterations ({}) reached", self.max_iterations)
+                finish_reason = "max_iterations"
+                final_content = (
+                    f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
+                    "without completing the task. You can try breaking the task into smaller steps."
                 )
-                final_content = clean
-                break
 
-        if final_content is None and iteration >= self.max_iterations:
-            logger.warning("Max iterations ({}) reached", self.max_iterations)
-            final_content = (
-                f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
-                "without completing the task. You can try breaking the task into smaller steps."
+            await emit(
+                AgentEventType.TURN_DONE,
+                finish_reason=finish_reason,
+                usage=dict(total_usage),
             )
-
-        return final_content, tools_used, messages
+            return final_content, tools_used, messages
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await emit(AgentEventType.CANCELLED)
+            raise
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -454,10 +634,27 @@ class AgentLoop:
                 await self.bus.publish_outbound(response)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                self._register_active_task(msg.session_key, task)
 
-    async def _handle_stop(self, msg: InboundMessage) -> None:
+    async def _cancel_session_side_effects(self, session_key: str) -> tuple[int, int]:
+        """Cancel subagents and the Forge AgentTask bound to a session.
+
+        This never touches ``_active_tasks``, so a turn can call it from its
+        own ``CancelledError`` handler without cancelling itself recursively.
+        """
+        sub_cancelled = await self.subagents.cancel_by_session(session_key)
+        forge_cancelled = 0
+        if self.forge_task_coordinator is not None:
+            record = self.forge_task_coordinator.store.active()
+            if record is not None and record.origin_session_key == session_key:
+                await self.forge_task_coordinator.cancel_task(
+                    record.task_id, reason="user_stop"
+                )
+                forge_cancelled = 1
+        self._cancel_results[session_key] = (sub_cancelled, forge_cancelled)
+        return sub_cancelled, forge_cancelled
+
+    async def _handle_stop(self, msg: InboundMessage, *, notify: bool = True) -> None:
         """Cancel all active tasks and subagents for the session."""
         tasks = self._active_tasks.pop(msg.session_key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
@@ -466,16 +663,17 @@ class AgentLoop:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
-        forge_cancelled = 0
-        if self.forge_task_coordinator is not None:
-            record = self.forge_task_coordinator.store.active()
-            if record is not None and record.origin_session_key == msg.session_key:
-                await self.forge_task_coordinator.cancel_task(
-                    record.task_id, reason="user_stop"
-                )
-                forge_cancelled = 1
+        if cancelled:
+            sub_cancelled, forge_cancelled = self._cancel_results.pop(
+                msg.session_key, (0, 0)
+            )
+        else:
+            sub_cancelled, forge_cancelled = await self._cancel_session_side_effects(
+                msg.session_key
+            )
         local_stopped = cancelled + sub_cancelled
+        if not notify:
+            return
         if forge_cancelled:
             content = (
                 f"Stopped {local_stopped} local task(s); requested cancellation for "
@@ -503,38 +701,123 @@ class AgentLoop:
 
         asyncio.create_task(_do_restart())
 
-    async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
+    def _register_active_task(self, session_key: str, task: asyncio.Task) -> None:
+        """Track a running turn so /stop can find and cancel it."""
+        self._active_tasks.setdefault(session_key, []).append(task)
+
+        def _cleanup(done: asyncio.Task) -> None:
+            tasks = self._active_tasks.get(session_key)
+            if tasks is None:
+                return
+            if done in tasks:
+                tasks.remove(done)
+            if not tasks:
+                self._active_tasks.pop(session_key, None)
+
+        task.add_done_callback(_cleanup)
+
+    async def _dispatch(
+        self,
+        msg: InboundMessage,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        publish: bool = True,
+        on_event: Callable[[AgentEvent], Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
+        """Process a message under the global lock.
+
+        ``publish=False`` returns the reply to the caller without putting it on
+        the outbound queue; ``process_direct`` uses that so cron/heartbeat do
+        not deliver the same reply twice. Streaming events go to ``on_event``
+        when given, and to the bus for CLI publishers.
+        """
+        stream_to_bus = publish and msg.channel == "cli"
+        deferred_terminal: list[AgentEvent] = []
+
+        async def _send_event(event: AgentEvent) -> None:
+            if on_event is not None:
+                await on_event(event)
+            if stream_to_bus:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=event.content or "",
+                    metadata=dict(msg.metadata or {}, _progress=True),
+                    event=event,
+                ))
+
+        async def _publish_event(event: AgentEvent) -> None:
+            # Terminal events wait until the reply itself is on the queue, so a
+            # CLI that ends its turn on turn_done never races the reply.
+            if event.type in (
+                AgentEventType.TURN_DONE,
+                AgentEventType.ERROR,
+                AgentEventType.CANCELLED,
+            ):
+                deferred_terminal.append(event)
+            else:
+                await _send_event(event)
+
+        async def _flush_terminal() -> None:
+            while deferred_terminal:
+                await _send_event(deferred_terminal.pop(0))
+
+        event_callback = _publish_event if (on_event is not None or stream_to_bus) else None
+
+        try:
+            async with self._processing_lock:
+                response = await self._process_message(
+                    msg, on_progress=on_progress, on_event=event_callback
+                )
+                if publish:
+                    if response is not None:
+                        await self.bus.publish_outbound(response)
+                    elif msg.channel == "cli" and event_callback is None:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="", metadata=msg.metadata or {},
+                        ))
+                await _flush_terminal()
+                return response
+        except asyncio.CancelledError:
+            logger.info("Task cancelled for session {}", msg.session_key)
             try:
-                response = await self._process_message(msg)
-                if response is not None:
-                    await self.bus.publish_outbound(response)
-                elif msg.channel == "cli":
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
-                    ))
-            except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
-                raise
-            except LLMCallError as exc:
-                # Defensive net: _process_message normally absorbs these into a
-                # failure reply (persisting the partial turn first). If a future
-                # path lets one escape, still answer instead of crashing the
-                # dispatcher — callers like cron and heartbeat have no handler.
-                logger.error("LLM call failed for session {}: {}", msg.session_key, exc.detail)
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=f"LLM call failed: {exc.detail}",
-                    metadata=dict(msg.metadata or {}),
-                ))
-            except Exception:
-                logger.exception("Error processing message for session {}", msg.session_key)
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
-                ))
+                await self._cancel_session_side_effects(msg.session_key)
+            except Exception as exc:
+                logger.warning(
+                    "Session side-effect cancellation failed for {}: {}",
+                    msg.session_key,
+                    type(exc).__name__,
+                )
+            with suppress(Exception):
+                await _flush_terminal()
+            raise
+        except LLMCallError as exc:
+            # Defensive net: _process_message normally absorbs these into a
+            # failure reply (persisting the partial turn first). If a future
+            # path lets one escape, still answer instead of crashing the
+            # dispatcher — callers like cron and heartbeat have no handler.
+            logger.error("LLM call failed for session {}: {}", msg.session_key, exc.detail)
+            reply = OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"LLM call failed: {exc.detail}",
+                metadata=dict(msg.metadata or {}),
+            )
+            if publish:
+                await self.bus.publish_outbound(reply)
+            with suppress(Exception):
+                await _flush_terminal()
+            return reply
+        except Exception:
+            logger.exception("Error processing message for session {}", msg.session_key)
+            reply = OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Sorry, I encountered an error.",
+            )
+            if publish:
+                await self.bus.publish_outbound(reply)
+            with suppress(Exception):
+                await _flush_terminal()
+            return reply
 
     def _runtime_command(
         self, msg: InboundMessage, session_key: str | None = None,
@@ -587,8 +870,12 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_event: Callable[[AgentEvent], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
+        if not msg.turn_id:
+            msg.turn_id = uuid.uuid4().hex
+        turn_id = msg.turn_id
         command_response = self._runtime_command(msg, session_key)
         if command_response is not None:
             return command_response
@@ -603,7 +890,7 @@ class AgentLoop:
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
                                 else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
-            key = msg.session_key_override or f"{channel}:{chat_id}"
+            key = session_key or msg.session_key_override or f"{channel}:{chat_id}"
             self.skill_activation.begin_turn(key, msg.content)
             task_ref = msg.metadata.get("agent_task_id") or msg.metadata.get(
                 "forge_session_id"
@@ -619,7 +906,11 @@ class AgentLoop:
                 chat_id,
                 msg.metadata.get("message_id"),
                 key,
+                turn_id,
             )
+            if message_tool := self.tools.get("message"):
+                if isinstance(message_tool, MessageTool):
+                    message_tool.start_turn()
             history = session.get_history(max_messages=0)
             messages = self.context.build_messages(
                 history=history,
@@ -627,7 +918,10 @@ class AgentLoop:
             )
             try:
                 final_content, _, all_msgs = await self._run_agent_loop(
-                    messages, experience_session_key=key
+                    messages,
+                    experience_session_key=key,
+                    on_event=on_event,
+                    turn_id=turn_id,
                 )
             except LLMCallError as exc:
                 return self._abort_turn(
@@ -636,6 +930,8 @@ class AgentLoop:
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+                return None
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -692,6 +988,7 @@ class AgentLoop:
             msg.chat_id,
             msg.metadata.get("message_id"),
             key,
+            turn_id,
         )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -714,11 +1011,18 @@ class AgentLoop:
             ))
 
         try:
+            # Streaming events supersede the legacy progress callbacks; keep
+            # the old path for callers that only pass on_progress.
+            progress_callback = on_progress or (
+                None if on_event is not None else _bus_progress
+            )
             final_content, _, all_msgs = await self._run_agent_loop(
                 initial_messages,
-                on_progress=on_progress or _bus_progress,
+                on_progress=progress_callback,
                 experience_session_key=key,
                 runtime=runtime,
+                on_event=on_event,
+                turn_id=turn_id,
             )
         except LLMCallError as exc:
             return self._abort_turn(
@@ -809,14 +1113,56 @@ class AgentLoop:
         self,
         content: str,
         session_key: str = "cli:direct",
-        channel: str = "cli",
-        chat_id: str = "direct",
+        channel: str | None = None,
+        chat_id: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        on_event: Callable[[AgentEvent], Awaitable[None]] | None = None,
     ) -> str:
-        """Process a message directly (for CLI or cron usage)."""
+        """Process a message directly (for CLI, cron or heartbeat usage).
+
+        Runs through ``_dispatch`` so the turn takes the processing lock and is
+        tracked in ``_active_tasks`` (and therefore cancellable by ``/stop``).
+        The reply is returned instead of published, because these callers
+        deliver it themselves.
+        """
         if self.forge_task_coordinator is not None:
             self.forge_task_coordinator.interaction.long_lived = self._running
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        if channel is None or chat_id is None:
+            derived_channel, _, derived_chat = session_key.partition(":")
+            if not derived_chat:
+                derived_channel, derived_chat = "cli", "direct"
+            channel = channel if channel is not None else derived_channel
+            chat_id = chat_id if chat_id is not None else derived_chat
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            session_key_override=session_key,
+        )
+        task = asyncio.create_task(
+            self._dispatch(
+                msg,
+                on_progress=on_progress,
+                publish=False,
+                on_event=on_event,
+            )
+        )
+        self._register_active_task(msg.session_key, task)
+        try:
+            response = await task
+        except asyncio.CancelledError:
+            # Cancelling this outer task does not cancel the dispatch task it
+            # started. Cancel it explicitly so the turn runs its CancelledError
+            # branch (side effects, cancelled event) before we leave.
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            logger.info("Direct turn cancelled for session {}", msg.session_key)
+            return ""
         return response.content if response else ""

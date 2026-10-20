@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from contextvars import ContextVar
 from typing import Any
 
 from PhyAgentOS.agent.experience.activation import SkillActivationManager
@@ -12,10 +13,12 @@ from PhyAgentOS.agent.tools.base import Tool
 class ActivateSkillTool(Tool):
     def __init__(self, manager: SkillActivationManager) -> None:
         self.manager = manager
-        self.session_key = "cli:direct"
+        self.session_key: ContextVar[str] = ContextVar(
+            "activate_skill_session_key", default="cli:direct"
+        )
 
-    def set_context(self, session_key: str) -> None:
-        self.session_key = session_key
+    def set_context(self, session_key: str, turn_id: str = "") -> None:
+        self.session_key.set(session_key)
 
     @property
     def name(self) -> str:
@@ -50,7 +53,7 @@ class ActivateSkillTool(Tool):
 
     async def execute(self, name: str, role: str = "primary") -> str:
         result = self.manager.activate(
-            session_key=self.session_key,
+            session_key=self.session_key.get(),
             name=name,
             role=role,
         )

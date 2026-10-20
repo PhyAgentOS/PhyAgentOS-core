@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
@@ -93,6 +94,7 @@ class ToolExecutionRecord(BaseModel):
     ] = "pending"
     invocation_id: str | None = None
     attempt_id: str | None = None
+    cancel_requested: bool = False
     response: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     evidence_refs: list[str] = Field(default_factory=list)
@@ -377,6 +379,7 @@ class AgentTaskCoordinator:
         store: AgentTaskStore | None = None,
         max_replans: int = 2,
         replan_timeout_s: float = 120.0,
+        cancel_grace_s: float = 0.75,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.config = config
@@ -393,6 +396,9 @@ class AgentTaskCoordinator:
         self.interaction = InteractionService(self)
         self.max_replans = max(0, int(max_replans))
         self.replan_timeout_s = max(0.1, float(replan_timeout_s))
+        self.cancel_timeout_s = max(0.1, float(config.request_timeout_s))
+        self.cancel_poll_interval_s = max(0.01, float(config.poll_interval_s))
+        self.cancel_grace_s = max(0.01, float(cancel_grace_s))
 
     def set_experience(self, experience: Any | None) -> None:
         self.experience = experience
@@ -610,12 +616,17 @@ class AgentTaskCoordinator:
         record_id, caller = self._append_execution(
             task_id, tool_id, "action", arguments, tool=tool
         )
+        self._assert_dispatch_window(task_id, record_id)
+        client = self._execution_client(task_id)
         invocation_id: str | None = None
         attempt_id: str | None = None
-        try:
-            response = await self._execution_client(task_id).invoke_action(
+        inner = asyncio.ensure_future(
+            client.invoke_action(
                 tool_id, arguments, caller_id=caller, timeout_ms=timeout_ms
             )
+        )
+        try:
+            response = await asyncio.shield(inner)
             data = _response_data(response)
             invocation_id = data.get("invocation_id")
             attempt_id = data.get("attempt_id")
@@ -627,6 +638,63 @@ class AgentTaskCoordinator:
                     f"{invocation_id}",
                     payload=response,
                 )
+        except asyncio.CancelledError as exc:
+            response, failure = await self._dispatch_after_cancel(inner)
+            remote_invocation_id, remote_attempt_id = _remote_identity(exc)
+            if response is not None:
+                data = _response_data(response)
+                response_id = data.get("invocation_id")
+                response_attempt = data.get("attempt_id")
+                if isinstance(response_id, str) and response_id:
+                    remote_invocation_id = response_id
+                if isinstance(response_attempt, str) and response_attempt:
+                    remote_attempt_id = response_attempt
+            if failure is not None:
+                failed_id, failed_attempt = _remote_identity(failure)
+                remote_invocation_id = remote_invocation_id or failed_id
+                remote_attempt_id = remote_attempt_id or failed_attempt
+            invocation_id = remote_invocation_id or invocation_id
+            attempt_id = remote_attempt_id or attempt_id
+            self._finish_execution(
+                task_id,
+                record_id,
+                status="unknown",
+                invocation_id=invocation_id,
+                attempt_id=attempt_id,
+                response=response,
+                error={
+                    "type": "CancelledError",
+                    "message": (
+                        "Action dispatch was cancelled; remote state is unknown and "
+                        "the request was not resent"
+                        + (
+                            ""
+                            if invocation_id
+                            else "; Gateway invocation identity could not be confirmed"
+                        )
+                    ),
+                },
+            )
+            if invocation_id and self.runtime_invocation_ids is not None:
+                self._track_remote_identity(
+                    task_id,
+                    record_id,
+                    invocation_id,
+                    tracker=self.runtime_invocation_ids,
+                    response={
+                        "ok": False,
+                        "error": {
+                            "type": "CancelledError",
+                            "message": "dispatch cancelled; remote state is unknown",
+                        },
+                    },
+                    kind="Action",
+                )
+            if invocation_id:
+                record = _task_execution(self.store.get(task_id), record_id)
+                await self._request_remote_stop(task_id, record, client=client)
+                self._settle_cancellation(task_id)
+            raise
         except Exception as exc:
             remote_invocation_id, remote_attempt_id = _remote_identity(exc)
             invocation_id = remote_invocation_id or invocation_id
@@ -663,6 +731,14 @@ class AgentTaskCoordinator:
             record.updated_at = utc_now()
 
         self.store.update(task_id, mutate, event_type="action_accepted")
+        current = self.store.get(task_id)
+        accepted_record = _task_execution(current, record_id)
+        if (
+            current.cancellation_requested
+            or current.status != AgentTaskStatus.EXECUTING
+        ) and not accepted_record.cancel_requested:
+            await self._request_remote_stop(task_id, accepted_record, client=client)
+            self._settle_cancellation(task_id)
         return self._track_remote_identity(
             task_id,
             record_id,
@@ -720,6 +796,7 @@ class AgentTaskCoordinator:
 
         def mutate(current: AgentTaskRecord) -> None:
             target = _task_execution(current, record.record_id)
+            target.cancel_requested = True
             target.response = response
             target.updated_at = utc_now()
 
@@ -747,12 +824,15 @@ class AgentTaskCoordinator:
             tool=tool,
             ownership=ownership,
         )
+        self._assert_dispatch_window(task_id, record_id)
+        client = self._execution_client(task_id)
         invocation_id: str | None = None
         attempt_id: str | None = None
+        inner = asyncio.ensure_future(
+            client.start_session(tool_id, arguments, caller_id=caller)
+        )
         try:
-            response = await self._execution_client(task_id).start_session(
-                tool_id, arguments, caller_id=caller
-            )
+            response = await asyncio.shield(inner)
             data = _response_data(response)
             invocation_id = data.get("invocation_id")
             attempt_id = data.get("attempt_id")
@@ -760,6 +840,63 @@ class AgentTaskCoordinator:
                 raise AgentTaskError("Gateway Session response omitted invocation_id")
             if not isinstance(attempt_id, str):
                 attempt_id = None
+        except asyncio.CancelledError as exc:
+            response, failure = await self._dispatch_after_cancel(inner)
+            remote_invocation_id, remote_attempt_id = _remote_identity(exc)
+            if response is not None:
+                data = _response_data(response)
+                response_id = data.get("invocation_id")
+                response_attempt = data.get("attempt_id")
+                if isinstance(response_id, str) and response_id:
+                    remote_invocation_id = response_id
+                if isinstance(response_attempt, str) and response_attempt:
+                    remote_attempt_id = response_attempt
+            if failure is not None:
+                failed_id, failed_attempt = _remote_identity(failure)
+                remote_invocation_id = remote_invocation_id or failed_id
+                remote_attempt_id = remote_attempt_id or failed_attempt
+            invocation_id = remote_invocation_id or invocation_id
+            attempt_id = remote_attempt_id or attempt_id
+            self._finish_execution(
+                task_id,
+                record_id,
+                status="unknown",
+                invocation_id=invocation_id,
+                attempt_id=attempt_id,
+                response=response,
+                error={
+                    "type": "CancelledError",
+                    "message": (
+                        "Session start was cancelled; remote state is unknown and "
+                        "the request was not resent"
+                        + (
+                            ""
+                            if invocation_id
+                            else "; Gateway invocation identity could not be confirmed"
+                        )
+                    ),
+                },
+            )
+            if invocation_id and self.runtime_session_ids is not None:
+                self._track_remote_identity(
+                    task_id,
+                    record_id,
+                    invocation_id,
+                    tracker=self.runtime_session_ids,
+                    response={
+                        "ok": False,
+                        "error": {
+                            "type": "CancelledError",
+                            "message": "dispatch cancelled; remote state is unknown",
+                        },
+                    },
+                    kind="Session",
+                )
+            if invocation_id:
+                record = _task_execution(self.store.get(task_id), record_id)
+                await self._request_remote_stop(task_id, record, client=client)
+                self._settle_cancellation(task_id)
+            raise
         except Exception as exc:
             remote_invocation_id, remote_attempt_id = _remote_identity(exc)
             invocation_id = remote_invocation_id or invocation_id
@@ -796,6 +933,14 @@ class AgentTaskCoordinator:
             record.updated_at = utc_now()
 
         self.store.update(task_id, mutate, event_type="session_accepted")
+        current = self.store.get(task_id)
+        accepted_record = _task_execution(current, record_id)
+        if (
+            current.cancellation_requested
+            or current.status != AgentTaskStatus.EXECUTING
+        ) and not accepted_record.cancel_requested:
+            await self._request_remote_stop(task_id, accepted_record, client=client)
+            self._settle_cancellation(task_id)
         return self._track_remote_identity(
             task_id,
             record_id,
@@ -857,6 +1002,27 @@ class AgentTaskCoordinator:
         task = self.store.get(task_id)
         if task.terminal:
             return task
+
+        reason_text = reason.strip()
+
+        def mark(current: AgentTaskRecord) -> None:
+            if current.terminal:
+                return
+            current.cancellation_requested = True
+            current.evidence_errors.append(f"task cancellation requested: {reason_text}")
+            current.status = (
+                AgentTaskStatus.CANCELLING
+                if _has_owned_execution(current)
+                else AgentTaskStatus.CANCELLED
+            )
+
+        # The durable gate closes before any await, so no new Action can be admitted
+        # while remote cancel/stop requests are in flight.
+        task = self.store.update(task_id, mark, event_type="task_cancel_requested")
+        if task.terminal:
+            self._schedule_experience(task)
+            return task
+
         pending = [
             item
             for item in task.execution_records
@@ -864,48 +1030,31 @@ class AgentTaskCoordinator:
                 item.semantics == "action"
                 or (item.semantics == "session" and item.ownership == "task")
             )
-            and not item.terminal
             and item.invocation_id
+            and not item.cancel_requested
+            and (not item.terminal or item.status == "unknown")
         ]
-        responses: dict[str, Any] = {}
-        for item in pending:
-            invocation_id = item.invocation_id
-            assert invocation_id is not None
-            try:
-                responses[invocation_id] = (
-                    await self._execution_client(task_id).stop_session(invocation_id)
-                    if item.semantics == "session"
-                    else await self._execution_client(task_id).cancel_invocation(invocation_id)
+        if pending:
+            client = self._execution_client(task_id)
+            # Independent bounded stops run concurrently so several invocations do not
+            # serialize one full Gateway timeout each.
+            await asyncio.gather(
+                *(
+                    self._request_remote_stop(task_id, item, client=client)
+                    for item in pending
                 )
-            except Exception as exc:
-                responses[invocation_id] = {
-                    "ok": False,
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
-                }
-
-        def mutate(current: AgentTaskRecord) -> None:
-            current.cancellation_requested = True
-            has_owned_execution = any(
-                item.semantics == "action"
-                or (item.semantics == "session" and item.ownership == "task")
-                for item in current.execution_records
             )
+
+        def finish(current: AgentTaskRecord) -> None:
+            if current.terminal:
+                return
             current.status = (
                 AgentTaskStatus.CANCELLING
-                if pending or has_owned_execution
+                if _has_nonterminal_owned_execution(current)
                 else _cancel_terminal_status(current)
             )
-            current.evidence_errors.append(f"task cancellation requested: {reason.strip()}")
-            for invocation_id, response in responses.items():
-                target = next(
-                    item for item in current.execution_records if item.invocation_id == invocation_id
-                )
-                target.response = response
-                target.updated_at = utc_now()
 
-        result = self.store.update(
-            task_id, mutate, event_type="task_cancel_requested"
-        )
+        result = self.store.update(task_id, finish, event_type="task_cancel_dispatched")
         if result.terminal:
             self._schedule_experience(result)
         return result
@@ -1060,7 +1209,12 @@ class AgentTaskCoordinator:
         if binding is not None and self.runtime_task_binding_ids is not None:
             self.runtime_task_binding_ids.add(binding.binding_id)
         for record in task.execution_records:
-            if record.terminal or record.semantics == "query":
+            if record.semantics == "query":
+                continue
+            unknown_with_identity = (
+                record.status == "unknown" and bool(record.invocation_id)
+            )
+            if record.terminal and not unknown_with_identity:
                 continue
             if not record.invocation_id:
                 self._finish_execution(
@@ -1082,6 +1236,9 @@ class AgentTaskCoordinator:
             )
             if tracker is not None:
                 tracker.add(record.invocation_id)
+            if unknown_with_identity:
+                await self._reconcile_unknown(task.task_id, record)
+                continue
             try:
                 response = await self._execution_client(task.task_id).invocation_status(record.invocation_id)
             except Exception as exc:
@@ -1100,17 +1257,38 @@ class AgentTaskCoordinator:
                 self.observe_action(task.task_id, record.invocation_id, response)
         return self.store.get(task.task_id)
 
+    async def _reconcile_unknown(
+        self, task_id: str, record: ToolExecutionRecord
+    ) -> None:
+        """Confirm one unknown record with a GET only; never redispatch a POST."""
+        assert record.invocation_id is not None
+        try:
+            response = await self._execution_client(task_id).invocation_status(
+                record.invocation_id
+            )
+        except Exception:
+            return
+        status = _tool_status(response, default="unknown")
+        if status in {"cancelled", "stopped", "failed", "succeeded"}:
+            self._finish_execution(
+                task_id, record.record_id, status=status, response=response
+            )
+
     def _execution_client(self, task_id):
         from PhyAgentOS.forge.interaction.client import trusted_runtime
         runtime = trusted_runtime(self, task_id)
         return runtime.client if runtime is not None else self.client
 
     async def cancel_action(self, task_id: str, invocation_id: str):
-        self.require_action_invocation(task_id, invocation_id)
+        record = self.require_action_invocation(task_id, invocation_id)
         if self.interaction.managed(task_id):
             await self.interaction.cancel(task_id, "action_cancel_requested")
             return {"ok": True, "data": {"status": "requested"}}
-        response = await self.client.cancel_invocation(invocation_id)
+        self._claim_cancel_request(task_id, record.record_id)
+        response = await asyncio.wait_for(
+            self._execution_client(task_id).cancel_invocation(invocation_id),
+            timeout=self.cancel_timeout_s,
+        )
         self.record_cancel_response(task_id, invocation_id, response)
         return response
 
@@ -1121,8 +1299,241 @@ class AgentTaskCoordinator:
             "task-owned Sessions must be stopped before finalization."
         )
 
+    async def _dispatch_after_cancel(
+        self, inner: asyncio.Future
+    ) -> tuple[dict[str, Any] | None, BaseException | None]:
+        """Give an interrupted dispatch a short grace period to reveal its 202 identity."""
+        response: dict[str, Any] | None = None
+        failure: BaseException | None = None
+        try:
+            response = await asyncio.wait_for(
+                asyncio.shield(inner), timeout=self.cancel_grace_s
+            )
+        except asyncio.CancelledError:
+            pass
+        except asyncio.TimeoutError:
+            pass
+        except Exception as exc:
+            failure = exc
+        if response is None and inner.done() and not inner.cancelled():
+            try:
+                response = inner.result()
+                failure = None
+            except Exception as exc:
+                failure = exc
+        if response is None and not inner.done():
+            inner.cancel()
+        return response, failure
+
+    async def _request_remote_stop(
+        self, task_id: str, record: ToolExecutionRecord, *, client: Any
+    ) -> None:
+        if not self._claim_cancel_request(task_id, record.record_id):
+            return
+        invocation_id = record.invocation_id
+        assert invocation_id is not None
+        loop = asyncio.get_running_loop()
+        error: dict[str, Any] | None = None
+        try:
+            call = (
+                client.stop_session(invocation_id)
+                if record.semantics == "session"
+                else client.cancel_invocation(invocation_id)
+            )
+            response = await asyncio.wait_for(call, timeout=self.cancel_timeout_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = {"type": type(exc).__name__, "message": str(exc)}
+            response = {"ok": False, "error": error}
+        self._mark_cancel_response(
+            task_id,
+            record.record_id,
+            response,
+            error=error,
+            semantics=record.semantics,
+        )
+        await self._await_cancel_terminal(
+            task_id,
+            record,
+            client=client,
+            deadline=loop.time() + self.cancel_timeout_s,
+        )
+
+    async def _await_cancel_terminal(
+        self,
+        task_id: str,
+        record: ToolExecutionRecord,
+        *,
+        client: Any,
+        deadline: float,
+    ) -> None:
+        invocation_id = record.invocation_id
+        assert invocation_id is not None
+        loop = asyncio.get_running_loop()
+        terminal_phases = {"cancelled", "stopped", "failed", "succeeded"}
+        last_error: Exception | None = None
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                response = await asyncio.wait_for(
+                    client.invocation_status(invocation_id), timeout=remaining
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not _retryable_poll_error(exc):
+                    self._mark_cancel_unconfirmed(task_id, record.record_id, exc)
+                    return
+                last_error = exc
+                await asyncio.sleep(
+                    min(self.cancel_poll_interval_s, max(0.0, deadline - loop.time()))
+                )
+                continue
+            status = _tool_status(response, default="unknown")
+            if status in terminal_phases:
+                self._finish_execution(
+                    task_id, record.record_id, status=status, response=response
+                )
+                return
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                result = await asyncio.wait_for(
+                    client.invocation_result(invocation_id), timeout=remaining
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not _retryable_poll_error(exc):
+                    self._mark_cancel_unconfirmed(task_id, record.record_id, exc)
+                    return
+                last_error = exc
+                await asyncio.sleep(
+                    min(self.cancel_poll_interval_s, max(0.0, deadline - loop.time()))
+                )
+                continue
+            status = _tool_status(result, default="unknown")
+            if status in terminal_phases:
+                self._finish_execution(
+                    task_id, record.record_id, status=status, response=result
+                )
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(self.cancel_poll_interval_s, remaining))
+        self._mark_cancel_unconfirmed(task_id, record.record_id, last_error)
+
+    def _claim_cancel_request(self, task_id: str, record_id: str) -> bool:
+        """Durably mark a record before the cancel/stop POST so retries do not resend."""
+        claimed = False
+
+        def mutate(current: AgentTaskRecord) -> None:
+            nonlocal claimed
+            target = _task_execution(current, record_id)
+            if target.cancel_requested:
+                return
+            target.cancel_requested = True
+            target.updated_at = utc_now()
+            claimed = True
+
+        self.store.update(task_id, mutate, event_type="tool_cancel_requested")
+        return claimed
+
+    def _mark_cancel_response(
+        self,
+        task_id: str,
+        record_id: str,
+        response: dict[str, Any],
+        *,
+        error: dict[str, Any] | None = None,
+        semantics: Literal["query", "action", "session"],
+    ) -> None:
+        def mutate(current: AgentTaskRecord) -> None:
+            target = _task_execution(current, record_id)
+            target.cancel_requested = True
+            target.response = response
+            if error is not None:
+                target.error = error
+            target.updated_at = utc_now()
+
+        event_type = (
+            "session_stop_requested" if semantics == "session" else "action_cancel_requested"
+        )
+        self.store.update(task_id, mutate, event_type=event_type)
+
+    def _settle_cancellation(self, task_id: str) -> AgentTaskRecord:
+        changed = False
+
+        def mutate(current: AgentTaskRecord) -> None:
+            nonlocal changed
+            if current.terminal or not current.cancellation_requested:
+                return
+            current.status = (
+                AgentTaskStatus.CANCELLING
+                if _has_nonterminal_owned_execution(current)
+                else _cancel_terminal_status(current)
+            )
+            changed = True
+
+        result = self.store.update(task_id, mutate, event_type="task_cancel_settled")
+        if changed and result.terminal:
+            self._schedule_experience(result)
+        return result
+
+    def _mark_cancel_unconfirmed(
+        self, task_id: str, record_id: str, exc: Exception | None = None
+    ) -> None:
+        message = (
+            "cancellation was requested but Gateway did not confirm a terminal state; "
+            "cannot confirm remote state and the request was not resent"
+        )
+        error: dict[str, Any] = {"type": "CancellationUnconfirmed", "message": message}
+        if exc is not None:
+            error["cause"] = {"type": type(exc).__name__, "message": str(exc)}
+
+        def mutate(current: AgentTaskRecord) -> None:
+            target = _task_execution(current, record_id)
+            if target.terminal and target.status != "unknown":
+                return
+            target.status = "unknown"
+            target.error = error
+            target.updated_at = utc_now()
+
+        self.store.update(task_id, mutate, event_type="tool_execution_finished")
+
+    def _assert_dispatch_window(self, task_id: str, record_id: str) -> None:
+        """Re-check the durable gate after intent is recorded and before any POST."""
+        task = self.store.get(task_id)
+        if task.cancellation_requested or task.status != AgentTaskStatus.EXECUTING:
+            message = (
+                f"AgentTask {task_id} stopped accepting dispatch before the Gateway "
+                "request was sent; remote state is unchanged and the request was not resent"
+            )
+            aborted_status = (
+                "cancelled"
+                if task.cancellation_requested or task.status == AgentTaskStatus.CANCELLED
+                else "failed"
+            )
+            self._finish_execution(
+                task_id,
+                record_id,
+                status=aborted_status,
+                error={"type": "DispatchAborted", "message": message},
+            )
+            raise AgentTaskError(message)
+
     def _require_executable(self, task_id: str) -> AgentTaskRecord:
         task = self.store.get(task_id)
+        if task.cancellation_requested:
+            raise AgentTaskError(
+                f"AgentTask {task_id} is not accepting Tool calls: cancellation was requested"
+            )
         if task.status != AgentTaskStatus.EXECUTING:
             raise AgentTaskError(
                 f"AgentTask {task_id} is not accepting Tool calls: {task.status.value}"
@@ -1414,6 +1825,40 @@ def _owned_execution(
     )
 
 
+def _has_owned_execution(task: AgentTaskRecord) -> bool:
+    return any(
+        item.semantics == "action"
+        or (item.semantics == "session" and item.ownership == "task")
+        for item in task.execution_records
+    )
+
+
+def _has_nonterminal_owned_execution(task: AgentTaskRecord) -> bool:
+    return any(
+        (
+            item.semantics == "action"
+            or (item.semantics == "session" and item.ownership == "task")
+        )
+        and not item.terminal
+        for item in task.execution_records
+    )
+
+
+def _retryable_poll_error(exc: BaseException) -> bool:
+    if isinstance(exc, AttributeError):
+        return False
+    if isinstance(exc, ForgeToolAPIError):
+        if exc.retryable is False:
+            return False
+        if (
+            exc.status_code is not None
+            and 400 <= exc.status_code < 500
+            and exc.status_code not in {408, 429}
+        ):
+            return False
+    return True
+
+
 def _cancel_terminal_status(task: AgentTaskRecord) -> AgentTaskStatus:
     owned = [
         item
@@ -1443,7 +1888,7 @@ def _execution_facts_succeeded(task: AgentTaskRecord) -> bool:
     )
 
 
-def _remote_identity(exc: Exception) -> tuple[str | None, str | None]:
+def _remote_identity(exc: BaseException) -> tuple[str | None, str | None]:
     payload = getattr(exc, "payload", None)
     data = _response_data(payload) if isinstance(payload, dict) else {}
     invocation_id = data.get("invocation_id")
