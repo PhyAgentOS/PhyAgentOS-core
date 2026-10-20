@@ -329,7 +329,7 @@ class AgentLoop:
         if tool := self.tools.get("forge_task_create"):
             tool.set_context(key)
         if tool := self.tools.get("activate_skill"):
-            tool.set_context(key, turn_id)
+            tool.set_context(key)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -771,11 +771,6 @@ class AgentLoop:
                 if publish:
                     if response is not None:
                         await self.bus.publish_outbound(response)
-                    elif msg.channel == "cli" and event_callback is None:
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=msg.metadata or {},
-                        ))
                 await _flush_terminal()
                 return response
         except asyncio.CancelledError:

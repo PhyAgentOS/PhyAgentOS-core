@@ -17,7 +17,7 @@ class ActivateSkillTool(Tool):
             "activate_skill_session_key", default="cli:direct"
         )
 
-    def set_context(self, session_key: str, turn_id: str = "") -> None:
+    def set_context(self, session_key: str) -> None:
         self.session_key.set(session_key)
 
     @property

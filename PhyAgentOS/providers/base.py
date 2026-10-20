@@ -77,7 +77,6 @@ class StreamEvent:
     tool_call: ToolCallRequest | None = None
     finish_reason: str | None = None
     usage: dict[str, int] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict] | None = None
 
