@@ -153,65 +153,15 @@ class CustomProvider(LLMProvider):
                     kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
                     return await self._client.chat.completions.create(**kwargs)
                 raise
-        raise RuntimeError("unreachable")
 
     async def _stream_once(self, kwargs: dict[str, Any]) -> AsyncIterator[StreamEvent]:
         """Consume one OpenAI SDK stream, assembling tool calls first."""
         stream = await self._open_stream(kwargs)
-        pending: dict[int, dict[str, Any]] = {}
-        usage: dict[str, int] = {}
-        finish_reason: str | None = None
-        reasoning_parts: list[str] = []
-        thinking_blocks: list[dict] = []
-
-        try:
-            async for chunk in stream:
-                chunk_usage = getattr(chunk, "usage", None)
-                if chunk_usage:
-                    usage = self._usage_to_dict(chunk_usage)
-
-                for choice in getattr(chunk, "choices", None) or []:
-                    delta = getattr(choice, "delta", None)
-                    if delta is not None:
-                        content = getattr(delta, "content", None)
-                        if isinstance(content, str) and content:
-                            yield StreamEvent(type="delta", content=content)
-                        self._accumulate_reasoning(
-                            reasoning_parts, thinking_blocks, delta
-                        )
-                        for fragment in getattr(delta, "tool_calls", None) or []:
-                            self._accumulate_tool_fragment(pending, fragment)
-                    reason = getattr(choice, "finish_reason", None)
-                    if reason:
-                        finish_reason = reason
-        finally:
-            await self._close_stream(stream)
-
-        if finish_reason is None:
-            yield StreamEvent(
-                type="error",
-                content="stream ended without finish_reason",
-                finish_reason="error",
-            )
-            return
-
-        tool_calls = self._finalize_tool_calls(
-            pending, lambda index: f"call_{index}"
-        )
-        if isinstance(tool_calls, str):
-            yield StreamEvent(type="error", content=tool_calls, finish_reason="error")
-            return
-        for tool_call in tool_calls:
-            yield StreamEvent(type="tool_call", tool_call=tool_call)
-        if usage:
-            yield StreamEvent(type="usage", usage=dict(usage))
-        yield StreamEvent(
-            type="done",
-            finish_reason=finish_reason,
-            usage=dict(usage),
-            reasoning_content="".join(reasoning_parts) or None,
-            thinking_blocks=thinking_blocks or None,
-        )
+        async with aclosing(
+            self._iter_openai_stream(stream, id_factory=lambda index: f"call_{index}")
+        ) as events:
+            async for event in events:
+                yield event
 
     def _parse(self, response: Any) -> LLMResponse:
         choice = response.choices[0]

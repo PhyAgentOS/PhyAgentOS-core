@@ -251,7 +251,6 @@ async def test_non_streaming_channel_only_receives_final_reply() -> None:
         "plain", "read_file()", event=AgentEvent(
             type=AgentEventType.TOOL_PROGRESS,
             content="read_file()",
-            tool_name="read_file",
         ),
         _progress=True, _tool_hint=True,
     ))

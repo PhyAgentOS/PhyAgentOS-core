@@ -22,8 +22,5 @@ class AgentEvent:
 
     type: AgentEventType
     content: str | None = None
-    tool_name: str | None = None
-    finish_reason: str | None = None
-    usage: dict[str, int] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     turn_id: str | None = None

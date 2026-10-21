@@ -1,4 +1,4 @@
-"""Efficiency guards for real Forge arm skills: duplicate actions, evidence hints, context cache."""
+"""Agent-loop guards for real Forge arm skills: retries and live context."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import copy
 import json
 
 from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.agent.tools import forge_tool_api
 from PhyAgentOS.agent.tools.forge_tool_api import ForgeToolContextTool
 from PhyAgentOS.providers.base import LLMProvider, StreamEvent, ToolCallRequest
 
@@ -20,7 +19,7 @@ class _ScriptedProvider(LLMProvider):
     def get_default_model(self) -> str:
         return "stub-model"
 
-    async def chat(self, *args, **kwargs):
+    async def chat(self, *_args, **_kwargs):
         raise AssertionError("chat() should not be used when chat_stream exists")
 
     async def chat_stream(self, **kwargs):
@@ -90,19 +89,22 @@ def _action(arguments: dict | None = None) -> dict:
     }
 
 
-async def test_third_identical_action_is_blocked_and_execution_stops(tmp_path, monkeypatch) -> None:
+async def test_repeated_identical_actions_are_not_blocked_by_the_loop(
+    tmp_path, monkeypatch
+) -> None:
+    action = _action()
     provider = _ScriptedProvider([
-        [_call("c1", "forge_tool_start_action", _action()), _done()],
-        [_call("c2", "forge_tool_start_action", _action()), _done()],
-        [_call("c3", "forge_tool_start_action", _action()), _done()],
-        [_call("c4", "forge_tool_start_action", _action()), _done()],
+        [_call("c1", "forge_tool_start_action", action), _done()],
+        [_call("c2", "forge_tool_start_action", action), _done()],
+        [_call("c3", "forge_tool_start_action", action), _done()],
+        [_call("c4", "forge_tool_start_action", action), _done()],
         _answer("done"),
     ])
     loop = _loop(provider, tmp_path)
-    executed: list[str] = []
+    executed: list[dict] = []
 
-    async def fake_execute(name, params):
-        executed.append(name)
+    async def fake_execute(_name, params):
+        executed.append(params)
         return json.dumps({"ok": True, "data": {"accepted": True}})
 
     monkeypatch.setattr(loop.tools, "execute", fake_execute)
@@ -110,89 +112,36 @@ async def test_third_identical_action_is_blocked_and_execution_stops(tmp_path, m
     reply = await loop.process_direct("move", "cli:test")
 
     assert reply == "done"
-    assert executed == ["forge_tool_start_action", "forge_tool_start_action"]
-    blocked = [item for item in _tool_results(provider.requests[3]["messages"]) if item.get("blocked")]
-    assert len(blocked) == 1
-    assert "identical action already submitted 2 times" in blocked[0]["reason"]
-    fourth = [item for item in _tool_results(provider.requests[-1]["messages"]) if item.get("blocked")]
-    assert len(fourth) == 2
-    assert "already submitted 3 times" in fourth[-1]["reason"]
+    assert executed == [action, action, action, action]
+    assert not [
+        item for item in _tool_results(provider.requests[-1]["messages"])
+        if item.get("blocked")
+    ]
 
 
-async def test_changed_arguments_restart_the_duplicate_count(tmp_path, monkeypatch) -> None:
+async def test_changed_arguments_are_executed_in_order(tmp_path, monkeypatch) -> None:
     first = _action({"target_pose": {"x": 0.1}})
     second = _action({"target_pose": {"x": 0.2}})
     provider = _ScriptedProvider([
         [_call("c1", "forge_tool_start_action", first), _done()],
-        [_call("c2", "forge_tool_start_action", first), _done()],
-        [_call("c3", "forge_tool_start_action", second), _done()],
-        [_call("c4", "forge_tool_start_action", second), _done()],
+        [_call("c2", "forge_tool_start_action", second), _done()],
         _answer("done"),
     ])
     loop = _loop(provider, tmp_path)
-    executed: list[tuple[str, dict]] = []
+    executed: list[dict] = []
 
-    async def fake_execute(name, params):
-        executed.append((name, params))
+    async def fake_execute(_name, params):
+        executed.append(params)
         return json.dumps({"ok": True})
 
     monkeypatch.setattr(loop.tools, "execute", fake_execute)
 
     await loop.process_direct("move", "cli:test")
 
-    assert [params for _, params in executed] == [first, first, second, second]
-    assert not [
-        item for item in _tool_results(provider.requests[-1]["messages"]) if item.get("blocked")
-    ]
+    assert executed == [first, second]
 
 
-async def test_query_and_status_tools_are_never_suppressed(tmp_path, monkeypatch) -> None:
-    query = {"task_id": "task_1", "tool_id": "motion.resolve_relative_pose", "arguments": {}}
-    status = {"task_id": "task_1", "invocation_id": "inv_1"}
-    provider = _ScriptedProvider([
-        [
-            _call("c1", "forge_tool_query", query),
-            _call("c2", "forge_tool_action_status", status),
-            _call("c3", "forge_tool_action_result", status),
-            _call("c4", "forge_tool_context", {"tool_id": "motion.move_pose"}),
-            _done(),
-        ],
-        [
-            _call("c5", "forge_tool_query", query),
-            _call("c6", "forge_tool_action_status", status),
-            _call("c7", "forge_tool_action_result", status),
-            _call("c8", "forge_tool_context", {"tool_id": "motion.move_pose"}),
-            _done(),
-        ],
-        _answer("done"),
-    ])
-    loop = _loop(provider, tmp_path)
-    executed: list[str] = []
-
-    async def fake_execute(name, params):
-        executed.append(name)
-        return json.dumps({"ok": True})
-
-    monkeypatch.setattr(loop.tools, "execute", fake_execute)
-
-    await loop.process_direct("inspect", "cli:test")
-
-    assert executed == [
-        "forge_tool_query",
-        "forge_tool_action_status",
-        "forge_tool_action_result",
-        "forge_tool_context",
-        "forge_tool_query",
-        "forge_tool_action_status",
-        "forge_tool_action_result",
-        "forge_tool_context",
-    ]
-    assert not [
-        item for item in _tool_results(provider.requests[-1]["messages"]) if item.get("blocked")
-    ]
-
-
-async def test_finalize_evidence_gap_adds_missing_items_without_repeating_action(
+async def test_finalize_evidence_errors_are_left_in_the_tool_result(
     tmp_path, monkeypatch
 ) -> None:
     finalize_result = json.dumps({
@@ -211,10 +160,8 @@ async def test_finalize_evidence_gap_adds_missing_items_without_repeating_action
         _answer("evidence inspected"),
     ])
     loop = _loop(provider, tmp_path)
-    executed: list[str] = []
 
-    async def fake_execute(name, params):
-        executed.append(name)
+    async def fake_execute(_name, _params):
         return finalize_result
 
     monkeypatch.setattr(loop.tools, "execute", fake_execute)
@@ -222,20 +169,13 @@ async def test_finalize_evidence_gap_adds_missing_items_without_repeating_action
     reply = await loop.process_direct("finish", "cli:test")
 
     assert reply == "evidence inspected"
-    assert executed == ["forge_task_finalize"]
     messages = provider.requests[1]["messages"]
-    hints = [
-        message["content"] for message in messages
-        if message.get("role") == "user" and "Evidence Bundle is incomplete" in message.get("content", "")
-    ]
-    assert len(hints) == 1
-    assert "before:snapshot" in hints[0]
-    assert "after:rgb_image:front" in hints[0]
-    assert "forge_task_get(task_id=task_1)" in hints[0]
-    assert "Do not resubmit the same Action" in hints[0]
+    results = _tool_results(messages)
+    assert results == [json.loads(finalize_result)]
     assert not [
-        item for item in _tool_results(messages)
-        if item.get("blocked")
+        message for message in messages
+        if message.get("role") == "user"
+        and "Evidence Bundle is incomplete" in message.get("content", "")
     ]
 
 
@@ -243,7 +183,8 @@ class _FakeContextClient:
     def __init__(self) -> None:
         self.tool_calls = 0
         self.context_calls = 0
-        self.runtime_revision: str | None = "rev_1"
+        self.ready = True
+        self.pose = 0.0
 
     async def get_tool(self, tool_id: str) -> dict:
         self.tool_calls += 1
@@ -251,42 +192,25 @@ class _FakeContextClient:
 
     async def get_tool_context(self, tool_id: str) -> dict:
         self.context_calls += 1
-        return {"ok": True, "data": {"tool_id": tool_id, "ready": True}}
+        return {
+            "ok": True,
+            "data": {"tool_id": tool_id, "ready": self.ready, "pose": self.pose},
+        }
 
 
-async def test_context_cache_serves_repeated_reads_without_client_requests() -> None:
+async def test_forge_tool_context_always_reads_live_context() -> None:
     client = _FakeContextClient()
     tool = ForgeToolContextTool(client)
 
     first = json.loads(await tool.execute("motion.move_pose"))
+    client.ready = False
+    client.pose = 0.25
     second = json.loads(await tool.execute("motion.move_pose"))
 
-    assert first == second
-    assert first["data"]["context"]["ready"] is True
-    assert (client.tool_calls, client.context_calls) == (1, 1)
-
-
-async def test_context_cache_invalidates_on_runtime_revision_change() -> None:
-    client = _FakeContextClient()
-    tool = ForgeToolContextTool(client)
-
-    await tool.execute("motion.move_pose")
-    client.runtime_revision = "rev_2"
-    await tool.execute("motion.move_pose")
-
-    assert (client.tool_calls, client.context_calls) == (2, 2)
-
-
-async def test_context_cache_expires_after_ttl(monkeypatch) -> None:
-    client = _FakeContextClient()
-    tool = ForgeToolContextTool(client)
-    now = [100.0]
-    monkeypatch.setattr(forge_tool_api, "monotonic", lambda: now[0])
-
-    await tool.execute("motion.move_pose")
-    now[0] += 29.0
-    await tool.execute("motion.move_pose")
-    now[0] += 2.0
-    await tool.execute("motion.move_pose")
-
+    assert first["data"]["context"] == {
+        "tool_id": "motion.move_pose", "ready": True, "pose": 0.0,
+    }
+    assert second["data"]["context"] == {
+        "tool_id": "motion.move_pose", "ready": False, "pose": 0.25,
+    }
     assert (client.tool_calls, client.context_calls) == (2, 2)

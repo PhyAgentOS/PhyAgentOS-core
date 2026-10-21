@@ -1313,7 +1313,8 @@ class AgentTaskCoordinator:
         if self.interaction.managed(task_id):
             await self.interaction.cancel(task_id, "action_cancel_requested")
             return {"ok": True, "data": {"status": "requested"}}
-        self._claim_cancel_request(task_id, record.record_id)
+        if not self._claim_cancel_request(task_id, record.record_id):
+            return {"ok": True, "data": {"status": "already_requested"}}
         response = await asyncio.wait_for(
             self._execution_client(task_id).cancel_invocation(invocation_id),
             timeout=self.cancel_timeout_s,

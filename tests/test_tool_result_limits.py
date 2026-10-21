@@ -64,7 +64,7 @@ def test_long_text_is_truncated_and_saved(tmp_path) -> None:
     limiter = ToolResultLimiter(tmp_path)
     body = "A" * 20_000 + "TAIL"
 
-    limited = limiter.limit("call-1", "read_file", body)
+    limited = limiter.limit("call-1", body)
 
     assert len(limited) <= DEFAULT_MAX_CHARS
     assert limited.startswith("A" * 100)
@@ -90,7 +90,7 @@ def test_long_json_keeps_critical_fields(tmp_path) -> None:
     }
     raw = json.dumps(payload, ensure_ascii=False)
 
-    limited = ToolResultLimiter(tmp_path).limit("call-2", "forge_tool", raw)
+    limited = ToolResultLimiter(tmp_path).limit("call-2", raw)
 
     assert len(limited) <= DEFAULT_MAX_CHARS
     data = json.loads(limited)
@@ -124,9 +124,7 @@ def test_forge_result_keeps_safety_fields_when_nested(tmp_path) -> None:
         },
     }
 
-    limited = ToolResultLimiter(tmp_path).limit(
-        "call-3", "forge_task_get", json.dumps(payload)
-    )
+    limited = ToolResultLimiter(tmp_path).limit("call-3", json.dumps(payload))
 
     assert len(limited) <= DEFAULT_MAX_CHARS
     data = json.loads(limited)["data"]
@@ -143,7 +141,7 @@ def test_forge_result_keeps_safety_fields_when_nested(tmp_path) -> None:
 def test_short_result_is_unchanged_and_not_saved(tmp_path) -> None:
     limiter = ToolResultLimiter(tmp_path)
 
-    assert limiter.limit("call-4", "read_file", "small body") == "small body"
+    assert limiter.limit("call-4", "small body") == "small body"
     assert not (tmp_path / ".paos").exists()
 
 
@@ -155,7 +153,7 @@ def test_write_failure_falls_back_to_truncation(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(Path, "write_text", fail_write)
 
-    limited = limiter.limit("call-5", "read_file", "X" * 20_000)
+    limited = limiter.limit("call-5", "X" * 20_000)
 
     assert len(limited) <= DEFAULT_MAX_CHARS
     assert limited.startswith("X" * 100)
@@ -175,9 +173,7 @@ def test_oversized_preserved_fields_still_fit(tmp_path) -> None:
         "logs": "L" * 20_000,
     }
 
-    limited = ToolResultLimiter(tmp_path).limit(
-        "call-6", "forge_task_get", json.dumps(payload)
-    )
+    limited = ToolResultLimiter(tmp_path).limit("call-6", json.dumps(payload))
 
     assert len(limited) <= DEFAULT_MAX_CHARS
     data = json.loads(limited)
@@ -194,8 +190,8 @@ def test_same_tool_call_id_with_different_content_keeps_both_files(tmp_path) -> 
     first = "A" * 9_000
     second = "B" * 9_000
 
-    limiter.limit("shared-call", "read_file", first)
-    limiter.limit("shared-call", "read_file", second)
+    limiter.limit("shared-call", first)
+    limiter.limit("shared-call", second)
 
     saved = _saved_files(tmp_path, "shared-call")
     assert len(saved) == 2
@@ -212,7 +208,7 @@ async def test_limited_result_fits_the_budget_that_original_exceeds(
     ])
     loop = _loop(provider, tmp_path)
 
-    limited = loop.tool_results.limit("call-big", "read_file", long_text)
+    limited = loop.tool_results.limit("call-big", long_text)
     limited_messages = loop.context.build_messages(
         history=[], current_message="go", channel="cli", chat_id="test"
     )
@@ -239,9 +235,10 @@ async def test_limited_result_fits_the_budget_that_original_exceeds(
     reserve = provider.generation.max_tokens
     loop.context_window_tokens = estimated + reserve + 64
 
-    assert loop._input_budget_error(
+    output_budget, budget_error = loop._request_output_budget(
         provider, loop.model, unlimited_messages, tool_defs
-    ) is not None
+    )
+    assert budget_error is not None or (output_budget is not None and output_budget < reserve)
 
     async def fake_execute(name, params):
         return long_text

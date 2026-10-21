@@ -85,7 +85,6 @@ class _ToolCallRun:
     hint: str
     parallel_safe: bool
     result: str | None = None
-    blocked_reason: str | None = None
 
 
 class _TurnCancelledError(asyncio.CancelledError):
@@ -97,82 +96,6 @@ class _TurnCancelledError(asyncio.CancelledError):
 
 
 _MAX_PARALLEL_TOOL_CALLS = 4
-_DUPLICATE_ACTION_LIMIT = 3
-_ACTION_TOOL_NAMES = frozenset({
-    "forge_tool_start_action",
-    "forge_tool_cancel_action",
-    "forge_task_create",
-})
-_ACTION_TOOL_PREFIXES = ("motion.", "gripper.")
-_EVIDENCE_INCOMPLETE_MARKER = "Evidence Bundle is incomplete"
-
-
-def _normalized_arguments(arguments: object) -> str:
-    """Canonical JSON for duplicate detection, independent of key order/spacing."""
-    return json.dumps(
-        arguments,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-
-
-def _is_action_tool(name: str, tool: object = None) -> bool:
-    """Classification for duplicate-action suppression.
-
-    The registry exposes no Tool semantics, so the explicit names are always
-    treated as actions. Prefixed motion/gripper tools only qualify when a Tool
-    wrapper exposes ``semantics == "action"``; query tools with the same prefix
-    must not be suppressed.
-    """
-    if name in _ACTION_TOOL_NAMES:
-        return True
-    if name.startswith(_ACTION_TOOL_PREFIXES):
-        return getattr(tool, "semantics", None) == "action"
-    return False
-
-
-def _evidence_incomplete_hint(runs: list[_ToolCallRun]) -> str | None:
-    """Build a read-only recovery hint when finalize reports missing evidence."""
-    for run in runs:
-        if run.call.name != "forge_task_finalize" or not run.result:
-            continue
-        try:
-            payload = json.loads(run.result)
-        except (TypeError, ValueError):
-            continue
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict):
-            continue
-        errors = data.get("evidence_errors")
-        if not isinstance(errors, list):
-            continue
-        missing: list[str] = []
-        for error in errors:
-            if not isinstance(error, str):
-                continue
-            _, marker, tail = error.partition(_EVIDENCE_INCOMPLETE_MARKER)
-            if not marker:
-                continue
-            missing.extend(
-                part.strip() for part in tail.lstrip(": ").split(",") if part.strip()
-            )
-        if not missing:
-            continue
-        task_id = data.get("task_id")
-        target = f"task_id={task_id!s}" if task_id else "the task_id"
-        return (
-            f"Finalize stopped: Evidence Bundle is incomplete ({', '.join(dict.fromkeys(missing))}). "
-            "Do not resubmit the same Action and do not replay finalize with the same evidence. "
-            f"Use read-only tools first: forge_task_get({target}) to inspect status, "
-            "evidence_errors, before_snapshot_ref and after_snapshot_ref; "
-            "forge_tool_action_status and forge_tool_action_result to confirm terminal state; "
-            "forge_tool_context and forge_tool_query to inspect live observation state. "
-            "Missing evidence comes from the Gateway observation streams (/ws/images, /ws/state); "
-            "the agent cannot create it."
-        )
-    return None
 
 
 def _tool_call_batches(runs: list[_ToolCallRun]) -> list[list[_ToolCallRun]]:
@@ -207,8 +130,9 @@ class AgentLoop:
     5. Sends responses back
     """
 
-    _TOOL_RESULT_MAX_CHARS = 16_000
     _TOOL_CANCELLED_RESULT = "Tool execution cancelled"
+    _OUTPUT_BUDGET_SAFETY_MARGIN = 64
+    _MIN_OUTPUT_TOKENS = 256
 
     def __init__(
         self,
@@ -500,17 +424,22 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
-    def _input_budget_error(
+    def _request_output_budget(
         self,
         provider: LLMProvider,
         model: str,
         messages: list[dict],
         tool_defs: list[dict],
-    ) -> str | None:
-        """Return a failure message when the prompt cannot fit the context window."""
+    ) -> tuple[int | None, str | None]:
+        """Return the output-token cap for this request, or a budget failure.
+
+        The configured max_tokens is an upper bound, not a reservation. When
+        the prompt leaves less room than that, shrink the cap to what actually
+        fits instead of rejecting a request whose prompt is still valid.
+        """
         window = self.context_window_tokens
         if window <= 0:
-            return None
+            return None, None
         estimated, source = estimate_prompt_tokens_chain(
             provider, model, messages, tool_defs
         )
@@ -518,17 +447,29 @@ class AgentLoop:
             estimated = sum(estimate_message_tokens(message) for message in messages)
             source = "message_estimate"
         if estimated <= 0:
-            return None
+            return None, None
         generation = getattr(provider, "generation", None) or getattr(
             self.provider, "generation", None
         )
-        reserve = int(getattr(generation, "max_tokens", 0) or 0) or 4096
-        if estimated + reserve <= window:
-            return None
-        return (
-            f"上下文超出预算: estimated prompt tokens {estimated} ({source}) + "
-            f"reserved output tokens {reserve} > context window {window}"
-        )
+        configured = int(getattr(generation, "max_tokens", 0) or 0) or 4096
+        available = window - estimated - self._OUTPUT_BUDGET_SAFETY_MARGIN
+        minimum = min(self._MIN_OUTPUT_TOKENS, configured)
+        if available < minimum:
+            return None, (
+                f"上下文超出预算: estimated prompt tokens {estimated} ({source}) leaves "
+                f"{max(0, available)} tokens for output, below the minimum {minimum} "
+                f"(context window {window})"
+            )
+        effective = min(configured, available)
+        if effective < configured:
+            logger.info(
+                "Reducing output budget from {} to {} (prompt {} + output <= window {})",
+                configured,
+                effective,
+                estimated,
+                window,
+            )
+        return effective, None
 
     async def _chat_stream_events(
         self,
@@ -536,6 +477,7 @@ class AgentLoop:
         messages: list[dict],
         tool_defs: list[dict],
         model: str,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream one completion, replaying ``chat_with_retry`` when unsupported."""
         stream = getattr(provider, "chat_stream", None)
@@ -546,20 +488,28 @@ class AgentLoop:
             settings = {}
             if generation is not None:
                 settings = {
-                    "max_tokens": generation.max_tokens,
+                    "max_tokens": (
+                        max_tokens if max_tokens is not None else generation.max_tokens
+                    ),
                     "temperature": generation.temperature,
                     "reasoning_effort": generation.reasoning_effort,
                 }
+            elif max_tokens is not None:
+                settings = {"max_tokens": max_tokens}
             async for event in stream(
                 messages=messages, tools=tool_defs, model=model, **settings
             ):
                 yield event
             return
 
+        chat_kwargs = {}
+        if max_tokens is not None:
+            chat_kwargs["max_tokens"] = max_tokens
         response = await provider.chat_with_retry(
             messages=messages,
             tools=tool_defs,
             model=model,
+            **chat_kwargs,
         )
         if response.finish_reason == "error":
             yield StreamEvent(
@@ -614,35 +564,10 @@ class AgentLoop:
         model_call_count = 0
         turn_started = time.monotonic()
         final_content = None
-        finish_reason = "stop"
-        tools_used: list[str] = []
-        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         # Pin the entire turn, including retries and tool iterations, to one
         # selection. Session commands only replace the next turn's selection.
         provider = runtime.provider if runtime else self.provider
         model = runtime.model if runtime else self.model
-        # A turn may repeat the same action across model calls. Only the
-        # currently repeating action key accumulates; a different action key
-        # starts a new run. Read/query calls never touch this state.
-        action_counts: dict[str, int] = {}
-        last_action_key: str | None = None
-
-        def duplicate_action_reason(tool_call: ToolCallRequest, tool: object) -> str | None:
-            nonlocal last_action_key
-            if not _is_action_tool(tool_call.name, tool):
-                return None
-            key = tool_call.name + "\x00" + _normalized_arguments(tool_call.arguments)
-            if key != last_action_key:
-                action_counts.clear()
-                last_action_key = key
-            count = action_counts.get(key, 0) + 1
-            action_counts[key] = count
-            if count < _DUPLICATE_ACTION_LIMIT:
-                return None
-            return (
-                f"identical action already submitted {count - 1} times; "
-                "query status or finalize instead"
-            )
 
         async def emit(
             event_type: AgentEventType,
@@ -675,7 +600,7 @@ class AgentLoop:
 
                 tool_defs = self.tools.get_definitions()
 
-                budget_error = self._input_budget_error(
+                output_budget, budget_error = self._request_output_budget(
                     provider, model, messages, tool_defs
                 )
                 if budget_error is not None:
@@ -689,13 +614,12 @@ class AgentLoop:
                 stream_error: str | None = None
                 reasoning_content: str | None = None
                 thinking_blocks: list[dict] | None = None
-                finish_reason = "stop"
 
                 model_call_count += 1
                 call_id = f"{turn_id or '-'}:{model_call_count}"
 
                 async for event in self._chat_stream_events(
-                    provider, messages, tool_defs, model
+                    provider, messages, tool_defs, model, max_tokens=output_budget
                 ):
                     if event.type == "delta":
                         if event.content:
@@ -704,14 +628,10 @@ class AgentLoop:
                     elif event.type == "tool_call":
                         if event.tool_call is not None:
                             tool_calls.append(event.tool_call)
-                    elif event.type == "usage":
-                        if event.usage:
-                            stream_usage = dict(event.usage)
                     elif event.type == "error":
                         stream_error = event.content or "provider returned no detail"
                         break
                     elif event.type == "done":
-                        finish_reason = event.finish_reason or "stop"
                         if event.usage:
                             stream_usage = dict(event.usage)
                         reasoning_content = event.reasoning_content
@@ -734,8 +654,6 @@ class AgentLoop:
                         call_id=call_id,
                         duration_s=time.monotonic() - turn_started,
                     )
-                    for key in total_usage:
-                        total_usage[key] += int(stream_usage.get(key, 0))
 
                 response_content = "".join(deltas) or None
 
@@ -755,7 +673,6 @@ class AgentLoop:
 
                     runs: list[_ToolCallRun] = []
                     for tool_call in tool_calls:
-                        tools_used.append(tool_call.name)
                         if experience_session_key is not None:
                             self.skill_activation.record_tool(
                                 experience_session_key, tool_call.name, tool_call.arguments
@@ -770,39 +687,24 @@ class AgentLoop:
                             parallel_safe=bool(
                                 tool is not None and tool.parallel_safe
                             ),
-                            blocked_reason=duplicate_action_reason(tool_call, tool),
                         ))
 
                     async def execute_run(run: _ToolCallRun) -> None:
                         await emit(
                             AgentEventType.TOOL_PROGRESS,
                             run.hint,
-                            tool_name=run.call.name,
                             metadata={
                                 "phase": "start",
                                 "tool_call_id": run.call.id,
                             },
                         )
-                        if run.blocked_reason is not None:
-                            run.result = self.tool_results.limit(
-                                run.call.id,
-                                run.call.name,
-                                json.dumps(
-                                    {"blocked": True, "reason": run.blocked_reason},
-                                    ensure_ascii=False,
-                                ),
-                            )
-                        else:
-                            result = await self.tools.execute(
-                                run.call.name, run.call.arguments
-                            )
-                            run.result = self.tool_results.limit(
-                                run.call.id, run.call.name, result
-                            )
+                        result = await self.tools.execute(
+                            run.call.name, run.call.arguments
+                        )
+                        run.result = self.tool_results.limit(run.call.id, result)
                         await emit(
                             AgentEventType.TOOL_PROGRESS,
                             f"{run.hint} (done)",
-                            tool_name=run.call.name,
                             metadata={
                                 "phase": "done",
                                 "tool_call_id": run.call.id,
@@ -829,8 +731,10 @@ class AgentLoop:
                             )
                             raise
 
-                    def append_results(current_messages: list[dict]) -> list[dict]:
-                        for run in runs:
+                    def append_results(
+                        current_messages: list[dict], completed_runs: list[_ToolCallRun]
+                    ) -> list[dict]:
+                        for run in completed_runs:
                             if run.result is None:
                                 run.result = self._TOOL_CANCELLED_RESULT
                             current_messages = self.context.add_tool_result(
@@ -848,12 +752,9 @@ class AgentLoop:
                         # Completed results stay; unfinished calls, including
                         # batches never started, get an explicit result so the
                         # assistant tool_calls message stays complete.
-                        messages = append_results(messages)
+                        messages = append_results(messages, runs)
                         raise
-                    messages = append_results(messages)
-                    evidence_hint = _evidence_incomplete_hint(runs)
-                    if evidence_hint is not None:
-                        messages.append({"role": "user", "content": evidence_hint})
+                    messages = append_results(messages, runs)
                 else:
                     clean = self._strip_think(response_content)
                     # Error responses never reach here: they raise above, before
@@ -881,7 +782,6 @@ class AgentLoop:
 
             if final_content is None and iteration >= self.max_iterations:
                 logger.warning("Max iterations ({}) reached", self.max_iterations)
-                finish_reason = "max_iterations"
                 final_content = (
                     f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                     "without completing the task. You can try breaking the task into smaller steps."
@@ -889,14 +789,12 @@ class AgentLoop:
 
             await emit(
                 AgentEventType.TURN_DONE,
-                finish_reason=finish_reason,
-                usage=dict(total_usage),
                 metadata={
                     "duration_s": round(time.monotonic() - turn_started, 3),
                     "model_call_count": model_call_count,
                 },
             )
-            return final_content, tools_used, messages
+            return final_content, messages
         except asyncio.CancelledError:
             with suppress(asyncio.CancelledError, Exception):
                 await emit(AgentEventType.CANCELLED)
@@ -1330,7 +1228,7 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
             try:
-                final_content, _, all_msgs = await self._run_agent_loop(
+                final_content, all_msgs = await self._run_agent_loop(
                     messages,
                     experience_session_key=key,
                     on_event=on_event,
@@ -1434,7 +1332,7 @@ class AgentLoop:
             progress_callback = on_progress or (
                 None if on_event is not None else _bus_progress
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            final_content, all_msgs = await self._run_agent_loop(
                 initial_messages,
                 on_progress=progress_callback,
                 experience_session_key=key,
@@ -1518,16 +1416,14 @@ class AgentLoop:
         self.sessions.save(session)
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
-        """Save new-turn messages into session, truncating large tool results."""
+        """Save new-turn messages into the session after stripping injected context."""
         from datetime import datetime
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-            elif role == "user":
+            if role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._MESSAGE_CONTEXT_TAG):
                     # Strip the message-metadata prefix, keep only the user text.
                     parts = content.split("\n\n", 1)

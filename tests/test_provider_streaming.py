@@ -207,9 +207,6 @@ def test_agent_event_type_values_and_defaults() -> None:
 
     event = AgentEvent(type=AgentEventType.TURN_DONE)
     assert event.content is None
-    assert event.tool_name is None
-    assert event.finish_reason is None
-    assert event.usage == {}
     assert event.metadata == {}
     assert event.turn_id is None
 
@@ -358,13 +355,6 @@ async def test_litellm_stream_reports_usage_and_finish_reason(
 
     events = await _collect(provider.chat_stream([{"role": "user", "content": "go"}]))
 
-    usage_events = [event for event in events if event.type == "usage"]
-    assert usage_events == [
-        StreamEvent(
-            type="usage",
-            usage={"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8},
-        )
-    ]
     assert events[-1].type == "done"
     assert events[-1].finish_reason == "stop"
     assert events[-1].usage == {
@@ -696,7 +686,7 @@ async def test_custom_stream_ignores_empty_and_role_only_chunks() -> None:
 
     events = await _collect(provider.chat_stream([{"role": "user", "content": "go"}]))
 
-    assert [event.type for event in events] == ["usage", "done"]
+    assert [event.type for event in events] == ["done"]
     assert events[-1].usage == {
         "prompt_tokens": 1,
         "completion_tokens": 0,

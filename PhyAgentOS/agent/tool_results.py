@@ -24,11 +24,11 @@ OMITTED_KEYS_MAX = 10
 class ToolResultLimiter:
     """Truncate oversized tool results while keeping safety-critical fields."""
 
-    def __init__(self, workspace: Path, *, max_chars: int = DEFAULT_MAX_CHARS):
+    def __init__(self, workspace: Path):
         self.workspace = Path(workspace)
-        self.max_chars = max(1, max_chars)
+        self.max_chars = DEFAULT_MAX_CHARS
 
-    def limit(self, tool_call_id: str, tool_name: str, result: str) -> str:
+    def limit(self, tool_call_id: str, result: str) -> str:
         if not isinstance(result, str) or len(result) <= self.max_chars:
             return result
 

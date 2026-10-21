@@ -226,31 +226,6 @@ async def test_read_only_tool_does_not_overlap_with_writer(tmp_path) -> None:
     assert writer.max_active == 1
 
 
-async def test_forge_tools_stay_serial(tmp_path) -> None:
-    gate = asyncio.Event()
-    forge = _ProbeTool("forge_tool_start_action", gate=gate)
-    loop = _loop(
-        _provider_for(
-            ("c1", "forge_tool_start_action"),
-            ("c2", "forge_tool_start_action"),
-        ),
-        tmp_path,
-    )
-    loop.tools.register(forge)
-
-    turn = asyncio.create_task(_run(loop))
-    await asyncio.wait_for(forge.started.wait(), timeout=1)
-    for _ in range(3):
-        await asyncio.sleep(0)
-
-    assert forge.started_count == 1
-    gate.set()
-    await asyncio.wait_for(turn, timeout=1)
-
-    assert forge.started_count == 2
-    assert forge.max_active == 1
-
-
 async def test_completion_events_follow_finish_order_and_messages_keep_call_order(
     tmp_path,
 ) -> None:
@@ -276,7 +251,7 @@ async def test_completion_events_follow_finish_order_and_messages_keep_call_orde
     turn = asyncio.create_task(_run(loop, on_event))
     await asyncio.wait_for(fast_done.wait(), timeout=1)
     slow_gate.set()
-    _, _, messages = await asyncio.wait_for(turn, timeout=1)
+    _, messages = await asyncio.wait_for(turn, timeout=1)
 
     done_ids = [
         event.metadata.get("tool_call_id")

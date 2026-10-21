@@ -143,24 +143,6 @@ class _OrderProvider:
         return LLMResponse(content=f"reply-{number}")
 
 
-async def test_turns_in_one_session_stay_serial(tmp_path):
-    provider = _OrderProvider()
-    loop = _loop(tmp_path, provider)
-
-    first = asyncio.create_task(loop.process_direct("first", "sess-a"))
-    await asyncio.wait_for(provider.first_entered.wait(), 2)
-    second = asyncio.create_task(loop.process_direct("second", "sess-a"))
-    await asyncio.sleep(0.05)
-
-    assert provider.entered == 1
-    assert provider.max_active == 1
-    assert len(loop._active_tasks["sess-a"]) == 2
-
-    provider.release_first.set()
-    assert await asyncio.wait_for(first, 2) == "reply-1"
-    assert await asyncio.wait_for(second, 2) == "reply-2"
-
-
 async def test_semaphore_caps_cross_session_turns(tmp_path):
     provider = _GatedProvider()
     loop = _loop(tmp_path, provider, max_concurrent_turns=1)
@@ -323,21 +305,6 @@ def _consolidator(tmp_path, provider) -> MemoryConsolidator:
         build_messages=lambda **_: [],
         get_tool_definitions=lambda: [],
     )
-
-
-async def test_memory_lock_is_shared_across_consolidators(tmp_path):
-    provider = _MemoryProvider()
-    first = _consolidator(tmp_path, provider)
-    second = _consolidator(tmp_path, provider)
-
-    await asyncio.gather(
-        first.consolidate_messages([{"role": "user", "content": "fact-A"}]),
-        second.consolidate_messages([{"role": "user", "content": "fact-B"}]),
-    )
-
-    memory = (tmp_path / "memory" / "MEMORY.md").read_text(encoding="utf-8")
-    assert "fact-A" in memory
-    assert "fact-B" in memory
 
 
 async def test_memory_store_consolidate_locks_itself(tmp_path):

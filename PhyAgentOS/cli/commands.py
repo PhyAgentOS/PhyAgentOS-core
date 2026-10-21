@@ -812,13 +812,8 @@ class _InteractiveRuntime:
             "open": False,
             "current": "",
             "saw_event": False,
-            "cancelled": False,
             "think": _ThinkFilter(),
         }
-
-    @property
-    def pending(self) -> list[str]:
-        return self._pending
 
     def _ensure_input_task(self) -> asyncio.Task:
         # A completed reader still holds a line the user typed at the end of
@@ -976,7 +971,6 @@ class _InteractiveRuntime:
                     elif event.type == AgentEventType.CANCELLED:
                         self._close_stream_line()
                         console.print("\nCancelled.", style="yellow")
-                        self._stream["cancelled"] = True
                         self._turn_done.set()
                     elif event.type == AgentEventType.TURN_DONE:
                         self._close_stream_line()

@@ -13,7 +13,12 @@ from PhyAgentOS.agent.loop import AgentLoop
 from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.bus.events import InboundMessage
 from PhyAgentOS.bus.queue import MessageBus
-from PhyAgentOS.providers.base import LLMProvider, StreamEvent, ToolCallRequest
+from PhyAgentOS.providers.base import (
+    GenerationSettings,
+    LLMProvider,
+    StreamEvent,
+    ToolCallRequest,
+)
 
 
 class _StreamingProvider(LLMProvider):
@@ -23,6 +28,7 @@ class _StreamingProvider(LLMProvider):
         super().__init__()
         self._scripts = [list(script) for script in scripts]
         self.calls = 0
+        self.max_tokens: list[int | None] = []
 
     def get_default_model(self) -> str:
         return "stub-model"
@@ -32,6 +38,7 @@ class _StreamingProvider(LLMProvider):
 
     async def chat_stream(self, **kwargs):
         self.calls += 1
+        self.max_tokens.append(kwargs.get("max_tokens"))
         assert self._scripts, "unexpected extra chat_stream call"
         for event in self._scripts.pop(0):
             yield event
@@ -160,11 +167,6 @@ async def test_stream_events_order_and_tool_progress(tmp_path, monkeypatch) -> N
     assert executed == [("read_file", {"path": "a.txt"})]
     done_events = [event for event in events if event.type == AgentEventType.TURN_DONE]
     assert len(done_events) == 1
-    assert done_events[0].usage == {
-        "prompt_tokens": 30,
-        "completion_tokens": 5,
-        "total_tokens": 35,
-    }
 
 
 async def test_turn_done_records_duration_and_model_call_count(
@@ -290,7 +292,6 @@ def test_cli_single_mode_streams_once(tmp_path, monkeypatch) -> None:
             assert on_event is not None
             await on_event(AgentEvent(
                 type=AgentEventType.TOOL_PROGRESS,
-                tool_name="read_file",
                 content='read_file("a.txt")',
             ))
             await on_event(AgentEvent(
@@ -326,6 +327,26 @@ async def test_input_budget_rejects_before_request(tmp_path) -> None:
     assert provider.calls == 0
     assert any(event.type == AgentEventType.ERROR for event in events)
     assert not any(event.type == AgentEventType.TURN_DONE for event in events)
+
+
+async def test_budget_shrinks_output_tokens_instead_of_failing(
+    tmp_path, monkeypatch
+) -> None:
+    provider = _StreamingProvider([
+        [StreamEvent(type="delta", content="ok"), StreamEvent(type="done")],
+    ])
+    provider.generation = GenerationSettings(max_tokens=32768)
+    loop = _loop(provider, tmp_path, context_window_tokens=65536)
+    monkeypatch.setattr(
+        loop_module, "estimate_prompt_tokens_chain",
+        lambda *args, **kwargs: (32953, "tiktoken"),
+    )
+
+    reply = await loop.process_direct("move the arm", "cli:test")
+
+    assert reply == "ok"
+    assert provider.calls == 1
+    assert provider.max_tokens == [65536 - 32953 - loop._OUTPUT_BUDGET_SAFETY_MARGIN]
 
 
 async def test_cancel_emits_cancelled_without_turn_done(tmp_path) -> None:

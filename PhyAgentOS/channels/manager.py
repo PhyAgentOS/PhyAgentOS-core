@@ -234,11 +234,11 @@ class ChannelManager:
         if event.type == AgentEventType.TEXT_DELTA:
             if not channel.supports_streaming:
                 return
-            self._on_delta(channel, msg, event)
+            self._on_delta(msg, event)
         elif event.type == AgentEventType.TURN_STARTED:
             if not channel.supports_streaming:
                 return
-            self._reset_stream(channel, msg, event)
+            self._reset_stream(msg, event)
             self._enqueue(msg)
         elif event.type == AgentEventType.TOOL_PROGRESS:
             if (event.metadata or {}).get("phase") == "done":
@@ -258,49 +258,28 @@ class ChannelManager:
             if state is not None:
                 self._finalize_stream(
                     state, state.text, AgentEventType.TURN_DONE, metadata=msg.metadata,
-                    full_text=state.text, remember=True,
                 )
-        elif event.type == AgentEventType.ERROR:
-            status = event.content or "Error"
-            if not channel.supports_streaming:
-                return
-            state = self._state_for_event(msg, event)
-            if state is not None:
-                self._finalize_stream(
-                    state, status, AgentEventType.ERROR, metadata=msg.metadata,
-                    full_text=state.text, remember=True,
-                )
-            elif not self._already_finished(msg, event):
-                self._enqueue(OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=status,
-                    metadata=dict(msg.metadata or {}),
-                    event=event,
-                ))
-        elif event.type == AgentEventType.CANCELLED:
-            status = event.content or "Cancelled."
+        elif event.type in (AgentEventType.ERROR, AgentEventType.CANCELLED):
+            status = event.content or (
+                "Error" if event.type == AgentEventType.ERROR else "Cancelled."
+            )
             if channel.supports_streaming:
                 state = self._state_for_event(msg, event)
                 if state is not None:
                     self._finalize_stream(
-                        state, status, AgentEventType.CANCELLED,
-                        metadata=msg.metadata, full_text=state.text, remember=True,
+                        state, status, event.type, metadata=msg.metadata,
                     )
-                elif not self._already_finished(msg, event):
-                    self._enqueue(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=status,
-                        metadata=dict(msg.metadata or {}),
-                        event=event,
-                    ))
-            elif not self._already_finished(msg, event):
+                    return
+            elif event.type == AgentEventType.ERROR:
+                # The failure reply is already published as a normal message.
+                return
+            if not self._already_finished(msg, event):
                 self._enqueue(OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
                     content=status,
                     metadata=dict(msg.metadata or {}),
+                    event=event if channel.supports_streaming else None,
                 ))
 
     def _route_message(self, channel: BaseChannel, msg: OutboundMessage) -> None:
@@ -320,8 +299,7 @@ class ChannelManager:
         ):
             # The final reply is queued before turn_done, so it ends the stream.
             self._finalize_stream(
-                state, msg.content, AgentEventType.TURN_DONE,
-                metadata=msg.metadata, full_text=state.text, remember=True,
+                state, msg.content, AgentEventType.TURN_DONE, metadata=msg.metadata,
             )
             return
 
@@ -377,7 +355,7 @@ class ChannelManager:
         )
 
     def _reset_stream(
-        self, channel: BaseChannel, msg: OutboundMessage, event: AgentEvent,
+        self, msg: OutboundMessage, event: AgentEvent,
     ) -> _StreamState:
         key = self._stream_key(msg)
         old = self._streams.pop(key, None)
@@ -395,14 +373,14 @@ class ChannelManager:
         return state
 
     def _on_delta(
-        self, channel: BaseChannel, msg: OutboundMessage, event: AgentEvent,
+        self, msg: OutboundMessage, event: AgentEvent,
     ) -> None:
         key = self._stream_key(msg)
         state = self._streams.get(key)
         if state is None or (
             event.turn_id and state.turn_id and event.turn_id != state.turn_id
         ):
-            state = self._reset_stream(channel, msg, event)
+            state = self._reset_stream(msg, event)
 
         if event.content:
             state.text += event.content
@@ -461,8 +439,6 @@ class ChannelManager:
         terminal_type: AgentEventType,
         *,
         metadata: dict[str, Any] | None,
-        full_text: str,
-        remember: bool,
     ) -> None:
         """Cancel pending merges and queue the terminal event for one stream."""
         key = (state.channel, state.chat_id, state.thread_id)
@@ -475,11 +451,11 @@ class ChannelManager:
             type=terminal_type,
             content=content,
             turn_id=state.turn_id,
-            metadata={"_stream_text": full_text},
+            metadata={"_stream_text": state.text},
         )
         merged = dict(state.metadata)
         merged.update(metadata or {})
-        merged["_stream_text"] = full_text
+        merged["_stream_text"] = state.text
         self._enqueue(OutboundMessage(
             channel=state.channel,
             chat_id=state.chat_id,
@@ -487,8 +463,7 @@ class ChannelManager:
             metadata=merged,
             event=event,
         ))
-        if remember:
-            self._finalized[key] = (full_text, state.turn_id)
+        self._finalized[key] = (state.text, state.turn_id)
 
     def _enqueue(self, msg: OutboundMessage) -> bool:
         key = self._key(msg)

@@ -18,7 +18,7 @@ _DEFAULT_EVIDENCE_KINDS = ["robot_state"]
 def _prepare_verification(
     verification: dict[str, Any],
     *,
-    image_sources: list[str] | None,
+    image_sources: list[str],
 ) -> dict[str, Any]:
     """Reject evidence policies this Forge path cannot satisfy.
 
@@ -51,7 +51,7 @@ def _prepare_verification(
             "minimum_association=authoritative is unavailable for AgentTask evidence; "
             "PAOS Forge collection records best-effort observation evidence"
         )
-    if "rgb_image" in kinds and image_sources is not None and not image_sources:
+    if "rgb_image" in kinds and not image_sources:
         raise ValueError(
             "rgb_image evidence requires forge.evidence.requiredImageSources and a Gateway "
             "image stream; this runtime has neither. Use robot_state evidence instead."
@@ -118,7 +118,7 @@ class ForgeTaskCreateTool(Tool):
     async def execute(
         self, task_description: str, activation_id: str, verification: dict[str, Any]
     ) -> str:
-        image_sources = None
+        image_sources: list[str] = []
         coordinator_config = getattr(self.coordinator, "config", None)
         evidence_config = getattr(coordinator_config, "evidence", None)
         if evidence_config is not None:
