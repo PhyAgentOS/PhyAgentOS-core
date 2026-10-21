@@ -699,22 +699,36 @@ class AgentTaskCoordinator:
                 remote_attempt_id = remote_attempt_id or failed_attempt
             invocation_id = remote_invocation_id or invocation_id
             attempt_id = remote_attempt_id or attempt_id
+            # A structured rejection from the grace window never reached a
+            # provider, so it must not stay unknown or arm the resend guard.
+            rejected_before_dispatch = (
+                failure is not None and _rejected_before_dispatch(failure)
+            )
             self._finish_execution(
                 task_id,
                 record_id,
-                status="unknown",
+                status="failed" if rejected_before_dispatch else "unknown",
                 invocation_id=invocation_id,
                 attempt_id=attempt_id,
                 response=response,
+                rejected_before_dispatch=rejected_before_dispatch,
                 error={
-                    "type": "CancelledError",
+                    "type": (
+                        type(failure).__name__
+                        if rejected_before_dispatch and failure is not None
+                        else "CancelledError"
+                    ),
                     "message": (
-                        "Action dispatch was cancelled; remote state is unknown and "
-                        "the request was not resent"
-                        + (
-                            ""
-                            if invocation_id
-                            else "; Gateway invocation identity could not be confirmed"
+                        str(failure)
+                        if rejected_before_dispatch and failure is not None
+                        else (
+                            "Action dispatch was cancelled; remote state is unknown and "
+                            "the request was not resent"
+                            + (
+                                ""
+                                if invocation_id
+                                else "; Gateway invocation identity could not be confirmed"
+                            )
                         )
                     ),
                 },
@@ -1575,6 +1589,7 @@ class AgentTaskCoordinator:
                 record_id,
                 status=aborted_status,
                 error={"type": "DispatchAborted", "message": message},
+                rejected_before_dispatch=True,
             )
             raise AgentTaskError(message)
 

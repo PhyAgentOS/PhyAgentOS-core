@@ -397,7 +397,13 @@ class _StubResolver:
     def __init__(self) -> None:
         self.freeze_calls: list[str] = []
 
-    async def freeze(self, candidate_id: str, *, task_id: str) -> ForgeSkillBinding:
+    async def freeze(
+        self,
+        candidate_id: str,
+        *,
+        task_id: str,
+        activated_document_sha256: str | None = None,
+    ) -> ForgeSkillBinding:
         self.freeze_calls.append(task_id)
         return ForgeSkillBinding(
             binding_id=f"binding_{task_id}",
