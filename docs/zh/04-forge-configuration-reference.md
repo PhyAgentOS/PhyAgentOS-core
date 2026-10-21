@@ -135,9 +135,9 @@ Session 必须带 `task_id`，并计入任务验证。
 | 字段 | 类型 | 默认值 | 说明 |
 |:-----|:-----|:-------|:-----|
 | `profile` | string | `semantic_default` | 通用 profile 标签；当前不触发 action-specific 代码。 |
-| `required_kinds` | string[] | `["rgb_image"]` | before 与 after 都必须存在每种 kind。`robot_state` 会要求 `/ws/state`。 |
+| `required_kinds` | string[] | `forge_task_create` 默认 `["robot_state"]` | 只支持 `rgb_image` 与 `robot_state`，before/after 都必须存在。`robot_state` 读 `/ws/state`；`rgb_image` 还需要 `forge.evidence.requiredImageSources` 和 Gateway 图像流，未配置 source 时创建任务会被拒绝。Query/Action 结果只进 execution records，不进 Evidence Bundle。 |
 | `required_sources` | string[] | `[]` | 对 image kind，before/after 均需包含每个 source。 |
-| `minimum_association` | enum | `best_effort` | `best_effort | authoritative`；当前 PAOS 采集提供 best-effort evidence。 |
+| `minimum_association` | enum | `best_effort` | AgentTask 证据只有 `best_effort`；`forge_task_create` 会拒绝 `authoritative`，因为观测采集产生不了。`authoritative` 仍只用于 interaction evidence。 |
 
 ## 8. Mode 行为矩阵
 

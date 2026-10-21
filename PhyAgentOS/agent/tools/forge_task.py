@@ -11,6 +11,55 @@ from PhyAgentOS.agent.tools.base import Tool
 from PhyAgentOS.forge.task import AgentTaskCoordinator, AgentTaskRecord
 from PhyAgentOS.verification.contracts import TaskVerificationContract
 
+_SUPPORTED_EVIDENCE_KINDS = ("rgb_image", "robot_state")
+_DEFAULT_EVIDENCE_KINDS = ["robot_state"]
+
+
+def _prepare_verification(
+    verification: dict[str, Any],
+    *,
+    image_sources: list[str] | None,
+) -> dict[str, Any]:
+    """Reject evidence policies this Forge path cannot satisfy.
+
+    A classic AgentTask Evidence Bundle is built from observation snapshots only:
+    each phase can hold rgb_image artifacts (when the Gateway publishes images)
+    and one robot_state artifact from /ws/state. Query and Action results live in
+    the execution records, not in the bundle, so requiring them as artifact kinds
+    can never complete.
+    """
+    prepared = dict(verification)
+    raw_policy = prepared.get("evidence_policy")
+    policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
+    kinds = policy.get("required_kinds")
+    if kinds is None:
+        kinds = list(_DEFAULT_EVIDENCE_KINDS)
+    unsupported = [
+        str(kind) for kind in kinds if kind not in _SUPPORTED_EVIDENCE_KINDS
+    ]
+    if unsupported:
+        raise ValueError(
+            "unsupported evidence required_kinds: "
+            + ", ".join(unsupported)
+            + "; this Forge path records only "
+            + ", ".join(_SUPPORTED_EVIDENCE_KINDS)
+            + " artifacts (query/action results stay in execution records)"
+        )
+    association = policy.get("minimum_association", "best_effort")
+    if association != "best_effort":
+        raise ValueError(
+            "minimum_association=authoritative is unavailable for AgentTask evidence; "
+            "PAOS Forge collection records best-effort observation evidence"
+        )
+    if "rgb_image" in kinds and image_sources is not None and not image_sources:
+        raise ValueError(
+            "rgb_image evidence requires forge.evidence.requiredImageSources and a Gateway "
+            "image stream; this runtime has neither. Use robot_state evidence instead."
+        )
+    policy["required_kinds"] = list(kinds)
+    prepared["evidence_policy"] = policy
+    return prepared
+
 
 def _task_response(task: AgentTaskRecord) -> str:
     return json.dumps(
@@ -69,6 +118,15 @@ class ForgeTaskCreateTool(Tool):
     async def execute(
         self, task_description: str, activation_id: str, verification: dict[str, Any]
     ) -> str:
+        image_sources = None
+        coordinator_config = getattr(self.coordinator, "config", None)
+        evidence_config = getattr(coordinator_config, "evidence", None)
+        if evidence_config is not None:
+            image_sources = list(evidence_config.required_image_sources)
+        verification = _prepare_verification(
+            verification,
+            image_sources=image_sources,
+        )
         task = self.coordinator.create_task(
             task_description=task_description,
             activation_id=activation_id,
@@ -215,11 +273,20 @@ def _verification_schema() -> dict[str, Any]:
             "constraints": {"type": "array", "items": {"type": "string"}},
             "evidence_policy": {
                 "type": "object",
+                "description": (
+                    "Observation evidence requirements. This Forge path can produce "
+                    "rgb_image and robot_state artifacts. rgb_image also needs a Gateway "
+                    "image stream and forge.evidence.requiredImageSources; robot_state "
+                    "reads /ws/state. Defaults to robot_state."
+                ),
                 "properties": {
                     "profile": {"type": "string"},
                     "required_kinds": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {
+                            "type": "string",
+                            "enum": list(_SUPPORTED_EVIDENCE_KINDS),
+                        },
                     },
                     "required_sources": {
                         "type": "array",
@@ -227,7 +294,11 @@ def _verification_schema() -> dict[str, Any]:
                     },
                     "minimum_association": {
                         "type": "string",
-                        "enum": ["best_effort", "authoritative"],
+                        "enum": ["best_effort"],
+                        "description": (
+                            "PAOS Forge observation evidence is best-effort; "
+                            "authoritative association is not available here."
+                        ),
                     },
                 },
                 "additionalProperties": False,

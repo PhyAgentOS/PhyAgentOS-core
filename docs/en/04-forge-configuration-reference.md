@@ -139,9 +139,9 @@ the same task ID and is limited by `maxReplansPerEpisode` and `replanTimeoutS`.
 | Field | Type | Default | Meaning |
 |:------|:-----|:--------|:--------|
 | `profile` | string | `semantic_default` | Generic label; does not select action-specific code. |
-| `required_kinds` | string[] | `["rgb_image"]` | Each kind must exist in before and after. `robot_state` requires `/ws/state`. |
+| `required_kinds` | string[] | `["robot_state"]` for `forge_task_create` | Supported kinds are `rgb_image` and `robot_state`; each must exist in before and after. `robot_state` reads `/ws/state`. `rgb_image` also needs `forge.evidence.requiredImageSources` and a Gateway image stream, and is rejected at task creation when no sources are configured. Query and Action results stay in execution records, not in the bundle. |
 | `required_sources` | string[] | `[]` | Every source must exist for image kinds in both phases. |
-| `minimum_association` | enum | `best_effort` | `best_effort | authoritative`; current PAOS collection supplies best-effort evidence. |
+| `minimum_association` | enum | `best_effort` | AgentTask evidence is `best_effort`; `forge_task_create` rejects `authoritative` because the observation pipeline cannot produce it. `authoritative` remains reserved for interaction evidence. |
 
 ## 8. Mode behavior matrix
 
