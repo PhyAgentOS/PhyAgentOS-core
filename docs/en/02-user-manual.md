@@ -230,6 +230,22 @@ In an existing session, run `/effort none`, then `/provider api_route`, followed
 `providers.api_route.defaultModel`, switching providers retains the previous model,
 including any vendor prefix.
 
+**[Opper](https://opper.ai)** (`opper`) uses the same gateway configuration. Create a key at
+https://platform.opper.ai and put it in `providers.opper.apiKey`, or supply `OPPER_API_KEY` /
+`PAOS_OPPER_API_KEY` at startup. The default endpoint is `https://api.opper.ai/v3/compat`. Use a
+pool name such as `claude-sonnet-4-6` or `gpt-5.4-mini`, which Opper routes across the providers
+serving that model, or a `provider/model` ID such as `anthropic/claude-sonnet-4-6` to pin one
+route. This integration also uses PAOS's conservative gateway effort validation, so clear any
+explicit reasoning effort when selecting it:
+
+```bash
+paos provider use opper --model claude-sonnet-4-6 --reasoning-effort none
+```
+
+In an existing session, run `/effort none`, then `/provider opper`, followed by
+`/model <model-id>`. Without `providers.opper.defaultModel`, switching providers retains the
+previous model ID.
+
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
 session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.

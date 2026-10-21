@@ -6,8 +6,10 @@ import hashlib
 import json
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from PhyAgentOS.skill_runtime.catalog import SkillCatalog
@@ -36,6 +38,9 @@ class ForgeSkillBindingCandidate(BindingModel):
     skill_version: str
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     skill_document_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workflow_document_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     runtime_profile: str
     runtime_instance_id: str
     gateway_url: str
@@ -52,6 +57,9 @@ class ForgeSkillBinding(BindingModel):
     skill_version: str
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     skill_document_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workflow_document_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     runtime_profile: str
     runtime_instance_id: str
     gateway_url: str
@@ -82,7 +90,13 @@ def _response_data(response: dict[str, Any], label: str) -> dict[str, Any]:
 
 
 def _candidate_payload(candidate: ForgeSkillBindingCandidate) -> dict[str, Any]:
-    value = candidate.model_dump(mode="json", exclude={"candidate_id", "created_at"})
+    value = candidate.model_dump(
+        mode="json",
+        # workflow_document_sha256 is deliberately excluded: the workflow document
+        # may be edited locally between activation and task creation, and that must
+        # not invalidate the frozen binding (task creation only warns).
+        exclude={"candidate_id", "created_at", "workflow_document_sha256"},
+    )
     value["required_tools"] = sorted(value["required_tools"], key=lambda item: item["tool_id"])
     return value
 
@@ -90,9 +104,18 @@ def _candidate_payload(candidate: ForgeSkillBindingCandidate) -> dict[str, Any]:
 class ForgeSkillBindingResolver:
     """Preview, freeze, and continuously validate one active Skill runtime."""
 
-    def __init__(self, runtime_registry: Any, *, catalog: SkillCatalog | None = None) -> None:
+    def __init__(
+        self,
+        runtime_registry: Any,
+        *,
+        catalog: SkillCatalog | None = None,
+        skills_loader: Any | None = None,
+    ) -> None:
         self.runtime_registry = runtime_registry
         self.catalog = catalog or SkillCatalog()
+        # Optional SkillsLoader used to hash the document the agent actually reads
+        # (workspace overlay first) instead of the installed bundle document.
+        self.skills_loader = skills_loader
         self._candidates: dict[str, ForgeSkillBindingCandidate] = {}
         self._lock = threading.RLock()
         self.interaction_candidates: dict[str, dict] = {}
@@ -102,6 +125,33 @@ class ForgeSkillBindingResolver:
         if runtime is None:
             raise ForgeSkillBindingError("no ready Forge Skill runtime is active")
         return runtime
+
+    def _workflow_document_sha256(self, skill_name: str) -> str | None:
+        """Hash the document the agent actually reads (workspace overlay first).
+
+        Returns None when the resolved document cannot be confirmed, so the
+        binding never substitutes the installed bundle identity for a
+        document it did not verify.
+        """
+        if self.skills_loader is None:
+            return None
+        try:
+            resolved = self.skills_loader.resolve_skill(
+                skill_name, require_available=False
+            )
+        except Exception:
+            return None
+        if resolved is None:
+            return None
+        try:
+            return hashlib.sha256(Path(resolved["path"]).read_bytes()).hexdigest()
+        except OSError:
+            logger.warning(
+                "resolved workflow document for Skill {} is unreadable; "
+                "workflow document identity will not be frozen",
+                skill_name,
+            )
+            return None
 
     async def preview(self, skill_name: str) -> ForgeSkillBindingCandidate:
         runtime = self._runtime()
@@ -149,6 +199,7 @@ class ForgeSkillBindingResolver:
             )
         manifest_path = manifest.bundle_root / "skill.yaml"
         document_path = manifest.resolve_bundle_path(manifest.skill_document)
+        installed_document_sha256 = hashlib.sha256(document_path.read_bytes()).hexdigest()
         seed = {
             "skill": skill_name,
             "runtime": runtime.runtime_instance_id,
@@ -159,7 +210,8 @@ class ForgeSkillBindingResolver:
             skill_name=skill_name,
             skill_version=manifest.version,
             manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-            skill_document_sha256=hashlib.sha256(document_path.read_bytes()).hexdigest(),
+            skill_document_sha256=installed_document_sha256,
+            workflow_document_sha256=self._workflow_document_sha256(skill_name),
             runtime_profile=runtime.profile,
             runtime_instance_id=runtime.runtime_instance_id,
             gateway_url=runtime.gateway_url,
@@ -175,7 +227,13 @@ class ForgeSkillBindingResolver:
                 self.interaction_candidates[candidate.candidate_id] = extension
         return candidate
 
-    async def freeze(self, candidate_id: str, *, task_id: str) -> ForgeSkillBinding:
+    async def freeze(
+        self,
+        candidate_id: str,
+        *,
+        task_id: str,
+        activated_document_sha256: str | None = None,
+    ) -> ForgeSkillBinding:
         with self._lock:
             candidate = self._candidates.get(candidate_id)
         if candidate is None:
@@ -188,11 +246,30 @@ class ForgeSkillBindingResolver:
             raise ForgeSkillBindingError(
                 "Skill Runtime or ToolSpec changed after activation; activate the Skill again"
             )
+        workflow_sha256 = current.workflow_document_sha256
+        if activated_document_sha256 is not None:
+            # The binding must attest the document the agent actually activated.
+            # Local edits after activation are allowed, but they must not silently
+            # re-attribute execution to a version the agent never read.
+            if (
+                workflow_sha256 is not None
+                and activated_document_sha256 != workflow_sha256
+            ):
+                logger.warning(
+                    "workflow document changed after activation; freezing the "
+                    "activated document sha256 {} (current file sha256 {})",
+                    activated_document_sha256[:12],
+                    workflow_sha256[:12],
+                )
+            workflow_sha256 = activated_document_sha256
         binding_payload = _candidate_payload(current)
         binding_payload["task_id"] = task_id
         return ForgeSkillBinding(
             binding_id=f"binding_{canonical_sha256(binding_payload)[:24]}",
-            **current.model_dump(exclude={"candidate_id"}),
+            **{
+                **current.model_dump(exclude={"candidate_id"}),
+                "workflow_document_sha256": workflow_sha256,
+            },
         )
 
     async def validate_tool(

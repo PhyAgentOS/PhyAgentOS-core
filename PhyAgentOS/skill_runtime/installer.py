@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
+from loguru import logger
 
 from PhyAgentOS.config.paths import get_forge_runtime_root, get_skill_bundle_root
 from PhyAgentOS.skill_runtime.archive import (
@@ -265,7 +266,7 @@ class NodeInstaller:
         finally:
             shutil.rmtree(temporary, ignore_errors=True)
 
-    def load(self, lock: NodeLock) -> Path:
+    def load(self, lock: NodeLock, *, strict: bool = False) -> Path:
         self._verify_lock_host(lock)
         install_root = self.root / lock.node_id / "versions" / lock.artifact_id
         path = _entrypoint_path(lock, install_root)
@@ -291,17 +292,26 @@ class NodeInstaller:
         ):
             raise InstallerError("installed Forge node receipt does not match Skill lock")
         binary_sha256 = receipt.get("binary_sha256")
-        if (
-            not isinstance(binary_sha256, str)
-            or len(binary_sha256) != 64
-            or sha256_file(path) != binary_sha256
-        ):
-            raise InstallerError("installed Forge node executable sha256 does not match receipt")
+        if not isinstance(binary_sha256, str) or len(binary_sha256) != 64:
+            raise InstallerError("installed Forge node receipt has no usable binary sha256")
+        if sha256_file(path) != binary_sha256:
+            if strict:
+                raise InstallerError(
+                    "installed Forge node executable sha256 does not match receipt"
+                )
+            logger.warning(
+                "installed Forge node executable {} sha256 differs from the receipt; "
+                "proceeding with the locally modified file",
+                lock.entrypoint,
+            )
         return path
 
     def satisfies(self, lock: NodeLock) -> bool:
         try:
-            self.load(lock)
+            # Install/cache acceptance must stay strict: a locally modified
+            # executable is not a valid cache hit and must not be reused by a
+            # subsequent install of the original archive.
+            self.load(lock, strict=True)
         except InstallerError:
             return False
         return True

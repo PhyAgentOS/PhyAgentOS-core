@@ -218,6 +218,20 @@ paos provider use api_route --model gpt-6.1-sol --reasoning-effort none
 `/model <model-id>`，填写密钥可用且不带厂商前缀的模型 ID。未设置
 `providers.api_route.defaultModel` 时，切换 Provider 会沿用原模型，包括其厂商前缀。
 
+**[Opper](https://opper.ai)**（`opper`）使用相同的网关配置方式。在 https://platform.opper.ai
+创建密钥，填入 `providers.opper.apiKey`，或在启动时提供 `OPPER_API_KEY` /
+`PAOS_OPPER_API_KEY`。默认地址为 `https://api.opper.ai/v3/compat`。模型 ID 可以填写
+`claude-sonnet-4-6`、`gpt-5.4-mini` 这类模型池名称，由 Opper 在提供该模型的服务商之间路由；
+也可以填写 `anthropic/claude-sonnet-4-6` 这类 `provider/model` ID，固定使用某一条路由。
+本接入同样沿用 PAOS 对网关推理强度的保守校验，选择时请清除显式推理强度：
+
+```bash
+paos provider use opper --model claude-sonnet-4-6 --reasoning-effort none
+```
+
+在已有会话中，依次执行 `/effort none`、`/provider opper`，然后执行 `/model <model-id>`。
+未设置 `providers.opper.defaultModel` 时，切换 Provider 会沿用原模型 ID。
+
 优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
 开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
 子 Agent、Forge 任务、verification、evolution、记忆整理、Cron 和 Heartbeat 继续使用启动配置。

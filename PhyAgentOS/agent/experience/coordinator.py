@@ -185,7 +185,13 @@ class ExperienceCoordinator:
                     else None
                 ),
                 skill_document_sha256=(
-                    binding.get("forge_skill_binding", {}).get("skill_document_sha256")
+                    # The episode must be attributed to the document the agent
+                    # actually read (workflow overlay first), not the installed
+                    # bundle document when the two differ.
+                    (
+                        binding.get("forge_skill_binding", {}).get("workflow_document_sha256")
+                        or binding.get("forge_skill_binding", {}).get("skill_document_sha256")
+                    )
                     if isinstance(binding.get("forge_skill_binding"), dict)
                     else None
                 ),
