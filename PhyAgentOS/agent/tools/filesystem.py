@@ -41,6 +41,8 @@ class _FsTool(Tool):
 class ReadFileTool(_FsTool):
     """Read file contents with optional line-based pagination."""
 
+    parallel_safe = True
+
     _MAX_CHARS = 128_000
     _DEFAULT_LIMIT = 2000
 
@@ -281,6 +283,8 @@ class EditFileTool(_FsTool):
 
 class ListDirTool(_FsTool):
     """List directory contents with optional recursion."""
+
+    parallel_safe = True
 
     _DEFAULT_MAX = 200
     _IGNORE_DIRS = {

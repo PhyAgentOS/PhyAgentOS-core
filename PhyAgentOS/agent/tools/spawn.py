@@ -1,5 +1,6 @@
 """Spawn tool for creating background subagents."""
 
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 from PhyAgentOS.agent.tools.base import Tool
@@ -13,15 +14,29 @@ class SpawnTool(Tool):
 
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
-        self._origin_channel = "cli"
-        self._origin_chat_id = "direct"
-        self._session_key = "cli:direct"
+        self._origin_channel: ContextVar[str] = ContextVar(
+            "spawn_origin_channel", default="cli"
+        )
+        self._origin_chat_id: ContextVar[str] = ContextVar(
+            "spawn_origin_chat_id", default="direct"
+        )
+        self._session_key: ContextVar[str] = ContextVar(
+            "spawn_session_key", default="cli:direct"
+        )
+        self._turn_id: ContextVar[str] = ContextVar("spawn_turn_id", default="")
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        session_key: str | None = None,
+        turn_id: str = "",
+    ) -> None:
         """Set the origin context for subagent announcements."""
-        self._origin_channel = channel
-        self._origin_chat_id = chat_id
-        self._session_key = f"{channel}:{chat_id}"
+        self._origin_channel.set(channel)
+        self._origin_chat_id.set(chat_id)
+        self._session_key.set(session_key or f"{channel}:{chat_id}")
+        self._turn_id.set(turn_id)
 
     @property
     def name(self) -> str:
@@ -57,7 +72,8 @@ class SpawnTool(Tool):
         return await self._manager.spawn(
             task=task,
             label=label,
-            origin_channel=self._origin_channel,
-            origin_chat_id=self._origin_chat_id,
-            session_key=self._session_key,
+            origin_channel=self._origin_channel.get(),
+            origin_chat_id=self._origin_chat_id.get(),
+            session_key=self._session_key.get(),
+            turn_id=self._turn_id.get(),
         )

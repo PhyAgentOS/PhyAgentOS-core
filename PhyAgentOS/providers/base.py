@@ -1,11 +1,16 @@
 """Base LLM provider interface."""
 
 import asyncio
+import inspect
 import json
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
+
+import json_repair
 
 from PhyAgentOS.providers.errors import describe_provider_error
 
@@ -55,6 +60,25 @@ class LLMResponse:
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
         return len(self.tool_calls) > 0
+
+
+@dataclass
+class StreamEvent:
+    """One event from a streaming completion.
+
+    ``type`` is one of ``delta`` (incremental text), ``tool_call`` (a fully
+    assembled call), ``usage`` (token accounting), ``done`` (terminal success),
+    or ``error`` (terminal failure). Once any event has been produced the
+    stream is never retried or replayed.
+    """
+
+    type: str
+    content: str | None = None
+    tool_call: ToolCallRequest | None = None
+    finish_reason: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+    reasoning_content: str | None = None
+    thinking_blocks: list[dict] | None = None
 
 
 class LLMCallError(RuntimeError):
@@ -217,6 +241,346 @@ class LLMProvider(ABC):
         """
         pass
 
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: object = _SENTINEL,
+        temperature: object = _SENTINEL,
+        reasoning_effort: object = _SENTINEL,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Default streaming fallback for providers without native streaming.
+
+        Calls ``chat_with_retry`` and replays the complete response as events,
+        so providers that only implement ``chat`` (and test doubles that only
+        implement ``chat_with_retry``) keep the same retry and generation
+        defaults as the non-streaming path. Providers that support native
+        streaming override this method.
+        """
+        max_tokens, temperature, reasoning_effort = self._resolve_generation(
+            max_tokens, temperature, reasoning_effort
+        )
+
+        response = await self.chat_with_retry(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
+        )
+        if response.finish_reason == "error":
+            yield StreamEvent(
+                type="error",
+                content=response.content,
+                finish_reason="error",
+            )
+            return
+        if not response.finish_reason:
+            yield StreamEvent(
+                type="error",
+                content="stream ended without finish_reason",
+                finish_reason="error",
+            )
+            return
+        if response.content is not None:
+            yield StreamEvent(type="delta", content=response.content)
+        for tool_call in response.tool_calls:
+            yield StreamEvent(type="tool_call", tool_call=tool_call)
+        yield StreamEvent(
+            type="done",
+            finish_reason=response.finish_reason,
+            usage=dict(response.usage),
+            reasoning_content=response.reasoning_content,
+            thinking_blocks=response.thinking_blocks,
+        )
+
+    async def _chat_stream_with_retry(
+        self,
+        factory: Callable[[], AsyncIterator[StreamEvent]],
+    ) -> AsyncIterator[StreamEvent]:
+        """Run a stream factory with retries until the first event is emitted.
+
+        A failure before any event can be retried on transient errors; a
+        failure after a delta (or any other event) is reported as a terminal
+        ``error`` event and never replayed.
+        """
+        delays = self._CHAT_RETRY_DELAYS
+        last_error: StreamEvent | None = None
+
+        for attempt in range(len(delays) + 1):
+            emitted = False
+            completed = False
+            try:
+                async with aclosing(factory()) as stream:
+                    async for event in stream:
+                        if event.type == "error" and not emitted:
+                            if self._is_transient_error(event.content):
+                                last_error = event
+                                break
+                            yield event
+                            return
+                        emitted = True
+                        yield event
+                    completed = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                event = StreamEvent(
+                    type="error",
+                    content=describe_provider_error(exc),
+                    finish_reason="error",
+                )
+                if emitted:
+                    yield event
+                    return
+                last_error = event
+                if not self._is_transient_error(event.content):
+                    yield event
+                    return
+
+            if completed:
+                return
+
+            if attempt < len(delays):
+                logger.warning(
+                    "LLM stream failed before first token (attempt {}/{}), retrying in {}s: {}",
+                    attempt + 1,
+                    len(delays) + 1,
+                    delays[attempt],
+                    (last_error.content if last_error else "")[:120],
+                )
+                await asyncio.sleep(delays[attempt])
+
+        if last_error is not None:
+            yield last_error
+
+    def _resolve_generation(
+        self,
+        max_tokens: object,
+        temperature: object,
+        reasoning_effort: object,
+    ) -> tuple[int, float, str | None]:
+        """Apply the provider's generation defaults to sentinel arguments."""
+        if max_tokens is self._SENTINEL:
+            max_tokens = self.generation.max_tokens
+        if temperature is self._SENTINEL:
+            temperature = self.generation.temperature
+        if reasoning_effort is self._SENTINEL:
+            reasoning_effort = self.generation.reasoning_effort
+        return int(max_tokens), float(temperature), reasoning_effort
+
+    @staticmethod
+    async def _close_stream(stream: Any) -> None:
+        """Close an async stream iterator, awaiting its result when needed."""
+        for name in ("aclose", "close"):
+            close = getattr(stream, name, None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+                return
+
+    @staticmethod
+    def _is_complete_json_object(raw: str) -> bool:
+        """Return True when ``raw`` is a structurally complete JSON object.
+
+        This only checks brace/bracket balance and string termination; the
+        actual parsing still goes through ``json_repair`` so streaming matches
+        the non-streaming path's tolerance for minor damage.
+        """
+        text = raw.strip()
+        if not text.startswith("{"):
+            return False
+        depth = 0
+        in_string = False
+        escaped = False
+        for position, char in enumerate(text):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                depth += 1
+            elif char in "}]":
+                depth -= 1
+                if depth < 0:
+                    return False
+                if depth == 0 and position != len(text) - 1:
+                    return False
+        return depth == 0 and not in_string
+
+    @staticmethod
+    def _accumulate_reasoning(
+        reasoning_parts: list[str],
+        thinking_blocks: list[dict],
+        delta: Any,
+    ) -> None:
+        """Append reasoning deltas to the running transcript."""
+        reasoning = getattr(delta, "reasoning_content", None)
+        if isinstance(reasoning, str) and reasoning:
+            reasoning_parts.append(reasoning)
+        blocks = getattr(delta, "thinking_blocks", None)
+        if isinstance(blocks, dict):
+            thinking_blocks.append(blocks)
+        elif blocks:
+            thinking_blocks.extend(blocks)
+
+    @staticmethod
+    def _usage_to_dict(usage: Any) -> dict[str, int]:
+        """Normalize an OpenAI-shaped usage object or dict."""
+        if not usage:
+            return {}
+        if isinstance(usage, dict):
+            getter = usage.get
+        else:
+            def getter(key: str) -> Any:
+                return getattr(usage, key, 0)
+        return {
+            "prompt_tokens": int(getter("prompt_tokens") or 0),
+            "completion_tokens": int(getter("completion_tokens") or 0),
+            "total_tokens": int(getter("total_tokens") or 0),
+        }
+
+    @staticmethod
+    def _accumulate_tool_fragment(
+        pending: dict[int, dict[str, Any]],
+        fragment: Any,
+    ) -> None:
+        """Append an OpenAI-style tool_call delta fragment to its accumulator."""
+        index = getattr(fragment, "index", None)
+        if index is None:
+            index = max(pending) if pending else 0
+        entry = pending.setdefault(index, {"id": None, "name": "", "arguments": ""})
+        fragment_id = getattr(fragment, "id", None)
+        if fragment_id:
+            entry["id"] = fragment_id
+        fragment_fields = getattr(fragment, "provider_specific_fields", None)
+        if isinstance(fragment_fields, dict):
+            entry.setdefault("provider_specific_fields", {}).update(fragment_fields)
+        function = getattr(fragment, "function", None)
+        if function is not None:
+            name = getattr(function, "name", None)
+            if name:
+                entry["name"] += name
+            arguments = getattr(function, "arguments", None)
+            if arguments:
+                entry["arguments"] += arguments
+            function_fields = getattr(function, "provider_specific_fields", None)
+            if isinstance(function_fields, dict):
+                entry.setdefault("function_provider_specific_fields", {}).update(function_fields)
+
+    @staticmethod
+    def _finalize_tool_calls(
+        pending: dict[int, dict[str, Any]],
+        id_factory: Callable[[int], str],
+    ) -> list[ToolCallRequest] | str:
+        """Assemble pending fragments into complete tool calls.
+
+        Returns an error string instead of calls when an argument payload is
+        truncated or is not a JSON object.
+        """
+        tool_calls: list[ToolCallRequest] = []
+        for index, entry in sorted(pending.items()):
+            raw = entry.get("arguments") or "{}"
+            name = entry.get("name") or "tool"
+            if isinstance(raw, str):
+                complete = LLMProvider._is_complete_json_object(raw)
+                try:
+                    arguments = json_repair.loads(raw)
+                except Exception:
+                    return (
+                        f"Incomplete tool call arguments for {name}; "
+                        "the stream ended before the JSON payload was complete."
+                    )
+                if not isinstance(arguments, dict):
+                    return f"Tool call arguments for {name} are not a JSON object."
+                if not complete:
+                    return (
+                        f"Incomplete tool call arguments for {name}; "
+                        "the stream ended before the JSON payload was complete."
+                    )
+            else:
+                arguments = raw
+                if not isinstance(arguments, dict):
+                    return f"Tool call arguments for {name} are not a JSON object."
+
+            tool_calls.append(ToolCallRequest(
+                id=entry.get("id") or id_factory(index),
+                name=name,
+                arguments=arguments,
+                provider_specific_fields=entry.get("provider_specific_fields"),
+                function_provider_specific_fields=entry.get("function_provider_specific_fields"),
+            ))
+        return tool_calls
+
+    async def _iter_openai_stream(
+        self,
+        stream: Any,
+        *,
+        id_factory: Callable[[int], str],
+    ) -> AsyncIterator[StreamEvent]:
+        """Consume one OpenAI-compatible stream and assemble tool calls first."""
+        pending: dict[int, dict[str, Any]] = {}
+        usage: dict[str, int] = {}
+        finish_reason: str | None = None
+        reasoning_parts: list[str] = []
+        thinking_blocks: list[dict] = []
+
+        try:
+            async for chunk in stream:
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage:
+                    usage = self._usage_to_dict(chunk_usage)
+
+                for choice in getattr(chunk, "choices", None) or []:
+                    delta = getattr(choice, "delta", None)
+                    if delta is not None:
+                        content = getattr(delta, "content", None)
+                        if isinstance(content, str) and content:
+                            yield StreamEvent(type="delta", content=content)
+                        self._accumulate_reasoning(
+                            reasoning_parts, thinking_blocks, delta
+                        )
+                        for fragment in getattr(delta, "tool_calls", None) or []:
+                            self._accumulate_tool_fragment(pending, fragment)
+                    reason = getattr(choice, "finish_reason", None)
+                    if reason:
+                        finish_reason = reason
+        finally:
+            await self._close_stream(stream)
+
+        if finish_reason is None:
+            yield StreamEvent(
+                type="error",
+                content="stream ended without finish_reason",
+                finish_reason="error",
+            )
+            return
+
+        tool_calls = self._finalize_tool_calls(pending, id_factory)
+        if isinstance(tool_calls, str):
+            yield StreamEvent(type="error", content=tool_calls, finish_reason="error")
+            return
+        for tool_call in tool_calls:
+            yield StreamEvent(type="tool_call", tool_call=tool_call)
+        yield StreamEvent(
+            type="done",
+            finish_reason=finish_reason,
+            usage=dict(usage),
+            reasoning_content="".join(reasoning_parts) or None,
+            thinking_blocks=thinking_blocks or None,
+        )
+
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
@@ -243,12 +607,9 @@ class LLMProvider(ABC):
         every mode (main / multimodal / ...) with the same model. Only
         ProvidersManager routes it to a mode-specific provider.
         """
-        if max_tokens is self._SENTINEL:
-            max_tokens = self.generation.max_tokens
-        if temperature is self._SENTINEL:
-            temperature = self.generation.temperature
-        if reasoning_effort is self._SENTINEL:
-            reasoning_effort = self.generation.reasoning_effort
+        max_tokens, temperature, reasoning_effort = self._resolve_generation(
+            max_tokens, temperature, reasoning_effort
+        )
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             try:

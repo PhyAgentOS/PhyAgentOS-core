@@ -12,6 +12,10 @@ class Tool(ABC):
     the environment, such as reading files, executing commands, etc.
     """
 
+    # Only tools whose execute() has no observable side effects and does not
+    # share mutable state with another call may opt in to concurrent execution.
+    parallel_safe: bool = False
+
     _TYPE_MAP = {
         "string": str,
         "integer": int,

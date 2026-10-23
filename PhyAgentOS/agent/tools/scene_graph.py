@@ -14,6 +14,8 @@ from PhyAgentOS.utils.helpers import load_environment_doc
 class SceneGraphQueryTool(Tool):
     """Read-only queries against the structured scene graph."""
 
+    parallel_safe = True
+
     def __init__(self, workspace: Path):
         self.workspace = workspace
 

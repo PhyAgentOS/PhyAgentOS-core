@@ -47,6 +47,8 @@ def _validate_url(url: str) -> tuple[bool, str]:
 class WebSearchTool(Tool):
     """Search the web using Brave Search API."""
 
+    parallel_safe = True
+
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
     parameters = {
@@ -108,6 +110,8 @@ class WebSearchTool(Tool):
 
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL using Readability."""
+
+    parallel_safe = True
 
     name = "web_fetch"
     description = "Fetch URL and extract readable content (HTML → markdown/text)."

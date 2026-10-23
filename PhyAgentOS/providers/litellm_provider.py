@@ -3,13 +3,15 @@
 import hashlib
 import secrets
 import string
+from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 import json_repair
 from litellm import acompletion
 from loguru import logger
 
-from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from PhyAgentOS.providers.base import LLMProvider, LLMResponse, StreamEvent, ToolCallRequest
 from PhyAgentOS.providers.effort import EffortError, apply_litellm_effort
 from PhyAgentOS.providers.errors import describe_provider_error
 from PhyAgentOS.providers.registry import find_by_model, find_by_name, find_gateway
@@ -256,6 +258,98 @@ class LiteLLMProvider(LLMProvider):
                 content=describe_provider_error(e),
                 finish_reason="error",
             )
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: object = LLMProvider._SENTINEL,
+        temperature: object = LLMProvider._SENTINEL,
+        reasoning_effort: object = LLMProvider._SENTINEL,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream a completion through LiteLLM.
+
+        Failures before the first event are retried on transient errors; once
+        any event has been yielded the stream is finished with an error event
+        instead of being replayed.
+        """
+        max_tokens, temperature, reasoning_effort = self._resolve_generation(
+            max_tokens, temperature, reasoning_effort
+        )
+        try:
+            kwargs = self._stream_request_kwargs(
+                messages=messages,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                tool_choice=tool_choice,
+            )
+        except EffortError as e:
+            yield StreamEvent(type="error", content=str(e), finish_reason="error")
+            return
+
+        async with aclosing(
+            self._chat_stream_with_retry(lambda: self._stream_once(kwargs))
+        ) as events:
+            async for event in events:
+                yield event
+
+    def _stream_request_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int,
+        temperature: float,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Build the LiteLLM request kwargs shared by every stream attempt."""
+        original_model = model or self.default_model
+        resolved_model = self._resolve_model(original_model)
+        extra_msg_keys = self._extra_msg_keys(original_model, resolved_model)
+
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
+
+        kwargs: dict[str, Any] = {
+            "model": resolved_model,
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages), extra_keys=extra_msg_keys
+            ),
+            "max_tokens": max(1, max_tokens),
+            "temperature": temperature,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "drop_params": True,
+        }
+        self._apply_model_overrides(resolved_model, kwargs)
+
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+
+        apply_litellm_effort(kwargs, reasoning_effort)
+        return kwargs
+
+    async def _stream_once(self, kwargs: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+        """Consume one LiteLLM stream, assembling tool calls before emitting."""
+        stream = await acompletion(**kwargs)
+        async with aclosing(
+            self._iter_openai_stream(stream, id_factory=lambda _index: _short_tool_id())
+        ) as events:
+            async for event in events:
+                yield event
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

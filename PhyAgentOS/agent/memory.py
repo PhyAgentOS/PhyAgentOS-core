@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import tempfile
 import weakref
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -61,11 +65,46 @@ def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
         return args[0] if args and isinstance(args[0], dict) else None
     return args if isinstance(args, dict) else None
 
+
+_SESSION_SUMMARY_SYSTEM_PROMPT = """You compress the older messages of one chat session into a running summary. The summary replaces those messages in the live context, so preserve everything needed to continue the task.
+
+Return a concise markdown summary with these sections:
+- Current goal
+- Constraints
+- Unfinished work
+- Key tools and results (reference tool calls, task/action identities, and result facts exactly as observed)
+- Physical state: repeat that current physical state is unknown here and must be queried from Forge records
+
+Never infer or restate current robot/action state as fact. Action, task, and binding identities are references only; their status must be queried from TaskStore/Forge records."""
+
+_SESSION_SUMMARY_USER_PROMPT = """## Previous session summary
+{previous}
+
+## Messages to compress
+{messages}"""
+
+_MAX_SESSION_SUMMARY_CHARS = 8000
+_SUMMARY_MESSAGE_MAX_CHARS = 2000
+
+_WORKSPACE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _workspace_lock(workspace: Path) -> asyncio.Lock:
+    """Return the process-wide MEMORY.md lock for one resolved workspace."""
+    key = str(Path(workspace).expanduser().resolve())
+    lock = _WORKSPACE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _WORKSPACE_LOCKS[key] = lock
+    return lock
+
+
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
 
     def __init__(self, workspace: Path):
-        self.memory_dir = ensure_dir(workspace / "memory")
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.memory_dir = ensure_dir(self.workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
 
@@ -75,7 +114,20 @@ class MemoryStore:
         return ""
 
     def write_long_term(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+        """Replace MEMORY.md atomically so a reader never sees a partial file."""
+        fd, temp_path = tempfile.mkstemp(
+            dir=self.memory_dir, prefix=".MEMORY.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            os.replace(temp_path, self.memory_file)
+        except BaseException:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
     def append_history(self, entry: str) -> None:
         with open(self.history_file, "a", encoding="utf-8") as f:
@@ -91,9 +143,8 @@ class MemoryStore:
         for message in messages:
             if not message.get("content"):
                 continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
             lines.append(
-                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
+                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}: {message['content']}"
             )
         return "\n".join(lines)
 
@@ -106,7 +157,17 @@ class MemoryStore:
         """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
         if not messages:
             return True
+        # MEMORY.md is a read-modify-write value shared by every store and
+        # consolidator pointed at this workspace in the process.
+        async with _workspace_lock(self.workspace):
+            return await self._consolidate_locked(messages, provider, model)
 
+    async def _consolidate_locked(
+        self,
+        messages: list[dict],
+        provider: LLMProvider,
+        model: str,
+    ) -> bool:
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
@@ -222,32 +283,169 @@ class MemoryConsolidator:
             self._get_tool_definitions(),
         )
 
+    @staticmethod
+    def _format_session_messages(messages: list[dict[str, Any]]) -> str:
+        """Render messages for the compression prompt, keeping tool references."""
+        lines = []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                content = json.dumps(content, ensure_ascii=False)
+            text = str(content or "")
+            if len(text) > _SUMMARY_MESSAGE_MAX_CHARS:
+                text = text[:_SUMMARY_MESSAGE_MAX_CHARS] + " …[truncated]"
+            refs = ""
+            for call in message.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    refs += f" [tool_call: {call.get('name', '?')} id={call.get('id', '?')}]"
+            if message.get("tool_call_id"):
+                refs += f" [tool_call_id: {message['tool_call_id']}]"
+            if message.get("name"):
+                refs += f" [name: {message['name']}]"
+            lines.append(f"{str(message.get('role', '?')).upper()}: {text}{refs}")
+        return "\n".join(lines)
+
+    async def _compress_session_locked(self, session: Session, end_idx: int) -> bool:
+        """Compress into the session summary; return False without advancing on failure."""
+        start = session.last_consolidated
+        if end_idx <= start:
+            return True
+        chunk = session.messages[start:end_idx]
+        if not chunk:
+            return True
+
+        prompt = _SESSION_SUMMARY_USER_PROMPT.format(
+            previous=session.summary or "(empty)",
+            messages=self._format_session_messages(chunk),
+        )
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=[
+                    {"role": "system", "content": _SESSION_SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                model=self.model,
+                reasoning_effort=None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Session compression failed for {}", session.key)
+            return False
+
+        summary = (response.content or "").strip()
+        if getattr(response, "finish_reason", None) == "error" or not summary:
+            logger.warning("Session compression: empty or failed summary for {}", session.key)
+            return False
+        if len(summary) > _MAX_SESSION_SUMMARY_CHARS:
+            summary = summary[:_MAX_SESSION_SUMMARY_CHARS]
+
+        previous_summary = session.summary
+        previous_offset = session.last_consolidated
+        session.summary = summary
+        session.last_consolidated = end_idx
+        try:
+            self.sessions.save(session)
+        except asyncio.CancelledError:
+            session.summary = previous_summary
+            session.last_consolidated = previous_offset
+            raise
+        except Exception:
+            session.summary = previous_summary
+            session.last_consolidated = previous_offset
+            logger.exception(
+                "Session compression: failed to persist summary for {}", session.key
+            )
+            return False
+        return True
+
+    def _archive_session_summary(self, session: Session, summary: str) -> bool:
+        """Append the session summary once per session, keyed by session key + digest."""
+        digest = hashlib.sha256(summary.encode("utf-8")).hexdigest()[:16]
+        marker = f"[session-summary:{session.key}:{digest}]"
+        try:
+            existing = self.store.history_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            existing = ""
+        if marker in existing:
+            return True
+        entry = (
+            f"{datetime.now().strftime('[%Y-%m-%d %H:%M]')} {marker}\n"
+            f"Session summary from compressed messages:\n{summary}"
+        )
+        try:
+            self.store.append_history(entry)
+        except Exception:
+            logger.exception("Failed to archive session summary for {}", self.store.workspace)
+            return False
+        return True
+
     async def archive_unconsolidated(self, session: Session) -> bool:
-        """Archive the full unconsolidated tail for /new-style session rollover."""
+        """Archive the unconsolidated tail and the session summary for /new.
+
+        The summary covers messages already compressed out of the tail, so it is
+        written separately. Nothing is cleared here; the caller clears the
+        session only after this returns True.
+        """
         lock = self.get_lock(session.key)
         async with lock:
-            snapshot = session.messages[session.last_consolidated:]
-            if not snapshot:
-                return True
-            return await self.consolidate_messages(snapshot)
+            start = session.last_consolidated
+            tail = session.messages[start:]
+            summary = session.summary.strip()
+
+            if tail:
+                if not await self.consolidate_messages(tail):
+                    return False
+                session.last_consolidated = len(session.messages)
+                try:
+                    self.sessions.save(session)
+                except Exception:
+                    session.last_consolidated = start
+                    logger.exception(
+                        "Failed to persist archived offset for {}", session.key
+                    )
+                    return False
+
+            if summary:
+                if not self._archive_session_summary(session, summary):
+                    return False
+                session.summary = ""
+                try:
+                    self.sessions.save(session)
+                except Exception:
+                    session.summary = summary
+                    logger.exception(
+                        "Failed to persist cleared summary for {}", session.key
+                    )
+                    return False
+            return True
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
-        """Loop: archive old messages until prompt fits within half the context window."""
+        """Loop: compress old messages into the session summary until the prompt fits.
+
+        This never touches MEMORY.md/HISTORY.md. Only a successful summary that
+        was persisted advances ``last_consolidated``; a failed round leaves the
+        session unchanged so the next turn can retry.
+        """
         if not session.messages or self.context_window_tokens <= 0:
             return
 
         lock = self.get_lock(session.key)
         async with lock:
-            target = self.context_window_tokens // 2
+            generation = getattr(self.provider, "generation", None)
+            reserve = int(getattr(generation, "max_tokens", 0) or 0) or 4096
+            window = self.context_window_tokens
+            target = max(1, (window - reserve) // 2)
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
-            if estimated < self.context_window_tokens:
+            if estimated + reserve <= window:
                 logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}",
+                    "Token consolidation idle {}: {}+{}/{} via {}",
                     session.key,
                     estimated,
-                    self.context_window_tokens,
+                    reserve,
+                    window,
                     source,
                 )
                 return
@@ -271,7 +469,7 @@ class MemoryConsolidator:
                     return
 
                 logger.info(
-                    "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
+                    "Session compression round {} for {}: {}/{} via {}, chunk={} msgs",
                     round_num,
                     session.key,
                     estimated,
@@ -279,10 +477,8 @@ class MemoryConsolidator:
                     source,
                     len(chunk),
                 )
-                if not await self.consolidate_messages(chunk):
+                if not await self._compress_session_locked(session, end_idx):
                     return
-                session.last_consolidated = end_idx
-                self.sessions.save(session)
 
                 estimated, source = self.estimate_session_prompt_tokens(session)
                 if estimated <= 0:

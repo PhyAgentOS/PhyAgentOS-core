@@ -47,6 +47,12 @@ async def _call(operation: Callable[[], Awaitable[dict[str, Any]]]) -> str:
 
 
 class ForgeToolContextTool(Tool):
+    """Read a Forge ToolSpec and its live readiness/context before invocation.
+
+    Readiness, frame, and pose belong to the live Gateway state, so this tool
+    never caches its response; every call must reflect the current runtime.
+    """
+
     def __init__(self, client: ForgeToolClient) -> None:
         self.client = client
 

@@ -23,6 +23,7 @@ class BaseChannel(ABC):
     name: str = "base"
     display_name: str = "Base"
     transcription_api_key: str = ""
+    supports_streaming: bool = False
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -75,6 +76,15 @@ class BaseChannel(ABC):
             msg: The message to send.
         """
         pass
+
+    async def send_event(self, msg: OutboundMessage) -> None:
+        """Deliver one streaming event.
+
+        Channels that support streaming override this and set
+        ``supports_streaming = True``. The default ignores events so those
+        channels only receive the final reply through ``send``.
+        """
+        return None
 
     def is_allowed(self, sender_id: str) -> bool:
         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
