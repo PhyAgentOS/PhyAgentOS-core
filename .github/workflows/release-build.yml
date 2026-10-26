@@ -6,7 +6,7 @@ on:
       tag:
         description: Tag to build
         required: true
-        default: v1.0.0
+        default: v1.1.1
         type: string
   push:
     tags:

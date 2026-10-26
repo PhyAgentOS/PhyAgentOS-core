@@ -2,7 +2,9 @@
 
 [中文](README_zh.md) · [Documentation index](../README.md)
 
-> Applies to PhyAgentOS 1.0.0.
+> Applies to PhyAgentOS 1.1.1.
+
+This is the canonical reference for public Tool API routes, identities and invocation/task semantics. Node-side messages and dataflow belong to [TrackB protocols](../user_development_guide/track_b/PROTOCOLS.md); optional interaction has its own [restricted extension contract](../interaction/README.md).
 
 ## 1. Execution boundary
 
@@ -146,8 +148,9 @@ revision keeps the same task ID and is bounded by replan count and deadline.
 
 ## 9. Evidence and verification
 
-PAOS performs best-effort capture before the first bound Action and after every bound Action reaches
-terminal accounting state. Evidence artifacts include source, phase, sequence, timestamps, media
+For ordinary robot workflows, PAOS performs best-effort capture before the first bound
+Action. `forge_task_finalize` collects after-evidence once task-owned Actions/Sessions have reached
+terminal accounting state, rather than after each individual Action. Evidence artifacts include source, phase, sequence, timestamps, media
 metadata, size, SHA-256, and workspace-relative references. Capture errors are recorded rather than
 hidden. Bundle identity, quality, capture-window, policy requirements, and retained artifact bytes
 are validated before the verifier receives the task context.
@@ -220,5 +223,5 @@ recorded separately with exact artifact digests and environment.
 
 - [Framework Introduction](../en/01-framework-introduction.md)
 - [Configuration Reference](../en/04-forge-configuration-reference.md)
-- [Integration Development Guide](../user_development_guide/README_en.md)
-- [Operations Manual](../user_manual/README_en.md)
+- [Bundle and Tool Integration Reference](../user_development_guide/README.md)
+- [Operations Manual](../user_manual/README.md)

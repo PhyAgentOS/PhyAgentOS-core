@@ -10,22 +10,20 @@
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4264ce" alt="MIT License"></a>
     <img src="https://img.shields.io/badge/Python-3.11%2B-4264ce?logo=python&amp;logoColor=white" alt="Python 3.11 or newer">
-    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.1.0-4264ce" alt="Release v1.1.0"></a>
+    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.1.1-4264ce" alt="Release v1.1.1"></a>
     <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/stargazers"><img src="https://img.shields.io/github/stars/PhyAgentOS/PhyAgentOS-core?style=flat&amp;color=4264ce" alt="GitHub stars"></a>
   </p>
   <p><a href="README.md">English</a> · <a href="README_zh.md">简体中文</a></p>
   <p>
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
-    <a href="#release">v1.1.0</a> ·
-    <a href="#quick-start">Quick Start</a> ·
+    <a href="#release">v1.1.1</a> ·
+    <a href="#quick-start">Install</a> ·
+    <a href="#simulation-quickstart">Quickstart</a> ·
     <a href="#quickstart-examples">Examples</a> ·
-    <a href="#control-modes">Control Modes</a> ·
-    <a href="#benchmarks">Benchmark</a> ·
-    <a href="#robot-skills">Robot Skills</a> ·
     <a href="#documentation">Documentation</a>
   </p>
-  <p><a href="docs/news/gosim-shenzhen-2026.md"><b>GOSIM Shenzhen 2026 Spotlight · October 16–17 · Meet us in Shenzhen</b></a></p>
+  <p><a href="#release"><b>v1.1.1 · Skill development, execution reliability and the Opper gateway</b></a></p>
 </div>
 
 ---
@@ -48,28 +46,27 @@
 | **Reusable physical capabilities** | Package environment-specific tools and runtimes as versioned Skills, keeping cognitive planning separate from robot integration. |
 
 <a id="release"></a>
-## What's new in v1.1.0
+## What's new in v1.1.1
 
-**Provider management, Skill Runtime and governed interactions.** This release adds:
+**Skill development, execution reliability and the Opper gateway.** Changes since v1.1.0:
 
-- **Provider management:** centralized configuration, connection tests, authentication, model discovery, saved model selection, and per-session overrides.
-- **More model connections:** direct OpenAI Responses API support for tools, multimodal input, reasoning effort, and Forge verification; Requesty, Cheaper Inference, and API Route gateways.
-- **Skill Runtime updates:** `directory_tar_gz` Node packages with bundled dependencies and validated internal relative symbolic links; profile startup timeouts, `required_tools` overrides, and startup-hook context for LIBERO 0.3.4.
-- **Governed interaction foundation (opt-in):** connect AgentTask and Session to multi-step decisions, independent root verification, and one deduplicated experience episode through frozen bindings, a persistent Runner, and a Supervisor. See [scope and enablement](docs/interaction/README.md).
-- **Reliability improvements:** preserve valid cron jobs, handle Dora status and profile environments, improve archive and image-path handling, and retain conversation history on model failures. Cancellation blocks new execution intents, late decisions are discarded, and uncertain operations retain guards until reconciliation without automatic retransmission.
-- **Guides and validation:** expanded regression and build checks, bilingual documentation, Piper and LIBERO-10 quickstarts, and clearer benchmark scope and results.
+- **Opper gateway:** OpenAI-compatible routing with provider selection, environment credentials and unchanged model identifiers.
+- **Local Skill development:** locally edited workflow documents and Node executables can run with warnings, while bindings and experience retain the activated workflow hash. Explicit Node verification and install-cache acceptance remain strict.
+- **Action rejection handling:** structured pre-dispatch Gateway rejections are recorded as failed and do not block a later retry or successful task finalization. Timeouts and uncertain remote execution retain their existing guards.
+- **Piper X development example:** bilingual Track B guides and an independent simulation Skill example cover model conversion, original Node locks, packaging and recorded validation. See the [Piper X guide](docs/user_development_guide/PIPER_X_DEMO.md) for its original runtime baseline.
+- **Clearer documentation:** consolidated bilingual manuals and contribution guidance, a MuJoCo Quickstart with live GIFs, and retained benchmark documentation links.
 
-See the [full changelog](CHANGELOG.md) and [changes since v1.0.0](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.0.0...v1.1.0).
+See the [full changelog](CHANGELOG.md) and [changes since v1.1.0](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.1.0...v1.1.1).
 
 <a id="quick-start"></a>
-## Quickstart · How to get started
+## Install and configure
 
-Start with a model-backed CLI conversation, then connect a robot or simulator Skill below. **Prerequisites:** Python 3.11 or 3.12, Git, and an API key for your model provider.
+Start with a model-backed CLI conversation, then follow the [MuJoCo Quickstart](#simulation-quickstart) below. **Prerequisites:** Python 3.11 or 3.12, Git, and an API key for your model provider.
 
 ### 1. Install and initialize
 
 ```bash
-git clone --branch v1.1.0 https://github.com/PhyAgentOS/PhyAgentOS-core.git
+git clone --branch v1.1.1 https://github.com/PhyAgentOS/PhyAgentOS-core.git
 cd PhyAgentOS-core
 python -m venv .venv
 source .venv/bin/activate
@@ -80,7 +77,6 @@ paos onboard
 On Windows PowerShell, replace the activation command with `.venv\Scripts\Activate.ps1`.
 
 ### 2. Connect a model
-
 
 Configure credentials with hidden input, then select the default:
 
@@ -94,7 +90,7 @@ Docker/secret input, process overrides and session commands (`/provider`, `/mode
 Session switches affect subsequent turns only and leave running tasks and other sessions unchanged.
 
 <details>
-<summary>Full configuration reference (v1.1.0)</summary>
+<summary>Full configuration reference (v1.1.1)</summary>
 
 The configuration file is serialized in camelCase; snake_case keys are also accepted.
 
@@ -163,53 +159,24 @@ paos agent
 
 You should receive a model response; `paos agent` opens an interactive conversation. This checks the core Agent and provider connection. Physical execution additionally needs a running Skill Runtime.
 
-Need another provider or deployment option? See the [user manual](docs/en/02-user-manual.md) · [Docker](docs/user_manual/DOCKER_en.md).
-
-<a id="control-modes"></a>
-## One framework, three control modes
-
-![General, hybrid, and action-model control through PhyAgentOS](docs/imgs/control-modes-en.png)
-
-System 1 / System 2 follow the supplied figure’s naming for general-model control and action-model control, respectively.
-
-These describe integration patterns; model and environment availability depends on the installed Physical Execution Skill. Core does not bundle model weights, simulator assets, or robot drivers.
-
-<a id="benchmarks"></a>
-## Benchmark
-
-Reported task success rates on **LIBERO-Long**, **RoboDojo**, and **RoboTwin**. Purple bars show PhyAgentOS (PAOS); muted bars show public-leaderboard references.
-
-**Evaluation scope:** LIBERO uses `libero-10` (labeled LIBERO-Long in the figures). RoboDojo and RoboTwin each use 10 randomly sampled tasks; sample counts vary for some models. Public-leaderboard references may use different protocols.
-
-![LIBERO-Long benchmark](docs/imgs/benchmark-libero-long-en.png)
-
-![RoboDojo benchmark](docs/imgs/benchmark-robodojo-en.png)
-
-![RoboTwin benchmark](docs/imgs/benchmark-robotwin-en.png)
-
-| PhyAgentOS configuration | LIBERO-10 ↑ | RoboDojo ↑ | RoboTwin ↑ |
-| --- | ---: | ---: | ---: |
-| GPT-6 + π0.5 | 100.00% | 23.30% | 76.70% |
-| DeepSeek 4.1 Flash + π0.5 | 97.22% | 26.70% | 77.80% |
-| GLM 5.3 Flash + π0.5 | 100.00% | 20.00% | 66.70% |
-| Gemini Robotic ER2 + π0.5 | — | — | 80.00% |
-| Kimi-K3 + π0.5 | — | — | 66.70% |
-| Gemini 3.8 Flash + π0.5 | — | — | 66.70% |
-| DeepSeek 4.1 Flash | 82.00% | 8.30% | — |
-| GPT-6 | — | 8.30% | — |
-| GLM 5.3 Flash | — | 2.78% | — |
-| Kimi-K3 | 60.00% | 0.00% | — |
-
-> English translations of the latest maintainer-supplied figures. See [full results, time and token usage, and evaluation context](docs/benchmarks.md). “—” means not reported. To reproduce the LIBERO evaluation, follow the [LIBERO quickstart](example/quickstart/libero-quickstart.md).
+Need another provider or deployment option? See the [user manual](docs/en/02-user-manual.md) · [Docker](docs/user_manual/DOCKER.md).
 
 <a id="robot-skills"></a>
-## Connect a robot or simulator
+<a id="simulation-quickstart"></a>
+## Quickstart · Control a robot in MuJoCo
 
-A **Physical Execution Skill** packages a workflow and its runtime requirements. Install the Skill for your environment, start one of its named profiles, then ask the Agent to use it.
+> [!TIP]
+> **Developers: bring your own robot — [Piper X customization demo](docs/user_development_guide/PIPER_X_DEMO.md).**
+> Follow the complete model-to-Skill example for joint and end-effector control. Use the [Skill development manual](docs/user_development_guide/track_b/SKILL_DEVELOPMENT.md) to choose between configuration changes, a new profile and Node development.
 
-**1. Install Dora for managed runtimes**
+Use **`robot-control-sim`** to control a simulated Piper arm through joint targets or
+end-effector poses. Complete the installation and model configuration above first.
+The prebuilt simulation Nodes used here target **Linux x86_64** and require a working
+graphical display or virtual display for MuJoCo and the image viewer.
 
-v1.1.0 retains the Dora CLI **0.4.1** (`dora-message` **0.7.0**) compatibility baseline. On Linux/macOS:
+### 1. Install Dora
+
+v1.1.1 retains the Dora CLI **0.4.1** (`dora-message` **0.7.0**) compatibility baseline:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -217,66 +184,96 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 dora --version
 ```
 
-Dora is needed for `paos skill start`; the CLI conversation above does not require it. [Windows and Cargo instructions](docs/en/02-user-manual.md#dora-cli-for-managed-skill-profiles).
+Dora is required to start the simulation Runtime. See the [Dora installation reference](docs/en/02-user-manual.md#dora-cli-for-managed-skill-profiles) for other installation methods.
 
-**2. Find and install a Skill**
+### 2. Install robot-control-sim
 
-For registry downloads, set `resourceRegistry.url` in your config or export `PAOS_RESOURCE_REGISTRY_URL` to the registry supplied by your deployment. Then run:
-
-```bash
-paos skill search
-paos skill install <skill-name> --version <version>
-paos skill inspect <skill-name>
-```
-
-Replace `<skill-name>` and `<version>` with a search result. For an independently obtained local bundle:
+Set `resourceRegistry.url` in your config, or `PAOS_RESOURCE_REGISTRY_URL`, to a deployment
+that provides `robot-control-sim` and its locked Node artifacts. Then run:
 
 ```bash
-paos skill install /path/to/skill-bundle.tar.gz --local
+paos skill search robot-control-sim
+paos skill install robot-control-sim
+paos skill inspect robot-control-sim
 ```
 
-**3. Start the runtime and submit a task**
+`inspect` shows the installed version, profiles and dependencies. This example uses
+`mujoco-piper`; `mujoco-franka` and `mujoco-so101` select other robots. For a separately
+obtained Bundle, use `paos skill install /path/to/robot-control-sim.tar.gz --local`;
+its locked Nodes must also be available. Core does not bundle these simulation assets.
 
-Replace `<profile>` with a profile declared by the installed Skill; follow its setup instructions for models, assets, and hardware.
+### 3. Start the simulation
 
 ```bash
-paos skill start <skill-name> --profile <profile>
-paos skill status <skill-name>
-paos agent -m "Inspect the active Skill and Physical Execution capabilities, then report which tasks are available."
+paos skill start robot-control-sim --profile mujoco-piper
+paos skill status robot-control-sim
 ```
 
-Once the runtime is healthy, describe a task supported by that Skill in `paos agent`. Starting the Agent does not automatically download or start a runtime.
+Wait for the Runtime to report healthy and the simulation camera viewer to open. If startup
+fails, inspect `paos skill logs robot-control-sim` before sending a motion request.
 
-<details>
-<summary>Useful runtime commands</summary>
+![Live robot-control-sim startup in MuJoCo](docs/imgs/quickstart/robot-control-sim-startup.gif)
+
+### 4. Control joints and the end effector
+
+The Agent reads `sim.get_robot_info` and live Tool context to determine joints, limits, frames
+and units, then follows the active Skill workflow. The absolute targets below are for
+`mujoco-piper` (`arm_base` / `tcp`); use the selected robot's frames and reachable targets when switching profiles.
+
+| Control mode | Tool | Target |
+| --- | --- | --- |
+| Joint targets | `sim.set_joint_positions` | Absolute arm joint positions in radians |
+| End-effector pose | `sim.move_eef` | Absolute position in meters and quaternion orientation; the motion server solves IK |
+
+These motion demos use `verification.mode=off`, so success is derived from Tool execution results. For semantic task verification and evidence policies, see the [Core developer manual](docs/en/03-developer-manual.md#7-verification-and-recovery).
+
+Try a joint-space request:
 
 ```bash
-paos skill list
-paos skill logs <skill-name>
-paos skill stop <skill-name>
-paos gateway
+paos agent -m "Use robot-control-sim (mujoco-piper). Inspect robot info and Tool context. For this \
+  motion demo use verification.mode=off. Move joint1-joint6 to [0.35, 0.55, -0.9, 0.15, \
+  0.25, -0.1] rad via sim.set_joint_positions, with velocity_scale=0.2 and \
+  acceleration_scale=0.2. Read the action result, finalize the task and report briefly. Do \
+  not edit files or use shell tools; report any failure."
 ```
 
-`paos gateway` runs configured message channels and background services. For readiness checks and troubleshooting, see the [operations guide](docs/user_manual/README_en.md).
+![A joint-target command followed by live Piper motion](docs/imgs/quickstart/robot-control-sim-joint-control.gif)
 
-Each Physical Execution Skill bundle declares its workflow document, required Tool IDs, named runtime profiles,
-and exact platform/architecture Node locks. Each locked archive has an exact SHA-256 and contains
-either one named root-level executable (`executable_tar_gz`) or one root directory named after the
-entrypoint that holds the executable and its runtime tree (`directory_tar_gz`). For Registry Node
-downloads, the verified Skill lock supplies the
-digest when the Registry omits that duplicate field, and the exact size is resolved before the
-download begins; installation records and verifies the extracted binary hash.
-`python scripts/package_skill.py <bundle-dir> --output-dir <directory>` creates a deterministic
-bundle for publication. The PhyAgentOS source and release packages do not
-bundle concrete Physical Execution Skills, Physical Execution nodes, models, or simulation assets; obtain only the Skills
-needed for a deployment and install them explicitly.
-The [integration development guide](docs/user_development_guide/README_en.md#5-package-publish-and-close-the-local-loop)
-documents Bundle layout, local validation, immutable publication order, and Registry acceptance.
+Then try a Cartesian request:
 
-</details>
+```bash
+paos agent -m "Use robot-control-sim (mujoco-piper). Inspect Tool context. For this motion demo use \
+  verification.mode=off. Call sim.move_eef for TCP in arm_base: position (0.284045, \
+  0.007878, 0.478706) m, quaternion xyzw (-0.002904, 0.693239, 0.008319, 0.720654), \
+  position_tolerance_m=0.01, orientation_tolerance_rad=0.05, velocity_scale=0.2, \
+  acceleration_scale=0.2. Let the motion server solve IK. Read the action result, finalize \
+  the task and report briefly. Do not edit files or use shell tools; report any failure."
+```
+
+![An end-effector pose command followed by live Piper motion](docs/imgs/quickstart/robot-control-sim-eef-control.gif)
+
+*Live recordings of the command and MuJoCo simulation; the captured command panel is held visible and model-wait pauses are shortened.*
+
+You can also run `paos agent` for interactive control. Motion should be visible in the simulation;
+read the returned execution result and final state rather than treating admission as completion.
+
+### 5. Stop the simulation
+
+After the motion task has finished:
+
+```bash
+paos skill stop robot-control-sim
+```
+
+### Extend this example
+
+- [TrackB framework guide](docs/user_development_guide/track_b/README.md): architecture, repository catalog and Node protocols.
+- [Skill development manual](docs/user_development_guide/track_b/SKILL_DEVELOPMENT.md): configure a profile, add a profile, or develop Nodes and assemble a Skill.
+- [Piper X development demo](docs/user_development_guide/PIPER_X_DEMO.md): adapt `robot-control-sim` to another arm, including model conversion and both control modes.
+- [Bundle and Tool integration reference](docs/user_development_guide/README.md): manifest fields, packaging and local installation.
 
 <a id="quickstart-examples"></a>
-## Quickstart examples
+## More examples
 
 | Platform | Coverage | Guide |
 | --- | --- | --- |
@@ -289,19 +286,23 @@ documents Bundle layout, local validation, immutable publication order, and Regi
 | I want to… | Start here |
 | --- | --- |
 | Install, configure, and run PhyAgentOS | [User manual](docs/en/02-user-manual.md) |
-| Build a Skill or connect an environment | [Integration guide](docs/user_development_guide/README_en.md) |
+| Build a Skill or connect an environment | [TrackB development guide](docs/user_development_guide/track_b/README.md) |
 | Understand the Physical Execution API | [Physical Execution Tool API](docs/forge/README.md) |
-| Develop and test Core | [Developer manual](docs/en/03-developer-manual.md) |
-| Inspect benchmark values and provenance | [Benchmark](docs/benchmarks.md) |
+| Extend robot-control-sim to another arm | [Piper X development demo](docs/user_development_guide/PIPER_X_DEMO.md) |
+| Develop and test Core | [Core developer manual](docs/en/03-developer-manual.md) |
+| Inspect benchmark results and evaluation context | [Benchmark documentation](docs/benchmarks.md) |
 | Browse all documentation | [Documentation index](docs/README.md) |
 
 <a id="news"></a>
 ## News
 
+**2026-10-23 · v1.1.1 released:** Opper gateway support, local Skill development and Action rejection fixes, plus bilingual Track B and Piper X guides. [Release notes and packages](https://github.com/PhyAgentOS/PhyAgentOS-core/releases/tag/v1.1.1).
+
 **2026-10-10 · GOSIM Shenzhen 2026:** PhyAgentOS has been selected for Spotlight and will present in the Open Source Robotics track. [Read the announcement and event details](docs/news/gosim-shenzhen-2026.md).
 
 | Version | Date | Update |
 | --- | --- | --- |
+| **v1.1.1** | 2026-10-23 | Opper gateway, local Skill development and Action rejection fixes, bilingual Track B and Piper X guides, and a MuJoCo Quickstart. |
 | **v1.1.0** | 2026-10-09 | Centralized provider management, direct OpenAI Responses and new gateways, Skill Runtime packaging and startup improvements, and an opt-in governed interaction foundation. |
 | **v1.0.0** | 2026-08-30 | Initial stable release of PhyAgentOS. |
 | **v0.2.3** | 2026-08-27 | Physical Execution Skills can be installed and managed independently, activated into immutable AgentTask bindings, and used through governed Query, Action, and Session Tool API lifecycles with recovery and version-scoped experience. |
@@ -311,7 +312,7 @@ See the [full changelog](CHANGELOG.md).
 
 ## Contributing & community
 
-Contributions are welcome: report a bug, improve a Skill, add an environment integration, or help with documentation. Start with the [developer manual](docs/en/03-developer-manual.md) and open an [issue](https://github.com/PhyAgentOS/PhyAgentOS-core/issues) or pull request.
+Start with the [contribution guide](CONTRIBUTING.md) and the development manuals. We recommend focusing on TrackB Nodes, Skills and robot/environment integrations. External resource-platform submissions and changes to existing registered repositories are not yet open; they require completion and opening of the approval service. Local development and validation can proceed; see the guide for the current scope and source-review process.
 
 <details>
 <summary>Development checks</summary>

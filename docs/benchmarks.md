@@ -1,6 +1,6 @@
 # Benchmark results / 测评结果
 
-[English README](../README.md#benchmarks) · [中文 README](../README_zh.md#benchmarks)
+[English README](../README.md) · [中文 README](../README_zh.md)
 
 Values are transcribed from the three latest benchmark screenshots supplied by the maintainer. Model labels, ordering, and source categories follow the figures. PAOS entries are PhyAgentOS results; muted entries are labeled as public-leaderboard references in the source figures.
 

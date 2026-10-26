@@ -1,0 +1,3 @@
+mujoco==3.3.7
+numpy==2.3.4
+PyYAML==6.0.3

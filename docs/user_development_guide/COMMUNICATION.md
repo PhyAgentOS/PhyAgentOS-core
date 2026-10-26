@@ -1,155 +1,126 @@
-# PhyAgentOS 通信架构
+# PhyAgentOS Core Communication Architecture
 
-[English](COMMUNICATION_en.md) · [文档索引](../README.md)
+[中文](COMMUNICATION_zh.md) · [Documentation index](../README.md)
 
-> 版本：1.0.0
+> Version: 1.1.1
 
-## 1. 通信边界
+This reference covers Core message, observation, verification and persistence boundaries. For Forge Node messages and dataflow ports, use [TrackB protocols](track_b/PROTOCOLS.md). HTTP routes and invocation semantics have one canonical definition in the [API contract](../forge/README.md).
 
-PhyAgentOS 分离六类边界：
+## 1. Communication boundaries
 
-1. 用户/渠道 ↔ AgentLoop 消息；
-2. Agent tools ↔ AgentTaskCoordinator；
-3. ForgeToolClient ↔ Gateway Query/Action/Session Tool API；
-4. observation collector ↔ Gateway 图像/state WebSocket；
-5. verifier ↔ 独立 Verification Service；
-6. AgentTask/experience/Runtime ↔ 各自持久化存储。
+PhyAgentOS separates six boundaries:
 
-边界之间共享不透明 reference，不共享执行所有权。
+1. user/channel ↔ AgentLoop messages;
+2. Agent tools ↔ AgentTaskCoordinator;
+3. ForgeToolClient ↔ Gateway Query/Action/Session Tool API;
+4. observation collector ↔ Gateway image/state WebSockets;
+5. verifier ↔ isolated Verification Service;
+6. AgentTask/experience/Runtime ↔ their own persistent stores.
 
-## 2. 用户消息边界
+The boundaries share opaque references, not execution ownership.
 
-渠道向 Agent bus 发布 `InboundMessage`。AgentLoop 构造上下文、调用模型与工具，再发送
-`OutboundMessage`。Tool call 遵循注册的 JSON schema。现有文件、目录、Shell、Web、消息、
-图片、Scene Graph、Cron、Spawn、Agent Mode、Skill activation 和动态 MCP tools 都使用同一
-Loop。
+## 2. User-message boundary
 
-AgentTask 的 `origin_session_key` 将 completion experience 关联到原 Agent conversation；它
-不是 Gateway execution identifier。
+Channels publish `InboundMessage` objects to the Agent bus. AgentLoop builds context, invokes the
+model and tools, then emits `OutboundMessage`. Tool calls use registered JSON schemas. The existing
+file, directory, shell, web, messaging, image, Scene Graph, Cron, Spawn, Agent Mode, Skill
+activation, and dynamic MCP tools follow this same loop.
 
-## 3. AgentTask 边界
+AgentTask's `origin_session_key` associates completion experience with the originating Agent
+conversation. It is not a Gateway execution identifier.
 
-```text
-forge_task_create
-forge_task_get
-forge_task_begin_revision
-forge_task_finalize
-forge_task_cancel
-```
+## 3. AgentTask boundary
 
-这些 tools 调用 AgentTaskCoordinator，不调用 Dora 或机器人。Coordinator 使用事务 SQLite
-限制一个非终态 AgentTask，并保存只追加 PlanRevision、Tool record、evidence reference 与
-verification attempt。
+Task lifecycle tools are listed in the [API contract](../forge/README.md#6-agent-tools).
 
-诊断 Query 可不带 `task_id`；受治理 Query 以及全部 Action/Session 必须带 task。Wrapper 先
-检查不可变 Skill/Runtime/ToolSpec binding，再围绕同一 Gateway request 创建或更新匹配 Tool
-record。这是任务聚合，不是第二条物理执行面。
+These tools call AgentTaskCoordinator and never call Dora or a robot. The coordinator uses
+transactional SQLite to enforce one non-terminal AgentTask and stores append-only PlanRevisions,
+Tool records, evidence references, and verification attempts.
 
-## 4. Gateway HTTP 边界
+Diagnostic Query may omit `task_id`; governed Query and every Action/Session include it. The
+wrapper checks the immutable Skill/Runtime/ToolSpec binding and creates or updates the matching
+Tool record around the same Gateway request. This is aggregation, not another execution plane.
 
-```text
-GET  /tools
-GET  /tools/{tool_id}
-GET  /tools/{tool_id}/context
-POST /tools/{endpoint_id}/{operation}:invoke   # Query，HTTP 200
-POST /tools/{tool_id}:invoke                   # Action/Session admission，HTTP 202
-GET  /invocations/{invocation_id}
-GET  /invocations/{invocation_id}/result       # pending 时 HTTP 202
-POST /invocations/{invocation_id}/cancel
-POST /invocations/{invocation_id}/stop         # Session
-```
+## 4. Gateway HTTP boundary
 
-Query 先读取 ToolSpec，再使用其 `endpoint_id`、`operation` 和 `semantics=query` binding。
-Action/Session 根据稳定 Tool ID 调用，两者返回 `invocation_id`，Action 还返回 `attempt_id`。
+The [API contract](../forge/README.md#2-tool-discovery-and-context) defines discovery, Query, Action and Session routes and response envelopes. Core keeps transport handling in `ForgeToolClient`; timeout leaves the remote outcome unknown.
 
-成功响应必须是 `ok=true` 且 `data` 为 object 的 JSON。Error envelope 可以携带 code 与
-retryability。Transport timeout 表示远端状态未知。即使后续本地持久化或追踪失败，也必须保留
-响应中已返回的 invocation identity。
+Returned invocation identities must be retained even if subsequent local persistence or tracking fails. Verification and experience components do not replace the Gateway execution owner.
 
-## 5. Identity 边界
+## 5. Identity boundary
 
-| Identity | Namespace | 可变性 |
-|:---------|:----------|:-------|
-| `task_id` | PAOS AgentTask | 对全部 revisions 稳定 |
-| `binding_id` | PAOS Forge binding | 不可变 Skill/Runtime/ToolSpec 快照 |
-| `revision_id` | PAOS PlanRevision | 不可变、只追加规划世代 |
-| `record_id` | PAOS ToolExecutionRecord | 不可变 record identity |
-| `caller_id` | PAOS ToolExecutionRecord | 异步 admission 前持久化 |
-| `invocation_id` | Gateway ToolInvocation | 稳定 Action/Session 生命周期 identity |
-| `attempt_id` | Gateway attempt | 对返回的 attempt 稳定 |
+Namespaces and correlation fields are defined in the [binding and identity contract](../forge/README.md#7-binding-identity-and-correlation). Components exchange explicit stored references; they must not derive a Gateway identity from a PAOS task or revision ID.
 
-组件不能从另一个 namespace 派生 identity；关联依赖显式保存的 reference。
+## 6. Invocation terminal semantics
 
-## 6. Invocation 终态语义
+Use the [Action](../forge/README.md#4-action-contract), [Session](../forge/README.md#5-session-contract) and [AgentTask](../forge/README.md#8-agenttask-model) contracts for terminal and cancellation behavior. Core persists request/response observations and reconciles them before finalization; local cancellation or transport completion cannot establish physical stop.
 
-Gateway status/result 是唯一 Action/Session 终态来源。Pending 保持非终态。已知终态包括 Gateway
-报告的 success、failure、cancellation 或 stopped。`unknown` 对 PAOS 记账是终态，因为无法
-证明继续进展，但它不是已知物理停止，并继续参与正常 Runtime stop 门控。
+## 7. Evidence WebSocket boundary
 
-Cancellation/stop `requested` 或 `accepted` 只确认控制消息投递，不会取消追踪，也不会直接把
-AgentTask 设为 cancelled。PAOS 继续核对并显式 finalize task。
+PAOS connects to configured image and optional state streams using bounded connection and capture
+timeouts. Messages are treated as untrusted input. Image media, decoded size, sequence, phase,
+source, local receive time, and SHA-256 are validated before persistence.
 
-## 7. Evidence WebSocket 边界
+For ordinary robot workflows, the collector captures before the first bound Action and during
+finalization after task-owned Actions/Sessions reach terminal accounting state. Evidence association is best-effort; Gateway ToolResult and invocation events
+remain authoritative for execution.
 
-PAOS 使用有界连接和采集 timeout 连接配置的图像流与可选 state 流。消息均作为不可信 input。
-持久化前校验图像 media、decoded size、sequence、phase、source、本机 receive time 与
-SHA-256。
+## 8. Verification boundary
 
-Collector 在第一次绑定物理执行前和全部 task-owned 执行达到记账终态后采集。Evidence association
-为 best-effort；Gateway ToolResult 与 invocation events 仍是权威执行事实。
+The Agent-side verifier sends resolved public task contracts, normalized Tool facts, evidence,
+history, and frozen scoped Lessons to the isolated Verification Service. Lessons are untrusted,
+non-authoritative advice. The service cannot invoke Gateway, create a PlanRevision, or change
+execution records.
 
-## 8. Verification 边界
+Verifier output must validate as the versioned verdict contract. AgentTaskCoordinator applies
+`off`, `audit`, `enforce`, or `recovery` semantics and persists every attempt.
 
-Agent-side verifier 把已解析公共任务契约、规范化 Tool facts、evidence、history 和冻结的
-scoped Lessons 发送给独立 Verification Service。Lesson 是不可信、非权威建议。Service 不能
-调用 Gateway、创建 PlanRevision 或修改 execution record。
+## 9. Experience boundary
 
-Verifier output 必须通过版本化 verdict contract。AgentTaskCoordinator 应用 `off`、`audit`、
-`enforce` 或 `recovery` 语义并持久化每次 attempt。
+ExperienceCoordinator receives an AgentTask completion reference. `AgentTaskOutcomeSource` builds a
+redacted envelope containing workflow structure, semantic verdicts, field names, and opaque task,
+revision, invocation, attempt, and evidence references. Raw arguments, results, credentials,
+endpoints, and physical coordinates are not copied into learned content.
 
-## 9. Experience 边界
+The episode is unique per AgentTask. PlanRevisions, repeated completion notifications, reviews,
+and replay do not create independent support.
 
-ExperienceCoordinator 接收 AgentTask completion reference。`AgentTaskOutcomeSource` 构造去敏
-envelope，包含 workflow structure、semantic verdict、字段名，以及不透明 task、revision、
-invocation、attempt 与 evidence references。原始 arguments、results、凭据、endpoint 和物理
-坐标不会复制到学习内容。
+## 10. Persistence boundary
 
-每个 AgentTask 只有一个 episode。PlanRevision、重复 completion notification、review 与
-replay 不增加独立支持。
+| Store | Content |
+|:------|:--------|
+| `.paos/agent_tasks/tasks.sqlite3` | AgentTask records and append-only events |
+| `artifacts/agent_tasks/<task_id>/` | Before/after snapshots, bundle metadata, evidence entities |
+| `.paos/evolution/experience.sqlite3` | Bindings, episodes, Lessons, candidates, jobs, events |
+| Skill Runtime state path | Installed Runtime state, invocation/Session IDs, task bindings, and audit events |
+| Skill Runtime logs path | Lifecycle and Dora launch logs |
 
-## 10. 持久化边界
+SQLite updates and artifact writes are transactional or atomic within their own boundary. A
+Gateway response is not rolled back because local experience processing failed; evolution is
+fail-open.
 
-| Store | 内容 |
-|:------|:-----|
-| `.paos/agent_tasks/tasks.sqlite3` | AgentTask records 与 append-only events |
-| `artifacts/agent_tasks/<task_id>/` | before/after snapshot、bundle metadata、evidence entity |
-| `.paos/evolution/experience.sqlite3` | binding、episode、Lesson、candidate、job、event |
-| Skill Runtime state path | installed Runtime state、invocation/Session IDs、task bindings 与 audit events |
-| Skill Runtime logs path | 生命周期与 Dora launch 日志 |
+## 11. Skill Runtime and Registry boundary
 
-SQLite update 与 artifact write 在各自边界中保持事务或原子。不能因为本地 experience 处理
-失败而回滚 Gateway response；evolution fail-open。
+Registry/index clients return artifact metadata and downloads. Cache and installers require size
+and SHA-256, then validate archive inventories and the Node archive contract (single root
+executable, or a single root directory tree for `directory_tar_gz`) before atomic installation.
+RuntimeManager starts a named Dora flow and observes Gateway `/tools`; it never calls an alternate
+Gateway Agent API.
 
-## 11. Skill Runtime 与 Registry 边界
+The active Runtime availability provider supplies Skill visibility and Gateway URL to the Agent.
+It does not mutate AgentTask or experience data.
 
-Registry/index client 返回 artifact metadata 与下载。Cache/installer 要求 size 与 SHA-256，
-随后校验 archive inventory 和 Node 归档契约（单根目录可执行文件，或 `directory_tar_gz` 的单根目录树），再原子安装。RuntimeManager 启动命名 Dora flow
-并观察 Gateway `/tools`，不调用另一套 Gateway Agent API。
+## 12. Trust rules
 
-活动 Runtime availability provider 向 Agent 提供 Skill visibility 与 Gateway URL，但不修改
-AgentTask 或 experience 数据。
+- Treat ToolSpec, Gateway responses, WebSocket payloads, task text, and learned text as untrusted data.
+- Never log credentials or raw sensitive task inputs.
+- Never infer stop from cancel acceptance, timeout, or unknown.
+- Never bypass digest or archive safety checks.
+- Never place a second execution API between Agent tools and ForgeToolClient.
+- Keep Runtime force-stop and destructive artifact cleanup as explicit operator actions.
 
-## 12. 信任规则
+## Next reading
 
-- ToolSpec、Gateway response、WebSocket payload、task text 与 learned text 都是不可信数据；
-- 不记录凭据或原始敏感任务 input；
-- 不从 cancel accepted、timeout 或 unknown 推断停止；
-- 不绕过 digest 或 archive safety check；
-- 不在 Agent tools 与 ForgeToolClient 之间增加第二套执行 API；
-- Runtime force-stop 与破坏性 artifact cleanup 必须是显式运维动作。
-
-## 后续阅读
-
-- [集成开发指南](README.md)
-- [运行手册](../user_manual/README.md)
-- [Forge Tool API 契约](../forge/README_zh.md)
+- [Bundle and Tool Integration Reference](README.md)
+- [Operations Manual](../user_manual/README.md)
+- [Forge Tool API Contract](../forge/README.md)

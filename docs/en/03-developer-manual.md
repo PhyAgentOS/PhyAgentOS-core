@@ -1,8 +1,10 @@
-# PhyAgentOS Developer Manual
+# PhyAgentOS Core Developer Manual
 
 [中文](../zh/03-developer-manual.md) · [Documentation index](../README.md)
 
-> Documentation version: 1.0.0.
+> Documentation version: 1.1.1.
+
+This manual covers Core implementation: AgentTask coordination, persistence, binding, verification and Runtime management. For robot, Node and Skill development, start with the [TrackB framework guide](../user_development_guide/track_b/README.md). The [Forge Tool API contract](../forge/README.md) is the canonical reference for routes, identities and lifecycle semantics.
 
 ## 1. Development invariants
 
@@ -33,18 +35,7 @@
 `ForgeToolClient` accepts only JSON object envelopes with `ok=true` and object-valued `data`.
 Errors preserve HTTP status, error code, retryability, and any returned invocation identity.
 
-| Operation | HTTP contract |
-|:----------|:--------------|
-| List Tools | `GET /tools` → 200 |
-| Read ToolSpec | `GET /tools/{tool_id}` → 200 |
-| Read context | `GET /tools/{tool_id}/context` → 200 |
-| Invoke Query | resolve ToolSpec, then `POST /tools/{endpoint_id}/{operation}:invoke` → 200 |
-| Admit Action | `POST /tools/{tool_id}:invoke` → 202 |
-| Action status | `GET /invocations/{invocation_id}` → 200 |
-| Action result | `GET /invocations/{invocation_id}/result` → 200 or pending 202 |
-| Request cancel | `POST /invocations/{invocation_id}/cancel` → 200 or accepted 202 |
-| Admit Session | `POST /tools/{tool_id}:invoke` → 202 |
-| Stop Session | `POST /invocations/{invocation_id}/stop` → 200 or accepted 202 |
+Routes, response codes and pending/cancel/stop semantics are defined in the [Forge Tool API contract](../forge/README.md#2-tool-discovery-and-context). Keep the client implementation aligned with that contract rather than introducing a second route definition here.
 
 Path components are percent-encoded. PAOS supplies `caller_id` and persists it with the intent
 before Action/Session admission. Admission must contain a non-empty `invocation_id`; Action also
@@ -52,24 +43,7 @@ requires `attempt_id`. A timeout leaves an unknown record and recovery never rep
 
 ## 4. Agent-facing tools
 
-Task lifecycle:
-
-- `forge_task_create(task_description, verification, activation_id)`;
-- `forge_task_get(task_id)`;
-- `forge_task_begin_revision(task_id, reason)`;
-- `forge_task_finalize(task_id)`;
-- `forge_task_cancel(task_id, reason?)`.
-
-Tool transport:
-
-- `forge_tool_context(tool_id)`;
-- `forge_tool_query(tool_id, arguments, task_id?, timeout_ms?)`;
-- `forge_tool_start_action(task_id, tool_id, arguments, timeout_ms?)`;
-- `forge_tool_action_status(task_id, invocation_id)`;
-- `forge_tool_action_result(task_id, invocation_id)`;
-- `forge_tool_cancel_action(task_id, invocation_id)`;
-- `forge_tool_start_session(task_id, tool_id, arguments, ownership)`;
-- `forge_tool_session_status/result/stop_session(task_id, invocation_id)`.
+The public Agent-facing tool catalog is maintained in the [API contract](../forge/README.md#6-agent-tools). Implement wrappers in `agent/tools/forge_tool_api.py` and `agent/tools/forge_task.py`; keep transport handling in `forge/tool_client.py` and coordination in `forge/task.py`.
 
 Diagnostic Query and bound calls invoke the same HTTP methods. Every mutating or task-attributed
 wrapper validates ownership and the frozen Tool binding before network access. Tool wrappers must
@@ -85,24 +59,13 @@ timestamps. Each `PlanRevision` contains its own Tool records, verdict, and veri
 inside the same transaction, enforcing one global active slot across processes. Updates write the
 complete validated record and an append-only event. Callers do not modify tables directly.
 
-Terminal task states are `succeeded`, `failed`, and `cancelled`. Non-terminal states are
-`executing`, `cancelling`, and `awaiting_replan`. Tool status `unknown` is terminal for aggregate
-accounting but is a failure, not evidence of stop.
+The [AgentTask state contract](../forge/README.md#8-agenttask-model) defines public states. Store transitions must preserve those semantics; an `unknown` Tool record closes accounting without proving physical stop.
 
 ## 6. Bound execution lifecycle
 
-1. Activate the primary Skill and freeze its Runtime/ToolSpec candidate into AgentTask revision 1.
-2. On the first bound physical execution, perform best-effort before-capture.
-3. Invoke Query or admit Action/Session through ForgeToolClient.
-4. Persist caller intent before admission and then retain Gateway invocation/attempt references.
-5. Update asynchronous records only from authoritative status/result responses.
-6. After every task-owned execution is terminal, perform after-capture on finalize.
-7. Aggregate Tool records, evidence, and the task contract for verification.
-8. Persist task and revision verdicts; schedule one terminal experience episode.
+Core coordinates activation/binding, durable intent admission, authoritative response recording and finalization. Keep intent persistence before transport dispatch and write Gateway references back to the same task revision. Finalization waits for task-owned executions, collects after-evidence and applies verification before scheduling experience.
 
-Once a record is terminal, later observations do not rewrite it. Cancellation responses are
-stored, but `requested` or `accepted` leaves the task in `cancelling` until reconciliation and
-explicit finalization.
+The public [binding/identity](../forge/README.md#7-binding-identity-and-correlation) and [AgentTask lifecycle](../forge/README.md#8-agenttask-model) definitions are maintained in the API contract. Cancellation responses remain records of requests until reconciliation and finalization establish the aggregate result.
 
 ## 7. Verification and recovery
 
@@ -128,13 +91,7 @@ execution references, bundle metadata, and tombstone information required for au
 
 ## 9. Skill Runtime contracts
 
-A `skill.yaml` manifest must use `manifest_version: 2`, a directory-safe name/version, a relative
-Skill document, an HTTP(S) `gateway_url`, non-empty required Tools, at least one profile, and strict
-known fields. Registry-resolved nodes require artifact identity, version, platform, architecture,
-archive type (`executable_tar_gz` or `directory_tar_gz`), the entrypoint, and SHA-256. An
-`executable_tar_gz` archive contains one root-level executable named by the entrypoint; a
-`directory_tar_gz` archive contains one root directory named after the entrypoint that holds the
-same-named executable plus its runtime tree (tree-internal relative symlinks are allowed).
+Manifest fields, Node archive layouts and startup-hook environment are documented in the [Bundle and Tool integration reference](../user_development_guide/README.md#4-build-a-manifest-v2-skill-bundle). Core implements these contracts in `skill_runtime/manifest.py`, archive validators and installers.
 
 Archive validation rejects absolute/traversing paths, links outside the node-tree cases above,
 duplicate/colliding paths, oversized
@@ -196,18 +153,11 @@ Evolution failures remain fail-open.
 
 ## 12. Extension workflows
 
-To add a robot capability:
+For robot/model configuration, new profiles, or new Nodes, follow the [three TrackB extension modes](../user_development_guide/track_b/SKILL_DEVELOPMENT.md) and [Piper X example](../user_development_guide/PIPER_X_DEMO.md).
 
-1. implement or package the ToolEndpoint operation;
-2. publish a Query, Action, or Session ToolSpec with exact schemas and binding;
-3. define operation `max_concurrency` in Gateway;
-4. add the locked node and profile references to a manifest-v2 Bundle;
-5. test binding drift, context, invocation, pending, terminal, cancel/stop, ownership, and unknown outcomes;
-6. add workflow guidance to a Skill without embedding task-specific coordinates or secrets.
+Core changes should extend the existing generic client, binding, coordinator or installer only when the capability requires it. Preserve the API contract and add focused regression coverage at the affected implementation boundary. Do not add an alternate Agent-to-Dora execution path.
 
-Do not create a second PAOS execution protocol, direct Agent-to-Dora calls, or a cross-Tool lease.
-A new Agent tool is justified only when the generic task and Tool API tools cannot express the
-capability.
+The opt-in [interaction foundation](../interaction/README.md) is a separate restricted extension; its deployment limits also apply to Core changes.
 
 ## 13. Test gates
 
@@ -226,5 +176,10 @@ conditional on independently installed matching artifacts and Dora availability.
 ## Next reading
 
 - [Forge Tool API Integration Contract](../forge/README.md)
-- [Integration Development Guide](../user_development_guide/README_en.md)
+- [Bundle and Tool Integration Reference](../user_development_guide/README.md)
 - [Agent Experience and Skill Evolution](05-agent-experience-and-skill-evolution.md)
+
+## Node development references
+
+- [TrackB framework guide](../user_development_guide/track_b/README.md)
+- [Piper X MuJoCo development example](../user_development_guide/PIPER_X_DEMO.md)

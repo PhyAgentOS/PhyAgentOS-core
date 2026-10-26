@@ -1,6 +1,6 @@
 # Forge Configuration Reference
 
-> Applies to PhyAgentOS 1.0.0 and the unified Forge Gateway Tool API.
+> Applies to PhyAgentOS 1.1.1 and the unified Forge Gateway Tool API.
 
 ## 1. Location and naming
 
@@ -24,10 +24,21 @@ manifest and an explicitly started profile.
 | `pollIntervalS` | number | `0.5` | Recommended Action/Session reconciliation interval in `[0.1, 5.0]` seconds. |
 | `executionTimeoutS` | number | `300.0` | Default Agent-side task deadline guidance. It does not prove that a timed-out execution stopped. |
 | `evidence` | object | below | AgentTask best-effort before/after capture settings. |
+| `interaction` | object | `{"enabled": false}` | Opt-in restricted interaction extension; see below. |
 
 PAOS invokes Query, Action, and Session only through `/tools` and `/invocations`. It does not call
 legacy `/agent/sessions` or `/policy/command` routes. Concurrency is decided by the selected
 endpoint operation's `max_concurrency`.
+
+### `forge.interaction`
+
+| JSON field | Type | Default | Constraint and meaning |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Permits interaction task contracts. It does not authorize production control-plane access. |
+
+The [interaction foundation](../interaction/README.md) currently requires an explicitly injected
+in-process deployment with `httpx.MockTransport`. Ordinary CLI configuration alone cannot enable
+a real environment. Keep this optional extension separate from default robot/Skill development.
 
 ## 2.1 `resourceRegistry`
 
@@ -77,7 +88,7 @@ Verification Service readiness is bounded. A non-`off` AgentTask is rejected whe
 
 | JSON field | Type | Default | Constraint and meaning |
 |:-----------|:-----|:--------|:-----------------------|
-| `enabled` | boolean | `true` | Enables explicit Skill activation, the experience ledger, and background evolution. Failures never block task execution. |
+| `enabled` | boolean | `true` | Enables experience reflection and guarded promotion. Explicit Skill activation remains available when false; evolution failures do not block execution. |
 | `scope` | literal | `verified_forge_lineage` | Consumes AgentTask lineages with semantic verdicts; the persisted literal remains stable for compatibility. |
 | `promotionMode` | literal | `guarded_auto` | Allows only validated, guarded automatic promotion. |
 | `minSuccessfulEpisodes` | integer | `3` | Independent successful AgentTasks required for one candidate; at least 1. |
@@ -264,7 +275,7 @@ paos agent -m "Call forge_tool_context for the requested Tool and report its sch
 ## Next reading
 
 - [User Manual](02-user-manual.md)
-- [Developer Manual](03-developer-manual.md)
+- [Core Developer Manual](03-developer-manual.md)
 - [Agent Experience and Skill Evolution](05-agent-experience-and-skill-evolution.md)
-- [Operations Manual](../user_manual/README_en.md)
-- [Unified Forge Tool API Contract](../forge/UNIFIED_TOOL_API.md)
+- [Operations Manual](../user_manual/README.md)
+- [Unified Forge Tool API Contract](../forge/README.md)

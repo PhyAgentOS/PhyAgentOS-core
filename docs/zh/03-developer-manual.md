@@ -1,8 +1,10 @@
-# PhyAgentOS 开发者手册
+# PhyAgentOS Core 开发者手册
 
-[English](../en/03-developer-manual.md) · [文档索引](../README.md)
+[English](../en/03-developer-manual.md) · [文档索引](../README_zh.md)
 
-> 文档版本：1.0.0。
+> 文档版本：1.1.1。
+
+本文面向 Core 实现：AgentTask 协调、持久化、binding、验证和 Runtime 管理。机器人、Node 与 Skill 开发请从 [TrackB 框架说明](../user_development_guide/track_b/README_zh.md)开始。HTTP 路由、身份和生命周期语义以 [Forge Tool API 契约](../forge/README_zh.md)为准。
 
 ## 1. 开发不变量
 
@@ -33,18 +35,7 @@
 `ForgeToolClient` 只接受 `ok=true` 且 `data` 为 object 的 JSON envelope。错误保留 HTTP status、
 error code、retryability 以及响应中已有的 invocation identity。
 
-| 操作 | HTTP 契约 |
-|:-----|:----------|
-| 列出 Tools | `GET /tools` → 200 |
-| 读取 ToolSpec | `GET /tools/{tool_id}` → 200 |
-| 读取 context | `GET /tools/{tool_id}/context` → 200 |
-| 调用 Query | 解析 ToolSpec 后 `POST /tools/{endpoint_id}/{operation}:invoke` → 200 |
-| 接纳 Action | `POST /tools/{tool_id}:invoke` → 202 |
-| Action status | `GET /invocations/{invocation_id}` → 200 |
-| Action result | `GET /invocations/{invocation_id}/result` → 200 或 pending 202 |
-| 请求 cancel | `POST /invocations/{invocation_id}/cancel` → 200 或 accepted 202 |
-| 接纳 Session | `POST /tools/{tool_id}:invoke` → 202 |
-| 停止 Session | `POST /invocations/{invocation_id}/stop` → 200 或 accepted 202 |
+HTTP 路由、响应码及 pending/cancel/stop 语义统一维护在 [Forge Tool API 契约](../forge/README_zh.md#2-tool-发现与-context)。Client 实现应遵循该契约，本文不重复定义路由表。
 
 路径组件经过 percent encoding。PAOS 生成 `caller_id`，并在 Action/Session admission 前与
 intent 一同持久化。Admission 必须包含非空 `invocation_id`，Action 还要求 `attempt_id`。
@@ -52,24 +43,7 @@ Timeout 形成 unknown record，恢复不会重复 POST。
 
 ## 4. Agent tools
 
-Task lifecycle：
-
-- `forge_task_create(task_description, verification, activation_id)`；
-- `forge_task_get(task_id)`；
-- `forge_task_begin_revision(task_id, reason)`；
-- `forge_task_finalize(task_id)`；
-- `forge_task_cancel(task_id, reason?)`。
-
-Tool transport：
-
-- `forge_tool_context(tool_id)`；
-- `forge_tool_query(tool_id, arguments, task_id?, timeout_ms?)`；
-- `forge_tool_start_action(task_id, tool_id, arguments, timeout_ms?)`；
-- `forge_tool_action_status(task_id, invocation_id)`；
-- `forge_tool_action_result(task_id, invocation_id)`；
-- `forge_tool_cancel_action(task_id, invocation_id)`；
-- `forge_tool_start_session(task_id, tool_id, arguments, ownership)`；
-- `forge_tool_session_status/result/stop_session(task_id, invocation_id)`。
+公开的 Agent 工具清单统一维护在 [API 契约](../forge/README_zh.md#6-agent-tools)。Wrapper 位于 `agent/tools/forge_tool_api.py` 和 `agent/tools/forge_task.py`；传输处理放在 `forge/tool_client.py`，任务协调放在 `forge/task.py`。
 
 诊断 Query 与绑定调用使用相同 HTTP 方法；每个变更或任务归因 wrapper 都在网络访问前校验
 ownership 与冻结 binding。Tool wrapper 不能自行生成 Gateway identity 或 result。
@@ -84,22 +58,13 @@ PlanRevision、evidence refs、verification attempts、取消状态和时间戳�
 保证跨进程全局单活动槽位。更新写入完整的已校验 record 和 append-only event；业务代码不直接
 修改表。
 
-终态任务状态为 `succeeded`、`failed`、`cancelled`；非终态为 `executing`、`cancelling`、
-`awaiting_replan`。Tool status `unknown` 对聚合记账是终态，但它表示失败，不表示已停止。
+公开状态由 [AgentTask 状态契约](../forge/README_zh.md#8-agenttask-模型)定义。Store 转移必须保持这些语义；`unknown` Tool record 结束记账，但不证明物理停止。
 
 ## 6. 绑定执行生命周期
 
-1. 激活 primary Skill，把其 Runtime/ToolSpec candidate 冻结到 AgentTask revision 1；
-2. 第一次绑定物理执行前进行 best-effort 前置采集；
-3. 通过 ForgeToolClient 调用 Query 或接纳 Action/Session；
-4. Admission 前持久化 caller intent，再保留 Gateway invocation/attempt 引用；
-5. 仅根据权威 status/result 更新异步 record；
-6. 全部 task-owned 执行终结后，finalize 进行后置采集；
-7. 聚合 Tool records、evidence 与任务契约进行验证；
-8. 持久化 task/revision verdict，并调度唯一终态 experience episode。
+Core 协调激活与 binding、持久化 intent admission、权威响应记录和 finalize。Intent 必须先于网络派发持久化，Gateway 引用写回同一个 task revision。Finalize 等待 task-owned 执行终结，采集后置证据并应用验证，再调度 experience。
 
-record 一旦终结，后续 observation 不会重写它。Cancellation response 会保存，但
-`requested` 或 `accepted` 仍使任务保持 `cancelling`，直到核对并显式 finalize。
+公开的 [binding 与身份](../forge/README_zh.md#7-bindingidentity-与关联)和 [AgentTask 生命周期](../forge/README_zh.md#8-agenttask-模型)统一维护在 API 契约。Cancellation response 只记录请求，聚合结果仍需核对与 finalize 确立。
 
 ## 7. Verification 与 recovery
 
@@ -124,13 +89,7 @@ metadata 和审计所需 tombstone。
 
 ## 9. Skill Runtime 契约
 
-`skill.yaml` 必须使用 `manifest_version: 2`，包含目录安全的 name/version、相对 Skill
-document、HTTP(S) `gateway_url`、非空 required Tools、至少一个 profile，并拒绝未知字段。
-Registry resolver 的 Node 必须包含 artifact identity、version、platform、architecture、
-archive type（`executable_tar_gz` 或 `directory_tar_gz`）、entrypoint 与 SHA-256。
-`executable_tar_gz` 归档只含一个由 entrypoint 命名的根目录 executable；`directory_tar_gz`
-归档只含一个以 entrypoint 命名的根目录，内放同名 executable 及其运行时树（允许树内相对
-符号链接）。
+Manifest 字段、Node 归档结构和启动 hook 环境见 [Bundle 与 Tool 接入参考](../user_development_guide/README_zh.md#4-构建-manifest-v2-skill-bundle)。Core 在 `skill_runtime/manifest.py`、归档校验器与 installer 中实现这些契约。
 
 归档校验拒绝绝对/穿越路径、links（上述节点树内相对链接除外）、重复或冲突路径、超大文件、展开限制违规、清单缺项与摘要
 不一致。Skill/Node installer 先 staging 与校验，再原子替换目标，并支持 rollback。
@@ -185,17 +144,11 @@ attempt。Outcome source 将每个 revision verdict 映射到该 revision
 
 ## 12. 扩展工作流
 
-新增机器人能力时：
+模型与机器人配置、新增 profile 或独立 Node 开发，请使用 [TrackB 三种开发模式](../user_development_guide/track_b/SKILL_DEVELOPMENT_zh.md)与 [Piper X 示例](../user_development_guide/PIPER_X_DEMO_zh.md)。
 
-1. 实现或打包 ToolEndpoint operation；
-2. 发布带精确 schema 与 binding 的 Query/Action/Session ToolSpec；
-3. 在 Gateway 定义 operation `max_concurrency`；
-4. 在 manifest v2 Bundle 中加入锁定 Node 与 profile 引用；
-5. 测试 binding 漂移、context、invoke、pending、terminal、cancel/stop、ownership 与 unknown；
-6. 在 Skill 中加入工作流指导，不写入任务特定坐标或凭据。
+只有能力确实需要时，才扩展 Core 已有的通用 client、binding、coordinator 或 installer。保持 API 契约，并在受影响的实现边界补充有针对性的回归检查；不新增 Agent 直连 Dora 的另一条执行路径。
 
-不要创建第二套 PAOS 执行协议、Agent 直连 Dora 或跨 Tool lease。只有通用 task/Tool API tools
-无法表达能力时，才应新增 Agent tool。
+可选的[交互基础](../interaction/README_zh.md)是独立受限扩展，Core 改动也需遵守其部署限制。
 
 ## 13. 测试门禁
 
@@ -213,5 +166,10 @@ pytest -q
 ## 后续阅读
 
 - [Forge Tool API 接入契约](../forge/README_zh.md)
-- [集成开发指南](../user_development_guide/README.md)
+- [Bundle 与 Tool 接入参考](../user_development_guide/README_zh.md)
 - [Agent 经验与 Skill 自进化](05-agent-experience-and-skill-evolution.md)
+
+## 节点开发与实战示例
+
+- [TrackB 框架说明](../user_development_guide/track_b/README_zh.md)
+- [Piper X MuJoCo 二次开发](../user_development_guide/PIPER_X_DEMO_zh.md)

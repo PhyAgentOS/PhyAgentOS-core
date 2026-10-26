@@ -1,0 +1,155 @@
+[
+  {
+    "label": "joint-a",
+    "tool_id": "sim.set_joint_positions",
+    "arguments": {
+      "group_name": "piper_x_arm",
+      "joint_names": [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5",
+        "joint6"
+      ],
+      "positions": [
+        -0.15,
+        0.8,
+        -1.25,
+        0.15,
+        0.2,
+        -0.1
+      ],
+      "velocity_scale": 0.2,
+      "acceleration_scale": 0.2
+    }
+  },
+  {
+    "label": "joint-b",
+    "tool_id": "sim.set_joint_positions",
+    "arguments": {
+      "group_name": "piper_x_arm",
+      "joint_names": [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5",
+        "joint6"
+      ],
+      "positions": [
+        0.2,
+        0.6,
+        -0.9,
+        -0.2,
+        0.4,
+        0.25
+      ],
+      "velocity_scale": 0.2,
+      "acceleration_scale": 0.2
+    }
+  },
+  {
+    "label": "joint-home",
+    "tool_id": "sim.set_joint_positions",
+    "arguments": {
+      "group_name": "piper_x_arm",
+      "joint_names": [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5",
+        "joint6"
+      ],
+      "positions": [
+        0,
+        0.65,
+        -1.1,
+        0.25,
+        0.3,
+        0.1
+      ],
+      "velocity_scale": 0.2,
+      "acceleration_scale": 0.2
+    }
+  },
+  {
+    "label": "eef-a",
+    "tool_id": "sim.move_eef",
+    "arguments": {
+      "group_name": "piper_x_arm",
+      "reference_frame": "base_link",
+      "target_frame": "tcp",
+      "target_pose": {
+        "x": 0.2870407951459706,
+        "y": -0.03170407513342734,
+        "z": 0.5422729661601198,
+        "qw": 0.7657215005588278,
+        "qx": 0.1641599926622322,
+        "qy": 0.6218396509287355,
+        "qz": -0.006126085528408748
+      },
+      "velocity_scale": 0.2,
+      "acceleration_scale": 0.2,
+      "position_tolerance_m": 0.005,
+      "orientation_tolerance_rad": 0.03
+    }
+  },
+  {
+    "label": "eef-b",
+    "tool_id": "sim.move_eef",
+    "arguments": {
+      "group_name": "piper_x_arm",
+      "reference_frame": "base_link",
+      "target_frame": "tcp",
+      "target_pose": {
+        "x": 0.26220754945611513,
+        "y": -0.07584908836668063,
+        "z": 0.5653411741297875,
+        "qw": 0.8005078003734996,
+        "qx": 0.15001903453597412,
+        "qy": 0.5713479547474468,
+        "qz": -0.10120803043229705
+      },
+      "velocity_scale": 0.2,
+      "acceleration_scale": 0.2,
+      "position_tolerance_m": 0.005,
+      "orientation_tolerance_rad": 0.03
+    }
+  },
+  {
+    "label": "eef-home",
+    "tool_id": "sim.move_eef",
+    "arguments": {
+      "group_name": "piper_x_arm",
+      "reference_frame": "base_link",
+      "target_frame": "tcp",
+      "target_pose": {
+        "x": 0.2558384528449723,
+        "y": -0.052454819814354174,
+        "z": 0.5522704688371596,
+        "qw": 0.795475677980765,
+        "qx": 0.14913411735079685,
+        "qy": 0.585235291451576,
+        "qz": -0.04977061806558024
+      },
+      "velocity_scale": 0.2,
+      "acceleration_scale": 0.2,
+      "position_tolerance_m": 0.005,
+      "orientation_tolerance_rad": 0.03
+    }
+  },
+  {
+    "label": "gripper-smoke",
+    "tool_id": "sim.set_gripper_opening",
+    "arguments": {
+      "opening_m": 0.06
+    }
+  },
+  {
+    "label": "reset",
+    "tool_id": "sim.reset",
+    "arguments": {}
+  }
+]

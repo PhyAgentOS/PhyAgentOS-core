@@ -1,6 +1,6 @@
 # Agent 经验与 Skill 自进化
 
-> 文档版本：1.0.0。本文描述基于 AgentTask record 的 Agent 校验、经验、Lesson 与 Skill 演化链。
+> 文档版本：1.1.1。本文描述基于 AgentTask record 的 Agent 校验、经验、Lesson 与 Skill 演化链。
 
 ## 1. 目标与边界
 
@@ -202,6 +202,6 @@ Built-in Skill 永不原地修改：基线先归档，再复制为 workspace ove
 
 - [框架介绍](01-framework-introduction.md)
 - [用户手册](02-user-manual.md)
-- [开发者手册](03-developer-manual.md)
+- [Core 开发者手册](03-developer-manual.md)
 - [Forge 配置参考](04-forge-configuration-reference.md)
-- [文档索引](../README.md)
+- [文档索引](../README_zh.md)
