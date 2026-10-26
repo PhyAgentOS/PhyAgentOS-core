@@ -1335,7 +1335,7 @@ async def test_selected_session_provider_failure_keeps_dev_abort_semantics(
     reply = await agent._process_message(message)
 
     assert reply.content.startswith("LLM call failed:")
-    assert reply.metadata == message.metadata
+    assert message.metadata.items() <= reply.metadata.items()
     selected.chat.assert_awaited_once()
     assert selected.chat.call_args.kwargs["model"] == "gpt-5.2"
     assert original.calls == []

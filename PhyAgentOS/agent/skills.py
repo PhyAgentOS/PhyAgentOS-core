@@ -39,6 +39,9 @@ class SkillsLoader:
         )
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
         self.runtime_availability_provider = runtime_availability_provider
+        # Reading the same SKILL.md 2-4 times per prompt build is the dominant
+        # cost. Cache by (mtime_ns, size) so edits are still visible.
+        self._content_cache: dict[str, tuple[tuple[int, int], str]] = {}
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
@@ -109,6 +112,22 @@ class SkillsLoader:
             return dict(skill)
         return None
 
+    def _read_skill_file(self, path: Path) -> str | None:
+        """Read a SKILL.md once per content version."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        if not path.is_file():
+            return None
+        key = (stat.st_mtime_ns, stat.st_size)
+        cached = self._content_cache.get(str(path))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        content = path.read_text(encoding="utf-8")
+        self._content_cache[str(path)] = (key, content)
+        return content
+
     def load_skill(self, name: str) -> str | None:
         """
         Load a skill by name.
@@ -122,17 +141,17 @@ class SkillsLoader:
         # Check workspace first
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
-            return workspace_skill.read_text(encoding="utf-8")
+            return self._read_skill_file(workspace_skill)
 
         installed_skill = self.installed_skills / name / "SKILL.md"
         if installed_skill.exists():
-            return installed_skill.read_text(encoding="utf-8")
+            return self._read_skill_file(installed_skill)
 
         # Check built-in
         if self.builtin_skills:
             builtin_skill = self.builtin_skills / name / "SKILL.md"
             if builtin_skill.exists():
-                return builtin_skill.read_text(encoding="utf-8")
+                return self._read_skill_file(builtin_skill)
 
         return None
 

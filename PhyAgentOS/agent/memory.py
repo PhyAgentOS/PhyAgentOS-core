@@ -22,6 +22,7 @@ from PhyAgentOS.utils.helpers import (
 
 if TYPE_CHECKING:
     from PhyAgentOS.providers.base import LLMProvider
+    from PhyAgentOS.providers.service import RuntimeSelection
     from PhyAgentOS.session.manager import Session, SessionManager
 
 
@@ -240,9 +241,15 @@ class MemoryConsolidator:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
 
-    async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
+    async def consolidate_messages(
+        self,
+        messages: list[dict[str, object]],
+        runtime: RuntimeSelection | None = None,
+    ) -> bool:
         """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(messages, self.provider, self.model)
+        provider = runtime.provider if runtime is not None else self.provider
+        model = runtime.model if runtime is not None else self.model
+        return await self.store.consolidate(messages, provider, model)
 
     def pick_consolidation_boundary(
         self,
@@ -266,7 +273,11 @@ class MemoryConsolidator:
 
         return last_boundary
 
-    def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
+    def estimate_session_prompt_tokens(
+        self,
+        session: Session,
+        runtime: RuntimeSelection | None = None,
+    ) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=0)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
@@ -277,8 +288,8 @@ class MemoryConsolidator:
             chat_id=chat_id,
         )
         return estimate_prompt_tokens_chain(
-            self.provider,
-            self.model,
+            runtime.provider if runtime is not None else self.provider,
+            runtime.model if runtime is not None else self.model,
             probe_messages,
             self._get_tool_definitions(),
         )
@@ -305,7 +316,12 @@ class MemoryConsolidator:
             lines.append(f"{str(message.get('role', '?')).upper()}: {text}{refs}")
         return "\n".join(lines)
 
-    async def _compress_session_locked(self, session: Session, end_idx: int) -> bool:
+    async def _compress_session_locked(
+        self,
+        session: Session,
+        end_idx: int,
+        runtime: RuntimeSelection | None = None,
+    ) -> bool:
         """Compress into the session summary; return False without advancing on failure."""
         start = session.last_consolidated
         if end_idx <= start:
@@ -319,12 +335,14 @@ class MemoryConsolidator:
             messages=self._format_session_messages(chunk),
         )
         try:
-            response = await self.provider.chat_with_retry(
+            response = await (
+                runtime.provider if runtime is not None else self.provider
+            ).chat_with_retry(
                 messages=[
                     {"role": "system", "content": _SESSION_SUMMARY_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                model=self.model,
+                model=runtime.model if runtime is not None else self.model,
                 reasoning_effort=None,
             )
         except asyncio.CancelledError:
@@ -380,7 +398,11 @@ class MemoryConsolidator:
             return False
         return True
 
-    async def archive_unconsolidated(self, session: Session) -> bool:
+    async def archive_unconsolidated(
+        self,
+        session: Session,
+        runtime: RuntimeSelection | None = None,
+    ) -> bool:
         """Archive the unconsolidated tail and the session summary for /new.
 
         The summary covers messages already compressed out of the tail, so it is
@@ -394,7 +416,7 @@ class MemoryConsolidator:
             summary = session.summary.strip()
 
             if tail:
-                if not await self.consolidate_messages(tail):
+                if not await self.consolidate_messages(tail, runtime):
                     return False
                 session.last_consolidated = len(session.messages)
                 try:
@@ -420,23 +442,32 @@ class MemoryConsolidator:
                     return False
             return True
 
-    async def maybe_consolidate_by_tokens(self, session: Session) -> None:
+    async def maybe_consolidate_by_tokens(
+        self,
+        session: Session,
+        runtime: RuntimeSelection | None = None,
+    ) -> None:
         """Loop: compress old messages into the session summary until the prompt fits.
 
         This never touches MEMORY.md/HISTORY.md. Only a successful summary that
         was persisted advances ``last_consolidated``; a failed round leaves the
         session unchanged so the next turn can retry.
         """
-        if not session.messages or self.context_window_tokens <= 0:
+        window = (
+            (runtime.context_window_tokens or self.context_window_tokens)
+            if runtime is not None
+            else self.context_window_tokens
+        )
+        if not session.messages or window <= 0:
             return
 
         lock = self.get_lock(session.key)
         async with lock:
-            generation = getattr(self.provider, "generation", None)
+            provider = runtime.provider if runtime is not None else self.provider
+            generation = getattr(provider, "generation", None)
             reserve = int(getattr(generation, "max_tokens", 0) or 0) or 4096
-            window = self.context_window_tokens
             target = max(1, (window - reserve) // 2)
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            estimated, source = self.estimate_session_prompt_tokens(session, runtime)
             if estimated <= 0:
                 return
             if estimated + reserve <= window:
@@ -473,13 +504,13 @@ class MemoryConsolidator:
                     round_num,
                     session.key,
                     estimated,
-                    self.context_window_tokens,
+                    window,
                     source,
                     len(chunk),
                 )
-                if not await self._compress_session_locked(session, end_idx):
+                if not await self._compress_session_locked(session, end_idx, runtime):
                     return
 
-                estimated, source = self.estimate_session_prompt_tokens(session)
+                estimated, source = self.estimate_session_prompt_tokens(session, runtime)
                 if estimated <= 0:
                     return

@@ -730,6 +730,38 @@ async def test_unreachable_gateway_keeps_unknown_and_never_resends_the_action(
     assert client.cancel_calls == [invocation_id]
 
 
+async def test_failed_stop_can_be_retried_without_redispatching_the_action(
+    tmp_path,
+) -> None:
+    client = UnreachableCancelClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+
+    await coordinator.cancel_task(task.task_id, reason="operator stop")
+    retried = await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    assert retried.execution_records[0].status == "unknown"
+    assert client.action_calls == 1
+    assert client.cancel_calls == [invocation_id, invocation_id]
+
+
+async def test_new_task_is_blocked_while_an_unknown_invocation_remains(
+    tmp_path,
+) -> None:
+    client = ScriptedCancelClient(["running"])
+    coordinator = _coordinator(tmp_path, client=client)
+    _short_cancel_budget(coordinator)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    await coordinator.cancel_task(task.task_id, reason="operator stop")
+
+    with pytest.raises(AgentTaskBusyError, match="unknown remote state"):
+        coordinator.create_task(task_description="move again", verification=_contract())
+
+
 async def test_new_actions_are_rejected_while_the_cancel_request_is_in_flight(
     tmp_path,
 ) -> None:

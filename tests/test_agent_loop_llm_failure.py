@@ -124,7 +124,7 @@ async def test_failed_completion_preserves_thread_metadata(
     assert reply is not None
     assert reply.content.startswith("LLM call failed:")
     assert (reply.channel, reply.chat_id) == (channel, "chat")
-    assert reply.metadata == metadata
+    assert metadata.items() <= reply.metadata.items()
     assert reply.metadata is not metadata
     session = loop.sessions.get_or_create(f"{channel}:chat")
     assert any(m.get("role") == "user" and "hello" in str(m.get("content"))
@@ -147,7 +147,10 @@ async def test_dispatch_defensive_llm_handler_preserves_metadata(
     monkeypatch.setattr(loop, "_process_message", fail)
     await loop._dispatch(message)
 
-    reply = loop.bus.outbound[-1]
+    reply = next(
+        item for item in reversed(loop.bus.outbound)
+        if item.content == "LLM call failed: boom"
+    )
     assert reply.content == "LLM call failed: boom"
-    assert reply.metadata == message.metadata
+    assert message.metadata.items() <= reply.metadata.items()
     assert reply.metadata is not message.metadata

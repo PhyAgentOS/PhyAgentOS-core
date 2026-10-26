@@ -2,6 +2,7 @@
 
 import base64
 import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -33,9 +34,11 @@ class ImageTool(Tool):
         """Initialize the image tool with all required parameters."""
         self.provider = provider
         self._send_callback = send_callback
-        self._default_channel = default_channel
-        self._default_chat_id = default_chat_id
-        self._default_message_id = default_message_id
+        # Routing belongs to one turn, not to the shared tool instance.
+        self._context: ContextVar[tuple[str, str, str | None]] = ContextVar(
+            "image_tool_context",
+            default=(default_channel, default_chat_id, default_message_id),
+        )
 
     @property
     def name(self) -> str:
@@ -177,10 +180,8 @@ class ImageTool(Tool):
         return mime_types.get(ext, "image/png")
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
-        """Set the current message context."""
-        self._default_channel = channel
-        self._default_chat_id = chat_id
-        self._default_message_id = message_id
+        """Set the routing context for the current turn."""
+        self._context.set((channel, chat_id, message_id))
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -362,9 +363,12 @@ class ImageTool(Tool):
             }
 
             # Create outbound message with image as media
+            channel, chat_id, _ = self._context.get()
+            if not channel or not chat_id:
+                return "Error: no active chat to display the image in."
             msg = OutboundMessage(
-                channel=self._default_channel,
-                chat_id=self._default_chat_id,
+                channel=channel,
+                chat_id=chat_id,
                 content=text or "Image display",
                 media=[media_data],
                 metadata={

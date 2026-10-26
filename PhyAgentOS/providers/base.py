@@ -28,6 +28,9 @@ class ToolCallRequest:
     arguments: dict[str, Any]
     provider_specific_fields: dict[str, Any] | None = None
     function_provider_specific_fields: dict[str, Any] | None = None
+    # Original JSON payload as received. Kept so callers can reject a
+    # repaired-but-truncated payload before executing a tool.
+    raw_arguments: str | None = None
 
     def to_openai_tool_call(self) -> dict[str, Any]:
         """Serialize to an OpenAI-style tool_call payload."""
@@ -36,7 +39,11 @@ class ToolCallRequest:
             "type": "function",
             "function": {
                 "name": self.name,
-                "arguments": json.dumps(self.arguments, ensure_ascii=False),
+                "arguments": (
+                    self.raw_arguments
+                    if self.raw_arguments is not None
+                    else json.dumps(self.arguments, ensure_ascii=False)
+                ),
             },
         }
         if self.provider_specific_fields:
@@ -458,10 +465,19 @@ class LLMProvider(ABC):
     ) -> None:
         """Append an OpenAI-style tool_call delta fragment to its accumulator."""
         index = getattr(fragment, "index", None)
-        if index is None:
-            index = max(pending) if pending else 0
-        entry = pending.setdefault(index, {"id": None, "name": "", "arguments": ""})
         fragment_id = getattr(fragment, "id", None)
+        if index is None:
+            if fragment_id:
+                # Some gateways omit index on follow-up fragments. Prefer the
+                # call with the same id over guessing "the last one".
+                matches = [
+                    key for key, entry in pending.items()
+                    if entry.get("id") == fragment_id
+                ]
+                index = matches[0] if matches else len(pending)
+            else:
+                index = max(pending) if pending else 0
+        entry = pending.setdefault(index, {"id": None, "name": "", "arguments": ""})
         if fragment_id:
             entry["id"] = fragment_id
         fragment_fields = getattr(fragment, "provider_specific_fields", None)
@@ -520,6 +536,7 @@ class LLMProvider(ABC):
                 arguments=arguments,
                 provider_specific_fields=entry.get("provider_specific_fields"),
                 function_provider_specific_fields=entry.get("function_provider_specific_fields"),
+                raw_arguments=raw if isinstance(raw, str) else None,
             ))
         return tool_calls
 
@@ -667,3 +684,11 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+
+    def get_context_window(self, model: str | None = None) -> int | None:
+        """Return the model's input window when the provider knows it.
+
+        Providers that cannot report model metadata return ``None`` so the
+        caller keeps its configured window.
+        """
+        return None

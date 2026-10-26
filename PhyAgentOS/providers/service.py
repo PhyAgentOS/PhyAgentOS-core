@@ -86,6 +86,7 @@ class ProviderSelection:
 @dataclass(frozen=True)
 class RuntimeSelection(ProviderSelection):
     provider: LLMProvider = field(repr=False, compare=False)
+    context_window_tokens: int | None = None
 
 
 class ProviderService:
@@ -356,7 +357,13 @@ class ProviderService:
             reasoning_effort=selection.effort,
         )
         return RuntimeSelection(
-            selection.name, selection.model, selection.effort, selection.endpoint, provider
+            selection.name,
+            selection.model,
+            selection.effort,
+            selection.endpoint,
+            provider,
+            provider.get_context_window(selection.model)
+            or defaults.context_window_tokens,
         )
 
     @staticmethod

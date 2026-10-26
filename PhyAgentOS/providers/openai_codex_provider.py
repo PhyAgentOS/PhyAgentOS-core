@@ -259,7 +259,7 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
-    finish_reason = "stop"
+    finish_reason = "error"
 
     async for event in _iter_sse(response):
         event_type = event.get("type")
@@ -301,6 +301,7 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                         id=f"{call_id}|{buf.get('id') or item.get('id') or 'fc_0'}",
                         name=buf.get("name") or item.get("name"),
                         arguments=args,
+                        raw_arguments=args_raw if isinstance(args_raw, str) else None,
                     )
                 )
         elif event_type == "response.completed":

@@ -148,10 +148,16 @@ class OpenAIResponsesProvider(LLMProvider):
             item_type = getattr(item, "type", "")
             if item_type == "function_call":
                 arguments = getattr(item, "arguments", "{}")
+                raw_arguments = arguments if isinstance(arguments, str) else None
                 tool_calls.append(ToolCallRequest(
                     id=getattr(item, "call_id", "") or getattr(item, "id", ""),
                     name=getattr(item, "name", ""),
-                    arguments=json_repair.loads(arguments) if isinstance(arguments, str) else arguments,
+                    arguments=(
+                        json_repair.loads(arguments)
+                        if isinstance(arguments, str)
+                        else arguments
+                    ),
+                    raw_arguments=raw_arguments,
                 ))
             elif item_type == "reasoning":
                 for summary in getattr(item, "summary", None) or []:

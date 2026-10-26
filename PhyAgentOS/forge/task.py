@@ -237,6 +237,46 @@ class AgentTaskStore:
                 """
             )
 
+    def latest_for_session(self, session_key: str) -> AgentTaskRecord | None:
+        """Return the most recent task created from one session."""
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT record_json FROM agent_tasks ORDER BY updated_at DESC"
+            ).fetchall()
+        for row in rows:
+            try:
+                record = AgentTaskRecord.model_validate_json(row["record_json"])
+            except Exception:
+                continue
+            if record.origin_session_key == session_key:
+                return record
+        return None
+
+    def tasks_with_unknowns(self) -> list[AgentTaskRecord]:
+        """Return tasks that still carry an unknown Action/Session invocation."""
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT record_json FROM agent_tasks "
+                "WHERE record_json LIKE '%\"unknown\"%'"
+            ).fetchall()
+        found: list[AgentTaskRecord] = []
+        for row in rows:
+            try:
+                record = AgentTaskRecord.model_validate_json(row["record_json"])
+            except Exception:
+                continue
+            if any(
+                item.status == "unknown"
+                and item.semantics in {"action", "session"}
+                for item in record.execution_records
+            ):
+                found.append(record)
+        return found
+
+    def has_unresolved_unknowns(self) -> bool:
+        """True when any past Action/Session invocation still has unknown remote state."""
+        return bool(self.tasks_with_unknowns())
+
     def create(self, record: AgentTaskRecord) -> AgentTaskRecord:
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -421,6 +461,14 @@ class AgentTaskCoordinator:
     def set_activation_manager(self, activation_manager: Any) -> None:
         self.activation_manager = activation_manager
 
+    def _assert_no_unknown_remote_state(self) -> None:
+        """Refuse a new AgentTask while an older invocation may still be moving."""
+        if self.store.has_unresolved_unknowns():
+            raise AgentTaskBusyError(
+                "an earlier Action/Session invocation still has unknown remote state; "
+                "reconcile it before creating a new AgentTask"
+            )
+
     def create_task(
         self,
         *,
@@ -456,6 +504,7 @@ class AgentTaskCoordinator:
             active_revision_id=revision_id,
             origin_session_key=origin_session_key,
         )
+        self._assert_no_unknown_remote_state()
         self.store.create(task)
         if self.experience is not None and origin_session_key:
             self.experience.bind_forge_task(
@@ -532,6 +581,7 @@ class AgentTaskCoordinator:
         # Reserve the single slot before writing any interaction binding. A
         # busy slot must not leave journal state behind for a task that was
         # never created.
+        self._assert_no_unknown_remote_state()
         self.store.create(task)
         try:
             await self.interaction.freeze(task)
@@ -1063,26 +1113,26 @@ class AgentTaskCoordinator:
         if self.interaction.managed(task_id):
             return await self.interaction.cancel(task_id, reason)
         task = self.store.get(task_id)
-        if task.terminal:
+        if task.terminal and not _has_cancel_retry(task):
             return task
 
         reason_text = reason.strip()
 
         def mark(current: AgentTaskRecord) -> None:
-            if current.terminal:
+            if current.terminal and not _has_cancel_retry(current):
                 return
             current.cancellation_requested = True
             current.evidence_errors.append(f"task cancellation requested: {reason_text}")
             current.status = (
                 AgentTaskStatus.CANCELLING
-                if _has_owned_execution(current)
+                if _has_owned_execution(current) or _has_cancel_retry(current)
                 else AgentTaskStatus.CANCELLED
             )
 
         # The durable gate closes before any await, so no new Action can be admitted
         # while remote cancel/stop requests are in flight.
         task = self.store.update(task_id, mark, event_type="task_cancel_requested")
-        if task.terminal:
+        if task.terminal and not _has_cancel_retry(task):
             self._schedule_experience(task)
             return task
 
@@ -1094,7 +1144,7 @@ class AgentTaskCoordinator:
                 or (item.semantics == "session" and item.ownership == "task")
             )
             and item.invocation_id
-            and not item.cancel_requested
+            and (not item.cancel_requested or _needs_cancel_retry(item))
             and (not item.terminal or item.status == "unknown")
         ]
         if pending:
@@ -1263,6 +1313,16 @@ class AgentTaskCoordinator:
         """Repair local execution facts from Gateway GETs without redispatching POSTs."""
         if self.interaction.supervisor is not None:
             await self.interaction.supervisor.recover()
+        # Terminal tasks can still carry an unknown invocation. Settle those
+        # first so a new AgentTask is not blocked by stale state.
+        for stale in self.store.tasks_with_unknowns():
+            for record in stale.execution_records:
+                if (
+                    record.status == "unknown"
+                    and record.semantics in {"action", "session"}
+                    and record.invocation_id
+                ):
+                    await self._reconcile_unknown(stale.task_id, record)
         task = self.store.active()
         if task is not None and self.interaction.managed(task.task_id):
             return task
@@ -1500,9 +1560,14 @@ class AgentTaskCoordinator:
         def mutate(current: AgentTaskRecord) -> None:
             nonlocal claimed
             target = _task_execution(current, record_id)
-            if target.cancel_requested:
+            if target.cancel_requested and not _needs_cancel_retry(target):
                 return
+            retrying = _needs_cancel_retry(target)
             target.cancel_requested = True
+            if retrying:
+                # A repeated stop is safe and is the only way to recover from a
+                # POST that failed after the first attempt was recorded.
+                target.error = None
             target.updated_at = utc_now()
             claimed = True
 
@@ -1924,6 +1989,24 @@ def _retryable_poll_error(exc: BaseException) -> bool:
         ):
             return False
     return True
+
+
+def _has_cancel_retry(task: AgentTaskRecord) -> bool:
+    """True when a prior cancel/stop request failed and can be safely repeated."""
+    return any(_needs_cancel_retry(item) for item in task.execution_records)
+
+
+def _needs_cancel_retry(item: ToolExecutionRecord) -> bool:
+    """A stop/cancel POST is idempotent; retry when the last attempt errored."""
+    return bool(
+        item.cancel_requested
+        and item.error is not None
+        and item.status == "unknown"
+        and (
+            item.semantics == "action"
+            or (item.semantics == "session" and item.ownership == "task")
+        )
+    )
 
 
 def _cancel_terminal_status(task: AgentTaskRecord) -> AgentTaskStatus:

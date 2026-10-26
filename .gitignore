@@ -21,7 +21,7 @@ poetry.lock
 botpy.log
 nano.*.save
 SECURITY.md
-.kilo
+.meta
 *.codegraph
 uv.lock
 plan/

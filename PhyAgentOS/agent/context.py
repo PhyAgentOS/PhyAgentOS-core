@@ -45,6 +45,7 @@ class ContextBuilder:
             workspace,
             runtime_availability_provider=runtime_availability_provider,
         )
+        self._bootstrap_cache: dict[str, tuple[tuple[int, int], str]] = {}
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -166,7 +167,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
             if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
+                content = self._read_bootstrap_file(file_path)
                 parts.append(f"## {filename}\n\n{content}")
 
         # Embodied extensions — present only when the workspace provides them.
@@ -175,10 +176,24 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                 continue
             file_path = self.workspace / filename
             if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
+                content = self._read_bootstrap_file(file_path)
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    def _read_bootstrap_file(self, path: Path) -> str:
+        """Read a bootstrap file once per content version."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return ""
+        key = (stat.st_mtime_ns, stat.st_size)
+        cached = self._bootstrap_cache.get(str(path))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        content = path.read_text(encoding="utf-8")
+        self._bootstrap_cache[str(path)] = (key, content)
+        return content
 
     def build_messages(
         self,

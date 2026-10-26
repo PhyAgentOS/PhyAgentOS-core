@@ -124,6 +124,7 @@ class SubagentManager:
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
+            status = "ok"
 
             while iteration < max_iterations:
                 iteration += 1
@@ -133,6 +134,14 @@ class SubagentManager:
                     tools=tools.get_definitions(),
                     model=self.model,
                 )
+
+                if response.finish_reason == "error":
+                    status = "error"
+                    final_result = (
+                        "Provider returned an error"
+                        + (f": {response.content}" if response.content else ".")
+                    )
+                    break
 
                 if response.has_tool_calls:
                     tool_call_dicts = [
@@ -148,9 +157,24 @@ class SubagentManager:
 
                     # Execute tools
                     for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
+                        if response.finish_reason == "length":
+                            result = (
+                                "Error: the provider truncated this tool call; "
+                                "nothing was executed."
+                            )
+                        elif (
+                            tool_call.raw_arguments is not None
+                            and not LLMProvider._is_complete_json_object(
+                                tool_call.raw_arguments
+                            )
+                        ):
+                            result = (
+                                "Error: incomplete tool arguments; nothing was executed."
+                            )
+                        else:
+                            args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                            logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+                            result = await tools.execute(tool_call.name, tool_call.arguments)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -159,13 +183,23 @@ class SubagentManager:
                         })
                 else:
                     final_result = response.content
+                    if response.finish_reason == "length":
+                        status = "incomplete"
+                        final_result = (
+                            (final_result or "")
+                            + "\n[Subagent output truncated at the token limit.]"
+                        ).strip()
                     break
 
             if final_result is None:
-                final_result = "Task completed but no final response was generated."
+                status = "incomplete"
+                final_result = (
+                    f"Subagent stopped after {max_iterations} tool iterations "
+                    "without a final answer."
+                )
 
-            logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
+            logger.info("Subagent [{}] finished with status {}", task_id, status)
+            await self._announce_result(task_id, label, task, final_result, origin, status)
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
@@ -182,7 +216,22 @@ class SubagentManager:
         status: str,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
-        status_text = "completed successfully" if status == "ok" else "failed"
+        status_text = {
+            "ok": "completed successfully",
+            "incomplete": "did not finish",
+            "error": "failed",
+        }.get(status, "failed")
+
+        if status == "ok":
+            instruction = (
+                "Summarize this naturally for the user. Keep it brief (1-2 sentences). "
+                'Do not mention technical details like "subagent" or task IDs.'
+            )
+        else:
+            instruction = (
+                "Report this as an incomplete or failed result, not a success. "
+                "Say what is known and what is missing. Keep it brief."
+            )
 
         announce_content = f"""[Subagent '{label}' {status_text}]
 
@@ -191,7 +240,7 @@ Task: {task}
 Result:
 {result}
 
-Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
+{instruction}"""
 
         # Inject as system message into the parent session, not the channel-level one.
         session_key = origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"

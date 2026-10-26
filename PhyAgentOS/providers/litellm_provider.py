@@ -8,6 +8,7 @@ from contextlib import aclosing
 from typing import Any
 
 import json_repair
+import litellm
 from litellm import acompletion
 from loguru import logger
 
@@ -376,8 +377,10 @@ class LiteLLMProvider(LLMProvider):
 
         tool_calls = []
         for tc in raw_tool_calls:
-            # Parse arguments from JSON string if needed
+            # Parse arguments from JSON string if needed, keeping the raw
+            # payload so a truncated response is rejected before execution.
             args = tc.function.arguments
+            raw_arguments = args if isinstance(args, str) else None
             if isinstance(args, str):
                 args = json_repair.loads(args)
 
@@ -392,6 +395,7 @@ class LiteLLMProvider(LLMProvider):
                 arguments=args,
                 provider_specific_fields=provider_specific_fields,
                 function_provider_specific_fields=function_provider_specific_fields,
+                raw_arguments=raw_arguments,
             ))
 
         usage = {}
@@ -417,3 +421,16 @@ class LiteLLMProvider(LLMProvider):
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
+
+    def get_context_window(self, model: str | None = None) -> int | None:
+        """Read the model's input window from LiteLLM's model metadata."""
+        target = model or self.default_model
+        try:
+            info = litellm.get_model_info(target)
+        except Exception:
+            return None
+        for key in ("max_input_tokens", "max_tokens"):
+            value = info.get(key) if isinstance(info, dict) else None
+            if isinstance(value, int) and value > 0:
+                return value
+        return None

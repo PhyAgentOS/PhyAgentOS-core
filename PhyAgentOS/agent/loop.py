@@ -85,6 +85,7 @@ class _ToolCallRun:
     hint: str
     parallel_safe: bool
     result: str | None = None
+    preflight_error: str | None = None
 
 
 class _TurnCancelledError(asyncio.CancelledError):
@@ -178,6 +179,9 @@ class AgentLoop:
                 effort=provider.generation.reasoning_effort,
                 endpoint=provider.api_base,
                 provider=provider,
+                context_window_tokens=(
+                    provider.get_context_window(self.model) or context_window_tokens
+                ),
             ))
         self.max_iterations = max_iterations
         self.context_window_tokens = context_window_tokens
@@ -272,6 +276,9 @@ class AgentLoop:
         self._mcp_connecting = False
         self._forge_reconciled = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        # Post-turn compression runs off the reply path; keep strong references
+        # so the tasks are not garbage-collected mid-flight.
+        self._background_tasks: set[asyncio.Task] = set()
         # session_key -> pending /correct texts for the running turn
         self._corrections: dict[str, list[str]] = {}
         # session_key -> whether the turn can still consume a correction
@@ -401,6 +408,9 @@ class AgentLoop:
         if tool := self.tools.get("cron"):
             if hasattr(tool, "set_context"):
                 tool.set_context(channel, chat_id)
+        if tool := self.tools.get("image"):
+            if hasattr(tool, "set_context"):
+                tool.set_context(channel, chat_id, message_id)
         if tool := self.tools.get("forge_task_create"):
             tool.set_context(key)
         if tool := self.tools.get("activate_skill"):
@@ -430,6 +440,7 @@ class AgentLoop:
         model: str,
         messages: list[dict],
         tool_defs: list[dict],
+        window: int | None = None,
     ) -> tuple[int | None, str | None]:
         """Return the output-token cap for this request, or a budget failure.
 
@@ -437,7 +448,7 @@ class AgentLoop:
         the prompt leaves less room than that, shrink the cap to what actually
         fits instead of rejecting a request whose prompt is still valid.
         """
-        window = self.context_window_tokens
+        window = window or self.context_window_tokens
         if window <= 0:
             return None, None
         estimated, source = estimate_prompt_tokens_chain(
@@ -446,8 +457,7 @@ class AgentLoop:
         if estimated <= 0:
             estimated = sum(estimate_message_tokens(message) for message in messages)
             source = "message_estimate"
-        if estimated <= 0:
-            return None, None
+        estimated = max(1, estimated)
         generation = getattr(provider, "generation", None) or getattr(
             self.provider, "generation", None
         )
@@ -564,6 +574,7 @@ class AgentLoop:
         model_call_count = 0
         turn_started = time.monotonic()
         final_content = None
+        drop_corrections = False
         # Pin the entire turn, including retries and tool iterations, to one
         # selection. Session commands only replace the next turn's selection.
         provider = runtime.provider if runtime else self.provider
@@ -601,7 +612,11 @@ class AgentLoop:
                 tool_defs = self.tools.get_definitions()
 
                 output_budget, budget_error = self._request_output_budget(
-                    provider, model, messages, tool_defs
+                    provider,
+                    model,
+                    messages,
+                    tool_defs,
+                    window=runtime.context_window_tokens if runtime else None,
                 )
                 if budget_error is not None:
                     logger.error("Input budget exceeded: {}", budget_error)
@@ -612,6 +627,7 @@ class AgentLoop:
                 tool_calls = []
                 stream_usage: dict[str, int] = {}
                 stream_error: str | None = None
+                stream_finish_reason: str | None = None
                 reasoning_content: str | None = None
                 thinking_blocks: list[dict] | None = None
 
@@ -634,6 +650,7 @@ class AgentLoop:
                     elif event.type == "done":
                         if event.usage:
                             stream_usage = dict(event.usage)
+                        stream_finish_reason = event.finish_reason
                         reasoning_content = event.reasoning_content
                         thinking_blocks = event.thinking_blocks
                         break
@@ -681,15 +698,45 @@ class AgentLoop:
                         hint = self._tool_hint([tool_call])
                         logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                         tool = self.tools.get(tool_call.name)
+                        preflight_error = None
+                        if stream_finish_reason == "length":
+                            preflight_error = (
+                                f"Error: the model output was truncated before {tool_call.name} "
+                                "was complete; nothing was executed. Retry with a smaller step."
+                            )
+                        elif (
+                            tool_call.raw_arguments is not None
+                            and not LLMProvider._is_complete_json_object(
+                                tool_call.raw_arguments
+                            )
+                        ):
+                            preflight_error = (
+                                f"Error: incomplete arguments for {tool_call.name}; nothing was "
+                                "executed. Retry with a smaller step."
+                            )
                         runs.append(_ToolCallRun(
                             call=tool_call,
                             hint=hint,
                             parallel_safe=bool(
-                                tool is not None and tool.parallel_safe
+                                tool is not None
+                                and tool.parallel_safe
+                                and preflight_error is None
                             ),
+                            preflight_error=preflight_error,
                         ))
 
                     async def execute_run(run: _ToolCallRun) -> None:
+                        if run.preflight_error is not None:
+                            run.result = run.preflight_error
+                            await emit(
+                                AgentEventType.TOOL_PROGRESS,
+                                f"{run.hint} (rejected)",
+                                metadata={
+                                    "phase": "done",
+                                    "tool_call_id": run.call.id,
+                                },
+                            )
+                            return
                         await emit(
                             AgentEventType.TOOL_PROGRESS,
                             run.hint,
@@ -765,6 +812,15 @@ class AgentLoop:
                         thinking_blocks=thinking_blocks,
                     )
                     final_content = clean
+                    if stream_finish_reason == "length":
+                        logger.warning(
+                            "Model output truncated at the token limit for turn {}",
+                            turn_id or "-",
+                        )
+                        final_content = (
+                            (final_content or "")
+                            + "\n\n[Output truncated: the model reached its token limit.]"
+                        ).strip()
                     if self._apply_corrections(messages, session_key):
                         # The user corrected this turn before it ended: keep
                         # going inside the same turn instead of replying now.
@@ -798,13 +854,17 @@ class AgentLoop:
         except asyncio.CancelledError:
             with suppress(asyncio.CancelledError, Exception):
                 await emit(AgentEventType.CANCELLED)
+            drop_corrections = True
             raise _TurnCancelledError(messages) from None
         finally:
-            # Corrections belong to this turn only. Anything not consumed by
-            # the last model call must not leak into a later turn.
+            # A correction the turn never reached a safe point for is carried
+            # to the next turn instead of being acknowledged and dropped.
+            # Cancellation is different: the user asked to stop, so queued
+            # corrections are discarded with the turn.
             if session_key is not None:
-                self._corrections.pop(session_key, None)
                 self._correction_ready.pop(session_key, None)
+                if drop_corrections:
+                    self._corrections.pop(session_key, None)
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -842,12 +902,25 @@ class AgentLoop:
         sub_cancelled = await self.subagents.cancel_by_session(session_key)
         forge_cancelled = 0
         if self.forge_task_coordinator is not None:
-            record = self.forge_task_coordinator.store.active()
-            if record is not None and record.origin_session_key == session_key:
-                await self.forge_task_coordinator.cancel_task(
-                    record.task_id, reason="user_stop"
+            store = self.forge_task_coordinator.store
+            record = store.active()
+            if record is None or getattr(record, "origin_session_key", None) != session_key:
+                # A previous /stop may have marked the task terminal while the
+                # remote stop was never confirmed; keep it retryable.
+                latest = getattr(store, "latest_for_session", None)
+                record = latest(session_key) if callable(latest) else None
+            if record is not None and getattr(record, "origin_session_key", None) == session_key:
+                retry = any(
+                    item.cancel_requested
+                    and item.error is not None
+                    and item.status == "unknown"
+                    for item in getattr(record, "execution_records", [])
                 )
-                forge_cancelled = 1
+                if not getattr(record, "terminal", False) or retry:
+                    await self.forge_task_coordinator.cancel_task(
+                        record.task_id, reason="user_stop"
+                    )
+                    forge_cancelled = 1
         self._cancel_results[session_key] = (sub_cancelled, forge_cancelled)
         return sub_cancelled, forge_cancelled
 
@@ -861,14 +934,14 @@ class AgentLoop:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+        result = self._cancel_results.pop(session_key, None)
         if cancelled:
-            sub_cancelled, forge_cancelled = self._cancel_results.pop(
-                session_key, (0, 0)
-            )
+            sub_cancelled, forge_cancelled = result or (0, 0)
         else:
             sub_cancelled, forge_cancelled = await self._cancel_session_side_effects(
                 session_key
             )
+        self._cancel_results.pop(session_key, None)
         local_stopped = cancelled + sub_cancelled
         if not notify:
             return
@@ -925,6 +998,24 @@ class AgentLoop:
 
         asyncio.create_task(_do_restart())
 
+    def _schedule_consolidation(
+        self,
+        session: Session,
+        runtime: RuntimeSelection | None = None,
+    ) -> None:
+        """Compress the saved turn in the background so the reply is not delayed."""
+        task = asyncio.create_task(
+            self.memory_consolidator.maybe_consolidate_by_tokens(session, runtime)
+        )
+        self._background_tasks.add(task)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._background_tasks.discard(finished)
+            with suppress(Exception):
+                finished.result()
+
+        task.add_done_callback(_done)
+
     def _register_active_task(self, session_key: str, task: asyncio.Task) -> None:
         """Track a running turn so /stop can find and cancel it."""
         self._active_tasks.setdefault(session_key, []).append(task)
@@ -955,12 +1046,20 @@ class AgentLoop:
         if session_key is None:
             return False
         texts = self._corrections.pop(session_key, [])
+        if not texts:
+            return False
+        insert_at = len(messages)
+        if messages and messages[-1].get("role") == "user":
+            # A correction carried over from the previous turn belongs before
+            # the current request, not after it.
+            insert_at -= 1
         for text in texts:
-            messages.append({
+            messages.insert(insert_at, {
                 "role": "user",
                 "content": f"User correction: {text}",
             })
-        return bool(texts)
+            insert_at += 1
+        return True
 
     def _session_slot(self, session_key: str) -> _SessionSlot:
         """Return the slot for one session, creating it on first use."""
@@ -1033,21 +1132,64 @@ class AgentLoop:
         not deliver the same reply twice. Streaming events go to ``on_event``
         when given, and to the bus whenever the reply itself is published.
         """
-        stream_to_bus = publish
+        if not msg.turn_id:
+            msg.turn_id = uuid.uuid4().hex
+        turn_id = msg.turn_id
+        # A system turn is an internal hand-off (subagent result, Forge
+        # notification). Its events belong to no channel; publishing them
+        # produces one "Unknown channel: system" warning per token.
+        stream_to_bus = publish and msg.channel != "system"
         turn_session_key = self._session_key_for_turn(msg)
         deferred_terminal: list[AgentEvent] = []
+        pending_delta: list[str] = []
+        pending_chars = 0
+        last_delta_flush = 0.0
+        started = False
+
+        async def _flush_deltas(force: bool = False) -> None:
+            nonlocal last_delta_flush, pending_chars
+            if not pending_delta:
+                return
+            now = time.monotonic()
+            if not force and pending_chars < 60 and now - last_delta_flush < 0.05:
+                return
+            text = "".join(pending_delta)
+            pending_delta.clear()
+            pending_chars = 0
+            last_delta_flush = now
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=text,
+                metadata=dict(msg.metadata or {}, _progress=True),
+                event=AgentEvent(
+                    type=AgentEventType.TEXT_DELTA,
+                    content=text,
+                    turn_id=turn_id,
+                ),
+            ))
 
         async def _send_event(event: AgentEvent) -> None:
+            nonlocal pending_chars
             if on_event is not None:
                 await on_event(event)
-            if stream_to_bus:
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=event.content or "",
-                    metadata=dict(msg.metadata or {}, _progress=True),
-                    event=event,
-                ))
+            if not stream_to_bus:
+                return
+            if event.type == AgentEventType.TEXT_DELTA:
+                # Coalesce token deltas before they reach the bus. Channels
+                # already merge them; this keeps the shared queue bounded.
+                pending_delta.append(event.content or "")
+                pending_chars += len(event.content or "")
+                await _flush_deltas()
+                return
+            await _flush_deltas(force=True)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=event.content or "",
+                metadata=dict(msg.metadata or {}, _progress=True),
+                event=event,
+            ))
 
         async def _publish_event(event: AgentEvent) -> None:
             # Terminal events wait until the reply itself is on the queue, so a
@@ -1057,6 +1199,7 @@ class AgentLoop:
                 AgentEventType.ERROR,
                 AgentEventType.CANCELLED,
             ):
+                await _flush_deltas(force=True)
                 deferred_terminal.append(event)
             else:
                 await _send_event(event)
@@ -1065,10 +1208,21 @@ class AgentLoop:
             while deferred_terminal:
                 await _send_event(deferred_terminal.pop(0))
 
+        async def _emit_missing_error(content: str) -> None:
+            if not any(
+                item.type == AgentEventType.ERROR for item in deferred_terminal
+            ):
+                await _publish_event(AgentEvent(
+                    type=AgentEventType.ERROR,
+                    content=content,
+                    turn_id=turn_id,
+                ))
+
         event_callback = _publish_event if (on_event is not None or stream_to_bus) else None
 
         try:
             async with self._turn_slot(turn_session_key):
+                started = True
                 response = await self._process_message(
                     msg,
                     session_key=turn_session_key,
@@ -1091,14 +1245,15 @@ class AgentLoop:
             return reply
         except asyncio.CancelledError:
             logger.info("Task cancelled for session {}", turn_session_key)
-            try:
-                await self._cancel_session_side_effects(turn_session_key)
-            except Exception as exc:
-                logger.warning(
-                    "Session side-effect cancellation failed for {}: {}",
-                    turn_session_key,
-                    type(exc).__name__,
-                )
+            if started:
+                try:
+                    await self._cancel_session_side_effects(turn_session_key)
+                except Exception as exc:
+                    logger.warning(
+                        "Session side-effect cancellation failed for {}: {}",
+                        turn_session_key,
+                        type(exc).__name__,
+                    )
             with suppress(Exception):
                 await _flush_terminal()
             raise
@@ -1108,10 +1263,11 @@ class AgentLoop:
             # path lets one escape, still answer instead of crashing the
             # dispatcher — callers like cron and heartbeat have no handler.
             logger.error("LLM call failed for session {}: {}", msg.session_key, exc.detail)
+            await _emit_missing_error(exc.detail)
             reply = OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=f"LLM call failed: {exc.detail}",
-                metadata=dict(msg.metadata or {}),
+                metadata=self._final_reply_metadata(msg.metadata, turn_id),
             )
             if publish:
                 await self.bus.publish_outbound(reply)
@@ -1120,9 +1276,11 @@ class AgentLoop:
             return reply
         except Exception:
             logger.exception("Error processing message for session {}", msg.session_key)
+            await _emit_missing_error("Sorry, I encountered an error.")
             reply = OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content="Sorry, I encountered an error.",
+                metadata=self._final_reply_metadata(msg.metadata, turn_id),
             )
             if publish:
                 await self.bus.publish_outbound(reply)
@@ -1165,6 +1323,9 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
         if self.forge_task_coordinator is not None:
             self.forge_task_coordinator.interaction.closing = True
         if self.experience is not None:
@@ -1240,15 +1401,19 @@ class AgentLoop:
                 raise
             except LLMCallError as exc:
                 return self._abort_turn(
-                    session, history, exc, channel, chat_id, metadata=msg.metadata
+                    session, history, exc, channel, chat_id,
+                    turn_id=turn_id, metadata=msg.metadata,
                 )
             self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
-            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            await asyncio.to_thread(self.sessions.save, session)
+            self._schedule_consolidation(session)
             if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
                 return None
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+            return OutboundMessage(
+                channel=channel, chat_id=chat_id,
+                content=final_content or "Background task completed.",
+                metadata=self._final_reply_metadata(msg.metadata, turn_id),
+            )
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -1261,7 +1426,9 @@ class AgentLoop:
         cmd = msg.content.strip().lower()
         if cmd == "/new":
             try:
-                if not await self.memory_consolidator.archive_unconsolidated(session):
+                if not await self.memory_consolidator.archive_unconsolidated(
+                    session, runtime
+                ):
                     return OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
@@ -1276,8 +1443,10 @@ class AgentLoop:
                 )
 
             session.clear()
-            self.sessions.save(session)
+            await asyncio.to_thread(self.sessions.save, session, replace=True)
             self.sessions.invalidate(session.key)
+            self._corrections.pop(session.key, None)
+            self._correction_ready.pop(session.key, None)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -1297,7 +1466,7 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
             )
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        await self.memory_consolidator.maybe_consolidate_by_tokens(session, runtime)
 
         self._set_tool_context(
             msg.channel,
@@ -1346,15 +1515,16 @@ class AgentLoop:
             raise
         except LLMCallError as exc:
             return self._abort_turn(
-                session, history, exc, msg.channel, msg.chat_id, metadata=msg.metadata
+                session, history, exc, msg.channel, msg.chat_id,
+                turn_id=turn_id, metadata=msg.metadata,
             )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        await asyncio.to_thread(self.sessions.save, session)
+        self._schedule_consolidation(session, runtime)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -1382,6 +1552,7 @@ class AgentLoop:
         channel: str,
         chat_id: str,
         *,
+        turn_id: str,
         metadata: dict | None = None,
     ) -> OutboundMessage:
         """Persist the partial turn and reply with the failure.
@@ -1399,7 +1570,7 @@ class AgentLoop:
         self.sessions.save(session)
         return OutboundMessage(
             channel=channel, chat_id=chat_id, content=f"LLM call failed: {exc.detail}",
-            metadata=dict(metadata or {}),
+            metadata=self._final_reply_metadata(metadata, turn_id),
         )
 
     def _save_cancelled_turn(

@@ -571,6 +571,46 @@ async def test_wecom_retries_pending_text_after_failure(monkeypatch) -> None:
     assert "".join(call["content"] for call in client.calls) == "hello world"
 
 
+async def test_failed_reply_is_not_sent_twice_when_error_follows() -> None:
+    channel = _FakeChannel("telegram")
+    manager = _manager(channel)
+    manager.STREAM_COALESCE_INTERVAL = 0.0
+
+    manager._route(_started("telegram", turn_id="t1"))
+    manager._route(_message(
+        "telegram", "LLM call failed: boom", final=True, turn_id="t1",
+    ))
+    manager._route(_terminal(
+        "telegram", AgentEventType.ERROR, content="boom", turn_id="t1",
+    ))
+    await _wait_idle(manager)
+
+    delivered = [m.content for m in channel.messages] + [
+        m.content for m in channel.events
+    ]
+    assert delivered.count("LLM call failed: boom") == 1
+    assert "boom" not in delivered
+
+
+async def test_failed_reply_without_a_stream_is_not_sent_twice() -> None:
+    channel = _FakeChannel("telegram")
+    manager = _manager(channel)
+
+    manager._route(_message(
+        "telegram", "Sorry, I encountered an error.", final=True, turn_id="t2",
+    ))
+    manager._route(_terminal(
+        "telegram", AgentEventType.ERROR,
+        content="Sorry, I encountered an error.", turn_id="t2",
+    ))
+    await _wait_idle(manager)
+
+    delivered = [m.content for m in channel.messages] + [
+        m.content for m in channel.events
+    ]
+    assert delivered.count("Sorry, I encountered an error.") == 1
+
+
 async def test_manager_to_wecom_has_no_gap_or_duplicate(monkeypatch) -> None:
     monkeypatch.setattr(wecom_module, "WECOM_STREAM_INTERVAL", 0.0)
     monkeypatch.setattr(wecom_module, "WECOM_STREAM_MIN_CHARS", 0)

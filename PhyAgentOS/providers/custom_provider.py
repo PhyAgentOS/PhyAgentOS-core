@@ -166,11 +166,23 @@ class CustomProvider(LLMProvider):
     def _parse(self, response: Any) -> LLMResponse:
         choice = response.choices[0]
         msg = choice.message
-        tool_calls = [
-            ToolCallRequest(id=tc.id, name=tc.function.name,
-                            arguments=json_repair.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments)
-            for tc in (msg.tool_calls or [])
-        ]
+        tool_calls = []
+        for tc in msg.tool_calls or []:
+            raw_arguments = (
+                tc.function.arguments
+                if isinstance(tc.function.arguments, str)
+                else None
+            )
+            tool_calls.append(ToolCallRequest(
+                id=tc.id,
+                name=tc.function.name,
+                arguments=(
+                    json_repair.loads(raw_arguments)
+                    if raw_arguments is not None
+                    else tc.function.arguments
+                ),
+                raw_arguments=raw_arguments,
+            ))
         u = response.usage
         return LLMResponse(
             content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",

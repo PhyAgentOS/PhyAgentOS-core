@@ -349,6 +349,88 @@ async def test_budget_shrinks_output_tokens_instead_of_failing(
     assert provider.max_tokens == [65536 - 32953 - loop._OUTPUT_BUDGET_SAFETY_MARGIN]
 
 
+async def test_unexpected_exception_emits_error_and_final_reply(
+    tmp_path, monkeypatch
+) -> None:
+    loop = _loop(_StreamingProvider([]), tmp_path)
+
+    async def fail(_message, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(loop, "_process_message", fail)
+    events: list[AgentEvent] = []
+
+    async def on_event(event: AgentEvent) -> None:
+        events.append(event)
+
+    reply = await loop._dispatch(
+        InboundMessage(
+            channel="telegram", sender_id="test", chat_id="chat", content="hi",
+        ),
+        on_event=on_event,
+    )
+
+    assert reply is not None
+    assert reply.content == "Sorry, I encountered an error."
+    assert reply.metadata["_turn_final"] is True
+    assert [event.type for event in events] == [AgentEventType.ERROR]
+
+
+async def test_incomplete_tool_arguments_are_rejected_before_execution(
+    tmp_path, monkeypatch
+) -> None:
+    provider = _StreamingProvider([
+        [
+            StreamEvent(
+                type="tool_call",
+                tool_call=ToolCallRequest(
+                    id="c1",
+                    name="write_file",
+                    arguments={"path": "a.txt"},
+                    raw_arguments='{"path": "a.txt"',
+                ),
+            ),
+            StreamEvent(type="done", finish_reason="tool_calls"),
+        ],
+        [
+            StreamEvent(type="delta", content="not executed"),
+            StreamEvent(type="done"),
+        ],
+    ])
+    loop = _loop(provider, tmp_path)
+    executed: list[str] = []
+
+    async def fake_execute(name, params):
+        executed.append(name)
+        return "should not run"
+
+    monkeypatch.setattr(loop.tools, "execute", fake_execute)
+
+    reply = await loop.process_direct("write it", "cli:test")
+
+    assert reply == "not executed"
+    assert executed == []
+    session = loop.sessions.get_or_create("cli:test")
+    tool_messages = [m for m in session.messages if m.get("role") == "tool"]
+    assert tool_messages
+    assert "incomplete arguments" in tool_messages[-1]["content"]
+
+
+async def test_truncated_answer_is_marked_not_silently_complete(tmp_path) -> None:
+    provider = _StreamingProvider([
+        [
+            StreamEvent(type="delta", content="half an answer"),
+            StreamEvent(type="done", finish_reason="length"),
+        ],
+    ])
+    loop = _loop(provider, tmp_path)
+
+    reply = await loop.process_direct("answer", "cli:test")
+
+    assert reply.startswith("half an answer")
+    assert "Output truncated" in reply
+
+
 async def test_cancel_emits_cancelled_without_turn_done(tmp_path) -> None:
     class _BlockingProvider(LLMProvider):
         def __init__(self) -> None:

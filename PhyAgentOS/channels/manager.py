@@ -312,6 +312,10 @@ class ChannelManager:
         ):
             # turn_done already persisted this text; do not send it twice.
             return
+        if is_final and state is None and turn_id:
+            # A terminal reply that arrived without a stream still ends the
+            # turn; record it so the following error event is not sent twice.
+            self._finalized[key] = (msg.content, turn_id)
         self._enqueue(msg)
 
     def _allow_progress(self, msg: OutboundMessage) -> bool:

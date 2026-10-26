@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -102,6 +104,7 @@ class SessionManager:
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+        self._save_lock = threading.Lock()
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -183,33 +186,78 @@ class SessionManager:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
 
-    def save(self, session: Session) -> None:
+    @contextmanager
+    def _write_lock(self, path: Path):
+        """Serialize writers across threads and processes for one session file."""
+        lock_path = path.with_name(path.name + ".lock")
+        with self._save_lock:
+            handle = open(lock_path, "a+")
+            locked = False
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    locked = True
+                except (ImportError, OSError):
+                    pass
+                yield
+            finally:
+                if locked:
+                    try:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except (ImportError, OSError):
+                        pass
+                handle.close()
+
+    def _merged_messages(self, session: Session) -> tuple[list[dict], datetime]:
+        """Return messages to write, keeping anything another process appended."""
+        disk = self._load(session.key)
+        if disk is None or len(disk.messages) <= len(session.messages):
+            return session.messages, session.updated_at
+        prefix = session.messages
+        if disk.messages[: len(prefix)] == prefix:
+            return disk.messages, max(session.updated_at, disk.updated_at)
+        logger.warning(
+            "Session {} changed on disk in a non-append order; keeping the in-memory version",
+            session.key,
+        )
+        return session.messages, session.updated_at
+
+    def save(self, session: Session, *, replace: bool = False) -> None:
         """Save a session atomically so a failed write leaves the old file intact."""
         path = self._get_session_path(session.key)
-        fd, temp_path = tempfile.mkstemp(
-            dir=self.sessions_dir, prefix=f".{path.name}.", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                metadata_line = {
-                    "_type": "metadata",
-                    "key": session.key,
-                    "created_at": session.created_at.isoformat(),
-                    "updated_at": session.updated_at.isoformat(),
-                    "metadata": session.metadata,
-                    "last_consolidated": session.last_consolidated,
-                    "summary": session.summary,
-                }
-                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-                for msg in session.messages:
-                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-            os.replace(temp_path, path)
-        except BaseException:
+        with self._write_lock(path):
+            if replace:
+                messages, updated_at = session.messages, session.updated_at
+            else:
+                messages, updated_at = self._merged_messages(session)
+            fd, temp_path = tempfile.mkstemp(
+                dir=self.sessions_dir, prefix=f".{path.name}.", suffix=".tmp"
+            )
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    metadata_line = {
+                        "_type": "metadata",
+                        "key": session.key,
+                        "created_at": session.created_at.isoformat(),
+                        "updated_at": updated_at.isoformat(),
+                        "metadata": session.metadata,
+                        "last_consolidated": session.last_consolidated,
+                        "summary": session.summary,
+                    }
+                    f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                    for msg in messages:
+                        f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                os.replace(temp_path, path)
+            except BaseException:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
 
         self._cache[session.key] = session
 
