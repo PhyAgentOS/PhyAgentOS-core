@@ -4,28 +4,26 @@
   <p>
     <a href="https://arxiv.org/abs/2607.16636">技术报告</a> ·
     <a href="https://phy-agent-os.net/">官网</a> ·
-    <a href="docs/README.md">文档</a> ·
+    <a href="docs/README_zh.md">文档</a> ·
     <a href="https://discord.gg/YJztZ4wUM">Discord</a>
   </p>
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4264ce" alt="MIT License"></a>
     <img src="https://img.shields.io/badge/Python-3.11%2B-4264ce?logo=python&amp;logoColor=white" alt="Python 3.11 or newer">
-    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.1.0-4264ce" alt="Release v1.1.0"></a>
+    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.1.1-4264ce" alt="Release v1.1.1"></a>
     <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/stargazers"><img src="https://img.shields.io/github/stars/PhyAgentOS/PhyAgentOS-core?style=flat&amp;color=4264ce" alt="GitHub stars"></a>
   </p>
   <p><a href="README.md">English</a> · <a href="README_zh.md">简体中文</a></p>
   <p>
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
-    <a href="#release">v1.1.0</a> ·
-    <a href="#quick-start">快速开始</a> ·
+    <a href="#release">v1.1.1</a> ·
+    <a href="#quick-start">安装配置</a> ·
+    <a href="#simulation-quickstart">仿真 Quickstart</a> ·
     <a href="#quickstart-examples">快速启动示例</a> ·
-    <a href="#control-modes">控制方式</a> ·
-    <a href="#benchmarks">Benchmark</a> ·
-    <a href="#robot-skills">运行机器人技能</a> ·
     <a href="#documentation">文档导航</a>
   </p>
-  <p><a href="docs/news/gosim-shenzhen-2026_zh.md"><b>GOSIM Shenzhen 2026 Spotlight · 10 月 16–17 日 · 深圳现场见</b></a></p>
+  <p><a href="#release"><b>v1.1.1 · Skill 开发、执行可靠性与 Opper 网关</b></a></p>
 </div>
 
 ---
@@ -48,28 +46,27 @@
 | **可复用的物理执行能力** | 将环境相关工具与 Runtime 封装为版本化 Skill，使认知规划与机器人接入保持解耦。 |
 
 <a id="release"></a>
-## v1.1.0 更新亮点
+## v1.1.1 更新亮点
 
-**Provider 管理、Skill Runtime 与受治理的交互。** 本次版本包含：
+**Skill 开发、执行可靠性与 Opper 网关。** 相对 v1.1.0 的主要变化：
 
-- **Provider 管理：** 集中配置、连接测试、认证、模型发现、模型选择保存与会话级覆盖。
-- **更多模型接入：** 直接支持 OpenAI Responses API 的工具调用、多模态输入、推理强度与 Forge 验证；新增 Requesty、Cheaper Inference 和 API Route 网关。
-- **Skill Runtime 更新：** `directory_tar_gz` Node 包可携带运行时依赖并校验内部相对符号链接；profile 支持启动超时、`required_tools` 覆盖，以及用于 LIBERO 0.3.4 前置准备的启动 hook 上下文。
-- **受治理的交互基础（默认关闭）：** 通过冻结绑定、持久化 Runner 和 Supervisor，将 AgentTask、Session、多步决策、独立根目标验证与一条去重的经验 episode 连接起来。参见[适用范围与启用说明](docs/interaction/README.md)。
-- **可靠性改进：** 保留有效 cron 任务，完善 Dora 状态解析和 profile 环境注入、归档与图片路径处理，并在模型调用失败时保留对话历史。取消后拒绝新的执行意图并丢弃迟到决策；不确定操作不会自动重发，资源保护保持到执行状态完成核对。
-- **指南与验证：** 扩展回归测试和构建检查，完善双语文档、Piper 与 LIBERO-10 快速启动，以及评测范围和结果说明。
+- **Opper 网关：** 新增 OpenAI 兼容接入，支持 Provider 选择、环境变量凭据和原样传递模型标识。
+- **本地 Skill 开发：** 本地修改工作流文档和 Node 可执行文件后可带警告运行，绑定与经验仍记录实际激活的工作流哈希；显式 Node 校验和安装缓存验收保持严格。
+- **Action 拒绝处理：** Gateway 明确在分发前拒绝的请求记为失败，不再阻塞后续重试或成功任务的最终判定；超时和远端执行不确定时仍保留原有保护。
+- **Piper X 开发示例：** 双语 Track B 指南与独立仿真 Skill 示例覆盖模型转换、原始 Node locks、打包和历史验证记录；原始运行基线见 [Piper X 指南](docs/user_development_guide/PIPER_X_DEMO_zh.md)。
+- **文档整理：** 合并双语手册和贡献指南，新增带实时 GIF 的 MuJoCo Quickstart，并保留评测文档入口。
 
-查看[完整更新记录](CHANGELOG.md)和[相对 v1.0.0 的全部变更](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.0.0...v1.1.0)。
+查看[完整更新记录](CHANGELOG.md)和[相对 v1.1.0 的全部变更](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.1.0...v1.1.1)。
 
 <a id="quick-start"></a>
-## Quickstart · 如何开始使用
+## 安装与配置
 
-先运行模型驱动的 CLI 对话，再按下文接入机器人或仿真 Skill。**准备：** Python 3.11 或 3.12、Git，以及模型服务的 API Key。
+先运行模型驱动的 CLI 对话，再按下文的 [MuJoCo Quickstart](#simulation-quickstart) 操控仿真机器人。**准备：** Python 3.11 或 3.12、Git，以及模型服务的 API Key。
 
 ### 1. 安装与初始化
 
 ```bash
-git clone --branch v1.1.0 https://github.com/PhyAgentOS/PhyAgentOS-core.git
+git clone --branch v1.1.1 https://github.com/PhyAgentOS/PhyAgentOS-core.git
 cd PhyAgentOS-core
 python -m venv .venv
 source .venv/bin/activate
@@ -80,7 +77,6 @@ paos onboard
 Windows PowerShell 请将激活命令替换为 `.venv\Scripts\Activate.ps1`。
 
 ### 2. 配置模型
-
 
 通过隐藏输入配置密钥，再选择默认 Provider：
 
@@ -94,7 +90,7 @@ Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`�
 不改变正在执行的任务及其他会话。
 
 <details>
-<summary>完整配置参考（v1.1.0）</summary>
+<summary>完整配置参考（v1.1.1）</summary>
 
 配置保存为 camelCase，同时也接受 snake_case 输入。
 
@@ -162,53 +158,23 @@ paos agent
 
 收到模型回复即完成核心 Agent 与模型服务的连通检查；`paos agent` 会打开交互式对话。执行物理任务还需要启动对应的 Skill Runtime。
 
-其他模型服务与部署方式见 [用户手册](docs/zh/02-user-manual.md) · [Docker 部署](docs/user_manual/DOCKER.md).
-
-<a id="control-modes"></a>
-## 一套执行框架，三种控制方式
-
-![通用模型、混合控制与动作模型通过 PhyAgentOS 执行动作](docs/imgs/control-modes-original.jpg)
-
-图中的 System 1 / System 2 沿用所提供原图的命名，分别指通用模型控制与动作模型控制。
-
-以上描述的是接入方式；具体模型与环境取决于安装的 Physical Execution Skill。Core 不捆绑模型权重、仿真资源或机器人驱动。
-
-<a id="benchmarks"></a>
-## Benchmark
-
-以下展示 **LIBERO-Long**、**RoboDojo** 与 **RoboTwin** 上的任务成功率。深色为 PhyAgentOS（PAOS）结果，浅色为公开榜单参考值。
-
-**评测口径：** LIBERO 使用 `libero-10`（图中标为 LIBERO-Long）；RoboDojo 和 RoboTwin 各随机抽样 10 个任务，部分模型的评测样本量不同。公开榜单参考结果可能采用不同评测协议。
-
-![LIBERO-Long benchmark](docs/imgs/benchmark-libero-long-original.png)
-
-![RoboDojo benchmark](docs/imgs/benchmark-robodojo-original.png)
-
-![RoboTwin benchmark](docs/imgs/benchmark-robotwin-original.png)
-
-| PhyAgentOS 配置 | LIBERO-10 ↑ | RoboDojo ↑ | RoboTwin ↑ |
-| --- | ---: | ---: | ---: |
-| GPT-6 + π0.5 | 100.00% | 23.30% | 76.70% |
-| DeepSeek 4.1 Flash + π0.5 | 97.22% | 26.70% | 77.80% |
-| GLM 5.3 Flash + π0.5 | 100.00% | 20.00% | 66.70% |
-| Gemini Robotic ER2 + π0.5 | — | — | 80.00% |
-| Kimi-K3 + π0.5 | — | — | 66.70% |
-| Gemini 3.8 Flash + π0.5 | — | — | 66.70% |
-| DeepSeek 4.1 Flash | 82.00% | 8.30% | — |
-| GPT-6 | — | 8.30% | — |
-| GLM 5.3 Flash | — | 2.78% | — |
-| Kimi-K3 | 60.00% | 0.00% | — |
-
-> 使用维护者提供的最新评测原图。完整数值、耗时、Token 消耗与评测口径见 [Benchmark 说明](docs/benchmarks.md)；“—”表示未提供。复现 LIBERO 评测见 [LIBERO 快速启动](example/quickstart/libero-quickstart.md)。
+其他模型服务与部署方式见 [用户手册](docs/zh/02-user-manual.md) · [Docker 部署](docs/user_manual/DOCKER_zh.md).
 
 <a id="robot-skills"></a>
-## 接入机器人或仿真环境
+<a id="simulation-quickstart"></a>
+## Quickstart · 在 MuJoCo 中操控机器人
 
-**Physical Execution Skill** 封装工作流及其运行需求。安装环境对应的 Skill、启动其中一个命名 profile 后，即可让 Agent 使用它。
+> [!TIP]
+> **开发者接入自己的机械臂：直接查看 [Piper X 完整二次开发 demo](docs/user_development_guide/PIPER_X_DEMO_zh.md)。**
+> 从模型转换到 Skill 组装，跑通关节与末端位姿控制；配合 [Skill 开发手册](docs/user_development_guide/track_b/SKILL_DEVELOPMENT_zh.md)，选择配置修改、新增 profile 或独立 Node 开发。
 
-**1. 为托管 Runtime 安装 Dora**
+以 **`robot-control-sim`** 为例，通过关节目标或末端位姿控制仿真 Piper 机械臂。
+请先完成上方安装与模型配置。本例使用的预构建仿真 Node 面向 **Linux x86_64**，
+MuJoCo 和图像查看器需要可用的图形显示或虚拟显示环境。
 
-v1.1.0 沿用 Dora CLI **0.4.1**（`dora-message` **0.7.0**）兼容基线。Linux/macOS：
+### 1. 安装 Dora
+
+v1.1.1 沿用 Dora CLI **0.4.1**（`dora-message` **0.7.0**）兼容基线：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -216,62 +182,99 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 dora --version
 ```
 
-`paos skill start` 需要 Dora，上面的 CLI 对话无需安装。[Windows 与 Cargo 安装说明](docs/zh/02-user-manual.md#托管-skill-profile-所需的-dora-cli)。
+启动仿真 Runtime 需要 Dora；其他安装方式见 [Dora 安装参考](docs/zh/02-user-manual.md#托管-skill-profile-所需的-dora-cli)。
 
-**2. 查找并安装 Skill**
+### 2. 安装 robot-control-sim
 
-从 Registry 下载时，在配置中设置 `resourceRegistry.url`，或将环境变量 `PAOS_RESOURCE_REGISTRY_URL` 指向部署方提供的 Registry，然后运行：
-
-```bash
-paos skill search
-paos skill install <skill-name> --version <version>
-paos skill inspect <skill-name>
-```
-
-将 `<skill-name>`、`<version>` 替换为搜索结果。也可以安装独立获取的本地 Bundle：
+在配置中设置 `resourceRegistry.url`，或通过 `PAOS_RESOURCE_REGISTRY_URL` 指向提供
+`robot-control-sim` 及其锁定 Node 制品的部署，再运行：
 
 ```bash
-paos skill install /path/to/skill-bundle.tar.gz --local
+paos skill search robot-control-sim
+paos skill install robot-control-sim
+paos skill inspect robot-control-sim
 ```
 
-**3. 启动 Runtime 并提交任务**
+`inspect` 显示已安装版本、profile 与依赖。本例使用 `mujoco-piper`；也可选择
+`mujoco-franka` 或 `mujoco-so101` 切换机器人。独立获取的 Bundle 可用
+`paos skill install /path/to/robot-control-sim.tar.gz --local` 安装，所锁定的 Node 也需可获取。
+Core 不内置这些仿真资源。
 
-将 `<profile>` 替换为该 Skill 声明的 profile；模型、资源与硬件准备请遵循对应 Skill 的说明。
+### 3. 启动仿真
 
 ```bash
-paos skill start <skill-name> --profile <profile>
-paos skill status <skill-name>
-paos agent -m "Inspect the active Skill and Physical Execution capabilities, then report which tasks are available."
+paos skill start robot-control-sim --profile mujoco-piper
+paos skill status robot-control-sim
 ```
 
-Runtime 健康后，在 `paos agent` 中描述该 Skill 支持的任务。启动 Agent 不会自动下载或启动 Runtime。
+等待 Runtime 报告健康并打开仿真相机查看器。启动失败时，先通过
+`paos skill logs robot-control-sim` 定位问题，再提交运动请求。
 
-<details>
-<summary>常用运行管理命令</summary>
+![robot-control-sim 在 MuJoCo 中启动的实录](docs/imgs/quickstart/robot-control-sim-startup.gif)
+
+### 4. 按关节目标和末端位姿控制
+
+Agent 读取 `sim.get_robot_info` 与实时 Tool context，确认关节、限位、坐标系和单位，
+再按活动 Skill 的工作流执行。下方绝对目标适用于 `mujoco-piper`（`arm_base` / `tcp`）；
+切换 profile 时应使用对应机器人的坐标系和可达目标。
+
+| 控制方式 | Tool | 目标 |
+| --- | --- | --- |
+| 关节目标 | `sim.set_joint_positions` | 机械臂各关节的绝对位置，单位为弧度 |
+| 末端位姿 | `sim.move_eef` | 以米表示的绝对位置及四元数姿态，由 motion server 求解 IK |
+
+运动演示使用 `verification.mode=off`，按 Tool 执行结果判断完成；语义任务验证与证据策略见 [Core 开发者手册](docs/zh/03-developer-manual.md#7-verification-与-recovery)。
+
+先尝试关节空间请求：
 
 ```bash
-paos skill list
-paos skill logs <skill-name>
-paos skill stop <skill-name>
-paos gateway
+paos agent -m "使用 robot-control-sim 的 mujoco-piper。 \
+  检查机器人信息和 Tool context，本次运动演示使用 verification.mode=off。 \
+  通过 sim.set_joint_positions 将 joint1-joint6 移动到 [0.35, 0.55, -0.9, 0.15, 0.25, -0.1] rad， \
+  velocity_scale 和 acceleration_scale 均为 0.2。 \
+  读取动作结果、finalize 任务并简要报告。 \
+  不修改文件、不使用 shell 工具；失败时直接报告。"
 ```
 
-`paos gateway` 运行已配置的消息渠道与后台服务。就绪检查与排障见 [运行手册](docs/user_manual/README.md).
+![输入关节目标命令后的 Piper 仿真运动实录](docs/imgs/quickstart/robot-control-sim-joint-control.gif)
 
-每个 Physical Execution Skill Bundle 声明工作流文档、所需 Tool ID、命名 Runtime profile，以及精确的
-平台/架构 Node lock。每个锁定归档具有精确 SHA-256；`executable_tar_gz` 只包含一个指定文件名的
-根目录可执行文件，`directory_tar_gz` 则只包含一个以 entrypoint 命名的根目录（同名可执行文件及
-其运行时树置于其中）。安装时另行记录并校验解包后的 binary hash。
-`python scripts/package_skill.py <bundle-dir> --output-dir <directory>` 可生成确定性发布 Bundle。
-PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical Execution node、模型或仿真资源；
-部署者只需独立获取实际需要的 Skill 并显式安装。
-[集成开发指南](docs/user_development_guide/README.md#5-打包发布与本地闭环)说明 Bundle 布局、
-本地验证、不可变发布顺序与 Registry 验收。
+再尝试末端位姿请求：
 
-</details>
+```bash
+paos agent -m "使用 robot-control-sim 的 mujoco-piper。 \
+  检查 Tool context，本次运动演示使用 verification.mode=off。 \
+  调用 sim.move_eef，将 TCP 移到 arm_base 下的位置 (0.284045, 0.007878, 0.478706) m， \
+  四元数 xyzw 为 (-0.002904, 0.693239, 0.008319, 0.720654)， \
+  position_tolerance_m=0.01、orientation_tolerance_rad=0.05， \
+  velocity_scale 和 acceleration_scale 均为 0.2。 \
+  由 motion server 求解 IK；读取动作结果、finalize 任务并简要报告。 \
+  不修改文件、不使用 shell 工具；失败时直接报告。"
+```
+
+![输入末端位姿命令后的 Piper 仿真运动实录](docs/imgs/quickstart/robot-control-sim-eef-control.gif)
+
+*以上为命令与 MuJoCo 仿真的运行实录，命令画面固定保留以便阅读，并已缩短模型等待停顿。*
+
+也可运行 `paos agent` 进入交互控制。应能在仿真中观察到运动；以返回的执行结果和最终状态为准，
+不把请求已接纳当作动作已完成。
+
+### 5. 停止仿真
+
+运动任务结束后执行：
+
+```bash
+paos skill stop robot-control-sim
+```
+
+### 在此基础上二次开发
+
+- [TrackB 框架说明](docs/user_development_guide/track_b/README_zh.md)：整体架构、仓库目录与节点协议。
+- [Skill 开发手册](docs/user_development_guide/track_b/SKILL_DEVELOPMENT_zh.md)：修改 profile、增加 profile，以及独立开发 Node 并组装 Skill。
+- [Piper X 二次开发 demo](docs/user_development_guide/PIPER_X_DEMO_zh.md)：为 `robot-control-sim` 接入另一种机械臂，包含模型转换与两种控制方式。
+- [Bundle 与 Tool 接入参考](docs/user_development_guide/README_zh.md)：manifest 字段、打包和本地安装。
 
 <a id="quickstart-examples"></a>
-## Quickstart · 快速启动示例
+## 更多示例
 
 | 平台 | 内容 | 指南 |
 | --- | --- | --- |
@@ -284,19 +287,23 @@ PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical
 | 我想…… | 阅读入口 |
 | --- | --- |
 | 安装、配置并运行 PhyAgentOS | [用户手册](docs/zh/02-user-manual.md) |
-| 开发 Skill 或接入新环境 | [集成开发指南](docs/user_development_guide/README.md) |
+| 开发 Skill 或接入新环境 | [TrackB 开发指南](docs/user_development_guide/track_b/README_zh.md) |
 | 了解 Physical Execution API | [Physical Execution Tool API](docs/forge/README_zh.md) |
-| 开发与测试 Core | [开发者手册](docs/zh/03-developer-manual.md) |
-| 查看测评数值与来源 | [Benchmark](docs/benchmarks.md) |
-| 浏览全部文档 | [文档索引](docs/README.md) |
+| 为 robot-control-sim 接入另一种机械臂 | [Piper X 二次开发 demo](docs/user_development_guide/PIPER_X_DEMO_zh.md) |
+| 开发与测试 Core | [Core 开发者手册](docs/zh/03-developer-manual.md) |
+| 查看测评结果与评测口径 | [Benchmark 文档](docs/benchmarks.md) |
+| 浏览全部文档 | [文档索引](docs/README_zh.md) |
 
 <a id="news"></a>
 ## News · 最新动态
+
+**2026-10-23 · v1.1.1 发布：** 新增 Opper 网关，完善本地 Skill 开发和 Action 拒绝处理，并补充双语 Track B 与 Piper X 开发指南。[查看发布说明与安装包](https://github.com/PhyAgentOS/PhyAgentOS-core/releases/tag/v1.1.1)。
 
 **2026-10-10 · GOSIM Shenzhen 2026：** PhyAgentOS 入选 Spotlight，并将在开源机器人分论坛做主题分享。[查看活动公告与现场信息](docs/news/gosim-shenzhen-2026_zh.md)。
 
 | 版本 | 日期 | 更新 |
 | --- | --- | --- |
+| **v1.1.1** | 2026-10-23 | Opper 网关、本地 Skill 开发与 Action 拒绝处理修复、双语 Track B 和 Piper X 指南，以及 MuJoCo Quickstart。 |
 | **v1.1.0** | 2026-10-09 | 集中式 Provider 管理、直接 OpenAI Responses 与新网关接入、Skill Runtime 打包和启动改进，以及默认关闭的受治理交互基础。 |
 | **v1.0.0** | 2026-08-30 | Initial stable release of PhyAgentOS. |
 | **v0.2.3** | 2026-08-27 | Physical Execution Skill 可独立安装和管理，经显式激活冻结到 AgentTask，并通过受治理的 Query、Action、Session Tool API 生命周期执行，支持恢复和按版本限定的经验。 |
@@ -306,7 +313,7 @@ PhyAgentOS 源码与发布包不内置具体 Physical Execution Skill、Physical
 
 ## 参与贡献与社区
 
-欢迎报告问题、改进 Skill、接入新环境或完善文档。请先阅读[开发者手册](docs/zh/03-developer-manual.md)，再提交 [Issue](https://github.com/PhyAgentOS/PhyAgentOS-core/issues) 或 Pull Request。
+请先阅读[贡献指南](CONTRIBUTING_zh.md)与开发手册，建议优先参与 TrackB 的 Node、Skill 和机器人/环境接入开发。资源平台的外部贡献提交及已有登记仓库修改暂未开放，需等待审批服务完成并开放后支持；现阶段可进行本地开发验证，具体范围与源码评审流程见贡献指南。
 
 <details>
 <summary>开发检查命令</summary>

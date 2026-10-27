@@ -2,7 +2,7 @@
 
 [中文](../zh/01-framework-introduction.md) · [Documentation index](../README.md)
 
-> Documentation version: 1.0.0 · implementation baseline: 2026-08-30 source, schemas, and tests.
+> Documentation version: 1.1.1 · implementation baseline: 2026-10-23 source, schemas, and tests.
 
 ## 1. Positioning
 
@@ -173,6 +173,6 @@ outside the implemented contract.
 ## Next reading
 
 - [User Manual](02-user-manual.md)
-- [Developer Manual](03-developer-manual.md)
+- [Core Developer Manual](03-developer-manual.md)
 - [Forge Tool API Integration Contract](../forge/README.md)
 - [Agent Experience and Skill Evolution](05-agent-experience-and-skill-evolution.md)

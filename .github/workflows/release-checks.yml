@@ -1,0 +1,33 @@
+name: Check release automation
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/publish-pypi.yml
+      - .github/workflows/release-checks.yml
+      - scripts/pypi_release.py
+      - scripts/tests/test_pypi_release.py
+  push:
+    branches: [main, dev]
+    paths:
+      - .github/workflows/publish-pypi.yml
+      - .github/workflows/release-checks.yml
+      - scripts/pypi_release.py
+      - scripts/tests/test_pypi_release.py
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Test release validation and safe retries
+        run: python -m unittest discover -s scripts/tests -p test_pypi_release.py -v

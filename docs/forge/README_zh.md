@@ -1,8 +1,10 @@
 # Forge Tool API 接入契约
 
-[English](README.md) · [文档索引](../README.md)
+[English](README.md) · [文档索引](../README_zh.md)
 
-> 适用于 PhyAgentOS 1.0.0。
+> 适用于 PhyAgentOS 1.1.1。
+
+本文是公开 Tool API 路由、身份和 invocation/task 语义的统一契约。节点消息与 dataflow 参见 [TrackB 协议](../user_development_guide/track_b/PROTOCOLS_zh.md)；可选交互另有[受限扩展契约](../interaction/README_zh.md)。
 
 ## 1. 执行边界
 
@@ -142,7 +144,8 @@ Tool record 终结后，后续 observation 不改写执行事实。Recovery revi
 
 ## 9. Evidence 与 verification
 
-PAOS 在第一次绑定 Action 前和所有绑定 Action 达到记账终态后进行 best-effort 采集。Evidence
+普通机器人工作流在第一次绑定 Action 前进行 best-effort 采集；`forge_task_finalize` 在
+task-owned Action/Session 达到记账终态后采集后置证据，不是每个 Action 后分别采集。Evidence
 artifact 包含 source、phase、sequence、timestamp、media metadata、size、SHA-256 与工作区相对
 reference。采集错误会显式记录。Verifier 接收任务上下文前，会检查 bundle 身份、质量、采集时间
 窗口、policy 要求以及保留 artifact 字节。
@@ -206,5 +209,5 @@ Mock Gateway 测试可完成代码与契约验收；硬件/MuJoCo 验收单独�
 
 - [框架介绍](../zh/01-framework-introduction.md)
 - [配置参考](../zh/04-forge-configuration-reference.md)
-- [集成开发指南](../user_development_guide/README.md)
-- [运行手册](../user_manual/README.md)
+- [Bundle 与 Tool 接入参考](../user_development_guide/README_zh.md)
+- [运行手册](../user_manual/README_zh.md)

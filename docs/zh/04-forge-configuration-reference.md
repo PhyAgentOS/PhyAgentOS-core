@@ -1,6 +1,6 @@
 # Forge 配置参考
 
-> 适用于 PhyAgentOS 1.0.0 与统一的 Forge Gateway Tool API。
+> 适用于 PhyAgentOS 1.1.1 与统一的 Forge Gateway Tool API。
 
 ## 1. 配置位置与命名
 
@@ -23,9 +23,19 @@ Runtime 选择与 Gateway URL 来自已安装 Skill manifest 和显式启动的 
 | `pollIntervalS` | number | `0.5` | Action/Session status/result 建议对账间隔，范围 `[0.1, 5.0]` 秒。 |
 | `executionTimeoutS` | number | `300.0` | Agent 侧任务 deadline 指引；timeout 不能证明远端执行已停止。 |
 | `evidence` | object | 见下表 | AgentTask 的 best-effort 前后证据采集设置。 |
+| `interaction` | object | `{"enabled": false}` | 可选的受限交互扩展，见下文。 |
 
 PAOS 只通过 `/tools` 与 `/invocations` 调用 Query、Action 和 Session，不调用旧式
 `/agent/sessions` 或 `/policy/command`。并发由所选 Endpoint operation 的 `max_concurrency` 裁决。
+
+### `forge.interaction`
+
+| JSON 字段 | 类型 | 默认值 | 约束与含义 |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | 允许交互任务契约，不授权生产控制面访问。 |
+
+[交互基础](../interaction/README_zh.md)当前要求显式注入使用 `httpx.MockTransport` 的进程内部署。
+仅修改普通 CLI 配置不能启用真实环境；该可选扩展与默认机器人/Skill 开发流程分开。
 
 ## 2.1 `resourceRegistry`
 
@@ -75,7 +85,7 @@ Verification Service 启动 readiness 等待为有界操作。服务不可用时
 
 | JSON 字段 | 类型 | 默认值 | 约束与含义 |
 |:----------|:-----|:-------|:-----------|
-| `enabled` | boolean | `true` | 启用显式 Skill 激活、经验账本和后台演化。故障不会阻塞任务执行。 |
+| `enabled` | boolean | `true` | 启用经验反思与受控晋升；false 时显式 Skill 激活仍可用，演化故障不阻塞执行。 |
 | `scope` | literal | `verified_forge_lineage` | 消费有 semantic verdict 的 AgentTask lineage；持久化 literal 为兼容保持稳定。 |
 | `promotionMode` | literal | `guarded_auto` | 只允许经过门控验证的自动晋升。 |
 | `minSuccessfulEpisodes` | integer | `3` | 相同候选晋升所需的独立成功 AgentTask 数，至少为 1。 |
@@ -258,7 +268,7 @@ paos agent -m "调用 forge_tool_context 读取指定 Tool 的 schema、binding�
 ## 后续阅读
 
 - [用户手册](02-user-manual.md)
-- [开发者手册](03-developer-manual.md)
+- [Core 开发者手册](03-developer-manual.md)
 - [Agent 经验与 Skill 自进化](05-agent-experience-and-skill-evolution.md)
-- [运行手册](../user_manual/README.md)
-- [统一 Forge Tool API 契约](../forge/UNIFIED_TOOL_API.md)
+- [运行手册](../user_manual/README_zh.md)
+- [统一 Forge Tool API 契约](../forge/README_zh.md)

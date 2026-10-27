@@ -415,7 +415,12 @@ def _make_forge_components(config: Config, provider):
     invocation_ids = DynamicRuntimeSet(runtime_registry, "invocation_ids")
     session_ids = DynamicRuntimeSet(runtime_registry, "session_ids")
     task_binding_ids = DynamicRuntimeSet(runtime_registry, "task_binding_ids")
-    binding_resolver = ForgeSkillBindingResolver(runtime_registry)
+    from PhyAgentOS.agent.skills import SkillsLoader
+
+    binding_resolver = ForgeSkillBindingResolver(
+        runtime_registry,
+        skills_loader=SkillsLoader(config.workspace_path),
+    )
 
     coordinator = AgentTaskCoordinator(
         workspace=config.workspace_path,
@@ -1471,7 +1476,7 @@ def forge_node_verify(
         lock = manifest.artifacts.nodes.get(node_id)
         if lock is None:
             raise RuntimeError(f"Skill {skill_name!r} does not lock Node {node_id!r}")
-        NodeInstaller().load(lock)
+        NodeInstaller().load(lock, strict=True)
     except Exception as error:
         _skill_runtime_error(error)
         return

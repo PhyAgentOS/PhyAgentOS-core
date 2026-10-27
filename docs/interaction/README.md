@@ -1,5 +1,11 @@
 # Governed interaction foundation
 
+[English](README.md) | [简体中文](README_zh.md)
+
+This is an optional restricted Core extension, separate from the default robot development path.
+Start ordinary Node/Skill development with [TrackB](../user_development_guide/track_b/README.md).
+The [Tool API contract](../forge/README.md) remains the canonical transport and invocation reference.
+
 This opt-in foundation connects a single real `AgentTask` to a Forge Session and a
 bounded observation/decision loop. It is implemented against core `dev@3dcdc914`.
 Minecraft operations, its Bridge, and production control-plane isolation are not

@@ -238,6 +238,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # Opper: EU-hosted gateway, OpenAI-compatible, pool ids like "claude-sonnet-4-6".
+    # "custom_openai" sends the model id upstream unchanged, so pinned routes such as
+    # "anthropic/claude-sonnet-4-6" keep their vendor prefix.
+    ProviderSpec(
+        name="opper",
+        keywords=("opper",),
+        env_key="OPPER_API_KEY",
+        display_name="Opper",
+        litellm_prefix="custom_openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="opper.ai",
+        default_api_base="https://api.opper.ai/v3/compat",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(

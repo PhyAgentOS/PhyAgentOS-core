@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 from uuid import uuid4
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from PhyAgentOS.config.schema import ForgeConfig
@@ -95,6 +96,10 @@ class ToolExecutionRecord(BaseModel):
     attempt_id: str | None = None
     response: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
+    # True only when the Gateway proved the invoke was rejected before anything
+    # reached the provider. Such a record documents a tool call that never
+    # executed, so task finalization must neither require nor be failed by it.
+    rejected_before_dispatch: bool = False
     evidence_refs: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -483,12 +488,22 @@ class AgentTaskCoordinator:
             if not candidate_id:
                 raise AgentTaskError("primary Skill activation has no Forge binding candidate")
             try:
-                binding = await self.binding_resolver.freeze(candidate_id, task_id=task_id)
+                binding = await self.binding_resolver.freeze(
+                    candidate_id,
+                    task_id=task_id,
+                    activated_document_sha256=activation.content_sha256,
+                )
             except ForgeSkillBindingError as exc:
                 raise AgentTaskError(str(exc)) from exc
-            if activation.content_sha256 != binding.skill_document_sha256:
-                raise AgentTaskError(
-                    "activated SKILL.md does not match the installed Runtime binding"
+            if (
+                binding.workflow_document_sha256 is not None
+                and binding.workflow_document_sha256 != binding.skill_document_sha256
+            ):
+                logger.warning(
+                    "workflow document sha256 {} differs from the installed bundle "
+                    "document sha256 {}; proceeding with the locally modified document",
+                    binding.workflow_document_sha256[:12],
+                    binding.skill_document_sha256[:12],
                 )
         task = AgentTaskRecord(
             task_id=task_id,
@@ -649,13 +664,18 @@ class AgentTaskCoordinator:
             remote_invocation_id, remote_attempt_id = _remote_identity(exc)
             invocation_id = remote_invocation_id or invocation_id
             attempt_id = remote_attempt_id or attempt_id
+            # A structured pre-dispatch rejection leaves no remote state, so
+            # the record is definitively failed: the identical-Action guard
+            # must not arm and block a later identical resend.
+            rejected_before_dispatch = _rejected_before_dispatch(exc)
             self._finish_execution(
                 task_id,
                 record_id,
-                status="unknown",
+                status="failed" if rejected_before_dispatch else "unknown",
                 invocation_id=invocation_id,
                 attempt_id=attempt_id,
                 error={"type": type(exc).__name__, "message": str(exc)},
+                rejected_before_dispatch=rejected_before_dispatch,
             )
             if invocation_id and self.runtime_invocation_ids is not None:
                 self._track_remote_identity(
@@ -1246,6 +1266,7 @@ class AgentTaskCoordinator:
         attempt_id: str | None = None,
         response: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
+        rejected_before_dispatch: bool = False,
     ) -> None:
         def mutate(current: AgentTaskRecord) -> None:
             record = _task_execution(current, record_id)
@@ -1254,6 +1275,7 @@ class AgentTaskCoordinator:
             record.attempt_id = attempt_id or record.attempt_id
             record.response = response
             record.error = error
+            record.rejected_before_dispatch = rejected_before_dispatch
             record.updated_at = utc_now()
 
         self.store.update(task_id, mutate, event_type="tool_execution_finished")
@@ -1468,12 +1490,20 @@ def _cancel_terminal_status(task: AgentTaskRecord) -> AgentTaskStatus:
         if item.semantics == "action"
         or (item.semantics == "session" and item.ownership == "task")
     ]
-    if not owned or all(item.status in {"cancelled", "stopped"} for item in owned):
+    if not owned or all(
+        item.status in {"cancelled", "stopped"} or item.rejected_before_dispatch
+        for item in owned
+    ):
         return AgentTaskStatus.CANCELLED
     return AgentTaskStatus.FAILED
 
 
 def _execution_facts_succeeded(task: AgentTaskRecord) -> bool:
+    executed = [item for item in task.execution_records if not item.rejected_before_dispatch]
+    if not executed:
+        # Every recorded call was rejected before dispatch: nothing ran, so the
+        # task cannot be reported as succeeded.
+        return False
     return all(
         item.status == "succeeded"
         or (
@@ -1486,7 +1516,7 @@ def _execution_facts_succeeded(task: AgentTaskRecord) -> bool:
                 )
             )
         )
-        for item in task.execution_records
+        for item in executed
     )
 
 
@@ -1499,6 +1529,35 @@ def _remote_identity(exc: Exception) -> tuple[str | None, str | None]:
         invocation_id if isinstance(invocation_id, str) and invocation_id else None,
         attempt_id if isinstance(attempt_id, str) and attempt_id else None,
     )
+
+
+# Gateway error codes that are only raised before anything is dispatched to a
+# provider. An invoke that fails with one of these provably left no remote
+# state, so its execution is definitively failed rather than unknown.
+# The gateway attaches `error.code` to Action admission rejections from 1.1.2
+# onward; older releases return an unstructured 503 and are therefore still
+# recorded as unknown, which is the safe reading.
+# FORGE_TOOL_INVOKE_TIMEOUT is deliberately absent: the gateway also emits it
+# after dispatch when the synchronous caller response times out, where the
+# provider may still be executing and the outcome is genuinely unknown.
+_PRE_DISPATCH_REJECTION_CODES = frozenset(
+    (
+        "FORGE_TOOL_GATEWAY_BUSY",
+        "FORGE_TOOL_ACTION_ADMISSION_REJECTED",
+        "FORGE_TOOL_ENDPOINT_UNKNOWN",
+        "FORGE_TOOL_OPERATION_NOT_FOUND",
+        "FORGE_TOOL_ENDPOINT_UNAVAILABLE",
+    )
+)
+
+
+def _rejected_before_dispatch(exc: Exception) -> bool:
+    """True when the gateway rejected the invoke without dispatching it."""
+    error_code = getattr(exc, "error_code", None)
+    if error_code not in _PRE_DISPATCH_REJECTION_CODES:
+        return False
+    invocation_id, attempt_id = _remote_identity(exc)
+    return invocation_id is None and attempt_id is None
 
 
 def _fail_replan(task: AgentTaskRecord, message: str) -> None:

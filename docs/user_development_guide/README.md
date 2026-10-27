@@ -1,30 +1,24 @@
-# PhyAgentOS 集成开发指南
+# Bundle and Tool Integration Reference
 
-[English](README_en.md) · [文档索引](../README.md)
+[English](README.md) | [简体中文](README_zh.md)
 
-> 版本：1.0.0
+> Version: 1.1.1
 
-## 1. 选择接入点
+Use the [TrackB Skill development manual](track_b/SKILL_DEVELOPMENT.md) to choose a development mode and follow its procedure. This reference owns ToolSpec examples, manifest-v2 fields, startup hooks, packaging and conformance details. Public HTTP and lifecycle semantics are defined in the [Forge Tool API contract](../forge/README.md).
 
-| 能力 | 接入点 |
-|:-----|:-------|
-| 机器人读取或计算 | Gateway Query ToolSpec + ToolEndpoint operation |
-| 机器人物理效果 | Gateway Action ToolSpec + ToolEndpoint operation |
-| 有状态能力生命周期 | Gateway Session ToolSpec + ToolEndpoint operation |
-| Dora nodes 与部署资产 | manifest v2 Skill Bundle 与锁定 Node artifacts |
-| 工作流说明 | 由 SkillsLoader 发现的 `SKILL.md` |
-| 用户任务成功 | 通用 `TaskVerificationContract` 与 AgentTask finalize |
-| 新模型 Provider | 现有 provider registry/configuration |
-| 非机器人 Agent 能力 | 现有 Agent ToolRegistry 或动态 MCP |
+**Platform availability:** External resource submissions and changes to existing registered repositories are not yet open. They must wait for the approval service to be completed and opened. Current registration/publication is administrator-managed. Local development and validation can proceed; platform publication steps below are conditional on that workflow becoming available. See the [contribution guide](../../CONTRIBUTING.md).
 
-不要把 Agent 代码直接连接到机器人 SDK、Dora node、仿真器，或统一 Tool API 之外的旧式
-Gateway Session/Policy route。
+## 1. Choose the integration point
 
-## 2. 定义 ToolSpec
+Start with [TrackB](track_b/README.md) for robot models, profiles, Nodes and Skills. Read the [Core developer manual](../en/03-developer-manual.md) for AgentTask, binding, verification or installer implementation. Use the [communication reference](COMMUNICATION.md) for Agent bus, WebSocket and persistence boundaries.
 
-每个 ToolSpec 包含稳定 `tool_id`、implementation/endpoint binding、operation、
-`semantics: query|action|session`、description、严格 input/output JSON schema、readiness，以及空间
-输入所需 robot frame profile。
+Integrations use the governed Tool API; do not connect Agent code directly to a robot SDK, Dora Node or simulator outside that path.
+
+## 2. Define a ToolSpec
+
+Every ToolSpec has a stable `tool_id`, implementation and endpoint binding, operation,
+`semantics: query|action|session`, description, strict input/output JSON schemas, readiness requirements,
+and a robot frame profile when spatial inputs are involved.
 
 ```yaml
 tool_id: motion.resolve_relative_pose
@@ -54,53 +48,32 @@ robot_frame_profile:
   tool_frame: tcp
 ```
 
-同步读取或不产生机器人效果的确定性解析使用 Query；有界物理效果使用 Action；显式有所有权
-的有状态生命周期使用 Session。在执行方
-定义 Endpoint operation `max_concurrency`，PAOS 不创建跨 Tool lease。
+Use Query for synchronous reads or deterministic resolution without a robot effect. Use Action for
+bounded physical effects and Session for explicitly owned, stateful lifecycles. Define Endpoint operation `max_concurrency` at
+the execution owner; PAOS does not create a cross-Tool lease.
 
-## 3. 实现 Query、Action 与 Session 行为
+## 3. Implement Query, Action, and Session behavior
 
-Query 从 ToolSpec 解析并调用：
+Use the [Query](../forge/README.md#3-query-contract), [Action](../forge/README.md#4-action-contract) and [Session](../forge/README.md#5-session-contract) contracts for HTTP admission, reconciliation, ownership and terminal behavior. The [Node protocol guide](track_b/PROTOCOLS.md) covers provider and Dora ports.
 
-```text
-POST /tools/{endpoint_id}/{operation}:invoke → HTTP 200
-```
+Inputs and outputs must be finite JSON and satisfy ToolSpec. Spatial Tools must expose frames, units, tolerances and orientation behavior through inspectable context. Use explicit unknown outcomes when execution truth cannot be recovered; admission and cancellation acceptance do not prove completion or physical stop.
 
-Action admission 使用：
+## 4. Build a manifest-v2 Skill Bundle
 
-```text
-POST /tools/{tool_id}:invoke → HTTP 202 + invocation_id + attempt_id
-GET  /invocations/{invocation_id}
-GET  /invocations/{invocation_id}/result
-POST /invocations/{invocation_id}/cancel
-```
-
-Session admission 使用同一 `POST /tools/{tool_id}:invoke` 契约，通过通用 invocation routes
-核对，并以 `POST /invocations/{invocation_id}/stop` 停止。必须声明 task-owned、shared 或
-runtime-owned；一个 owner 不得停止另一个 owner 的 Session。
-
-Action status/result 必须暴露明确生命周期；result pending 时可返回 HTTP 202。Cancel accepted
-只表示控制处理。无法恢复执行事实时应返回显式 unknown，不能伪造 cancelled 或 success。
-
-Input/output 必须是有限 JSON 并满足 ToolSpec。空间 Tool 必须说明 frame、unit、tolerance 与
-orientation behavior，避免 Agent 无法通过 `forge_tool_context` 检查的隐藏默认值。
-
-## 4. 构建 manifest v2 Skill Bundle
-
-已安装 Skill Bundle 包含：
+An installed Skill Bundle contains:
 
 ```text
 <skill>/
 ├── skill.yaml
 ├── SKILL.md
-├── start.sh                    # 可选，Dora 启动前准备外部资源
-├── archive-manifest.json       # 打包脚本生成
+├── start.sh                    # optional external-resource preparation before Dora
+├── archive-manifest.json       # generated by the packaging script
 ├── profiles/<profile>/dataflow.yaml
 ├── profiles/<profile>/...
 └── assets/...
 ```
 
-最小 manifest 结构：
+Minimal manifest structure:
 
 ```yaml
 manifest_version: 2
@@ -113,7 +86,7 @@ required_tools: [example.query, example.action]
 profiles:
   sim:
     dataflow: profiles/sim/dataflow.yaml
-    # 可选：覆盖 Skill 级 required_tools；省略则继承
+    # optional: overrides the Skill-wide required_tools; omit to inherit
     required_tools: [example.query]
     required_binaries: [gateway, example_node]
     required_assets: [assets/scene.xml]
@@ -132,50 +105,57 @@ artifacts:
       sha256: <64-character-sha256>
 ```
 
-所有路径必须相对并包含在 Bundle 内。每个 Node archive 具有 lock 指定的 SHA-256。
-`executable_tar_gz` 只包含一个 lock 指定文件名的根目录 executable；`directory_tar_gz`
-只包含一个以 `entrypoint` 命名的根目录，同名 executable 及其运行时树置于其中（仅允许
-解析不出树的相对符号链接）。installer 在 receipt 中另行记录解包后 binary hash。
-Bundle archive inventory 需要覆盖每个文件及 SHA-256；links、路径穿越、冲突、过度展开和未列出
-内容会被拒绝。
+All paths are relative and contained by the Bundle. Each Node archive has the locked SHA-256.
+An `executable_tar_gz` archive contains exactly one root-level executable with the locked
+filename; a `directory_tar_gz` archive contains exactly one root directory named after the
+entrypoint that holds the same-named executable and its runtime tree (tree-internal relative
+symlinks only). The installer records the
+extracted binary hash in its receipt. The Bundle archive inventory must
+cover every file with SHA-256. Links, path traversal, collisions, oversized expansion, and unlisted
+content are rejected.
 
-Bundle 如需在启动前下载权重或准备其他外部资源，可在根目录提供 `start.sh`。PAOS 使用
-`bash <bundle>/start.sh <name> <version>` 调用它，不改变工作目录并继承终端 stdio；脚本应从
-自身路径解析 Bundle 内文件，支持重复执行，并在失败时返回非零退出码。此类 Bundle 要求主机
-`PATH` 中存在 Bash。`PAOS_SKILL_NAME` 与 `PAOS_SKILL_VERSION` 可用于 dataflow 占位符，
-也会进入 Dora 进程环境。
+When startup must download weights or prepare other external resources, the Bundle may provide a
+root-level `start.sh`. PAOS invokes it as `bash <bundle>/start.sh <name> <version>`, preserves the
+caller's working directory, and inherits terminal stdio. The script should resolve Bundle files
+relative to its own location, tolerate repeated execution, and return non-zero on failure. Such a
+Bundle requires Bash on the host `PATH`. `PAOS_SKILL_NAME` and `PAOS_SKILL_VERSION` are available as
+dataflow placeholders and in Dora process environments.
 
-Hook 的环境契约：除 `PAOS_SKILL_NAME` / `PAOS_SKILL_VERSION` 外，PAOS 还会传入
-`PAOS_SKILL_PROFILE`（本次启动的 profile 名）、`PAOS_SKILL_ROOT`（Bundle 根目录）和
-`PAOS_HOOK_PYTHON`（运行 PAOS Core 的解释器）。`PAOS_HOOK_PYTHON` 只保证能执行 Core 自身的依赖，
-**不保证**包含任何模型运行时依赖：要在 Hook 里准备 CUDA 版 PyTorch / transformers 之类，请自行创建
-虚拟环境或调用外部工具，不要假定它可用。
+Hook environment contract: PAOS also passes `PAOS_SKILL_PROFILE` (the profile being started),
+`PAOS_SKILL_ROOT` (the Bundle root), and `PAOS_HOOK_PYTHON` (the interpreter running PAOS Core).
+`PAOS_HOOK_PYTHON` is only guaranteed to import Core's own dependencies, not any model-runtime
+dependency: create your own virtual environment or call an external tool when the hook must prepare
+CUDA PyTorch, transformers, or similar.
 
-`profiles.<profile>.required_tools` 是可选字段：写了覆盖 Skill 级 `required_tools`，不写则继承。
-这一个字段同时承担两个契约——启动与状态健康检查要求就绪的 Tool 集合，以及 AgentTask 允许该 Skill
-调用的 Tool allowlist（`forge/binding.py` 冻结进 AgentTask 的 `required_tools` 就是同一份列表）。
-因此一个 Bundle 可以按 profile 暴露不同工具面，而同一 profile 的这两处始终一致。
+`profiles.<profile>.required_tools` is optional: when present it overrides the Skill-wide
+`required_tools`, and a profile that omits it inherits that list. The field carries two contracts at
+once - the Tool set the startup and status health checks require, and the Tool allowlist the AgentTask
+may call (`forge/binding.py` freezes the same list into the AgentTask). One Bundle can therefore
+expose a different Tool surface per profile while both checks stay in agreement for a given profile.
 
-`profiles.<profile>.required_tools` 需要支持该字段的 PAOS Core。不支持它的 Core（含 v1.0.0）会把整个
-Bundle 判为 `profiles.<profile> has unknown field(s): required_tools` 并拒绝安装，发布这类 Bundle 时
-请在说明里写明最低 Core 版本。
+`profiles.<profile>.required_tools` needs a PAOS Core that knows the field. An older Core, including
+v1.0.0, rejects the whole Bundle with
+`profiles.<profile> has unknown field(s): required_tools`, so Bundles using it should state their
+minimum Core version.
 
-## 5. 打包、发布与本地闭环
+## 5. Package, publish, and close the local loop
 
-### 5.1 构建并验证 Bundle
+### 5.1 Build and validate a Bundle
 
-仓库脚本会重新生成 `archive-manifest.json`，使用固定元数据构建确定性归档，再通过
-`ArchiveValidator` 安全解包复核：
+The repository script regenerates `archive-manifest.json`, builds a deterministic archive with
+fixed metadata, and safely extracts it through `ArchiveValidator` for final verification:
 
 ```bash
 python scripts/package_skill.py /path/to/example-skill --output-dir dist/skills
 ```
 
-输出文件名取自 `skill.yaml` 的 `name` 与 `version`，并打印归档 SHA-256 和字节数。已有同名
-输出默认不覆盖；仅在确认尚未发布时使用 `--force`。打包脚本拒绝 links，并排除版本控制、缓存
-与 `node_modules` 目录；发布源码目录不得包含凭据、预签名 URL、本机缓存、日志或运行状态。
+The output name comes from `name` and `version` in `skill.yaml`; the script prints the archive
+SHA-256 and byte size. It refuses to replace an existing output unless `--force` is supplied; use
+that option only before publication. The script rejects links and excludes version-control, cache,
+and `node_modules` directories. Do not put credentials, presigned URLs, machine caches, logs, or
+runtime state in the source directory.
 
-上传前使用与用户相同的公开命令完成本地闭环：
+Before upload, run the same public local loop that users depend on:
 
 ```bash
 paos skill install dist/skills/example-skill-1.0.0.tar.gz --local
@@ -186,43 +166,50 @@ paos skill status example-skill
 paos skill stop example-skill
 ```
 
-本地 Bundle 与 Registry Bundle 使用相同的归档、manifest 和 Node lock 校验；缺失 Node 仍需
-通过配置的 Registry 或静态 index 解析。Installer 先 staging、校验，再原子替换，失败则
-rollback。不得要求调用方关闭摘要校验。
+A local Bundle uses the same archive, manifest, and Node-lock validation as a Registry Bundle.
+Missing Nodes still resolve through the configured Registry or static index. Installers stage,
+validate, atomically replace, and roll back on failure. Never require callers to disable digest
+verification.
 
-### 5.2 不可变发布顺序
+### 5.2 Immutable publication order
 
-1. 先发布并登记所有 Node artifacts。`executable_tar_gz` 归档根目录只能包含一个与
-   `entrypoint` 同名的 executable；`directory_tar_gz` 归档根目录只能包含一个与
-   `entrypoint` 同名的目录（内含同名 executable 与运行时树）。最终归档 SHA-256 必须写入
-   Skill lock。
-2. 固定 `skill.yaml` 的 name/version、profiles 与 Node locks，执行打包，并保存输出的 Bundle
-   SHA-256 与 `size_bytes`。
-3. 将 Bundle 上传到不可覆盖、长期有效的 HTTPS 对象键。上传后从最终 URL 回读并重新校验
-   SHA-256 与大小；修正已发布内容必须递增版本，不能覆盖原对象。
-4. 在 Resource Registry 登记当前 Skill 的 name、URL、SHA-256 与大小，并保证每个 Node
-   `artifact_id` 均可通过 Node 端点解析。也可以发布等价的 schema v3 静态 index。
-5. 从干净 PAOS HOME 通过 Registry 重跑安装、启动、状态和停止命令，确认没有依赖源码仓绝对
-   路径或开发机缓存。
+This is the dependency/immutability order for administrators and, once enabled, the external approval workflow. It does not provide an external submission endpoint today.
 
-公网 Registry 按名称返回当前 Skill 条目，不提供历史版本子路径。`paos skill install
-<name> --version <version>` 中的版本是客户端约束：Bundle 下载后先校验 manifest version，
-不匹配时在 Node 下载和安装提交前失败。因此旧版本必须通过不可变 URL、静态 index 或本地归档
-另行保存，不能把 `--version` 当作 Registry 历史版本查询。
+1. Publish and register every Node artifact first. An `executable_tar_gz` archive contains only
+   one root-level executable named by `entrypoint`; a `directory_tar_gz` archive contains only one
+   root directory named by `entrypoint` (holding the same-named executable and its runtime tree).
+   Put the final archive SHA-256 in the Skill lock.
+2. Freeze the `skill.yaml` name/version, profiles, and Node locks, package the Bundle, and retain the
+   printed Bundle SHA-256 and `size_bytes`.
+3. Upload the Bundle to a non-overwritable, long-lived HTTPS object key. Read it back from the final
+   URL and verify size and SHA-256. Corrections require a new version instead of overwriting bytes.
+4. Register the current Skill name, URL, SHA-256, and size in the Resource Registry, and ensure every
+   Node `artifact_id` resolves through its Node endpoint. An equivalent schema-v3 static index is
+   also supported.
+5. From a clean PAOS HOME, repeat Registry install, start, status, and stop. Confirm that no source
+   checkout path or development-machine cache is required.
 
-## 6. 设计 Dora profile
+The public Registry returns the current Skill entry by name and has no historical-version subpath.
+The version in `paos skill install <name> --version <version>` is a client constraint: after the
+Bundle download, PAOS verifies its manifest version and rejects a mismatch before Node download or
+installation commit. Preserve old versions through immutable URLs, static indexes, or local
+archives; do not treat `--version` as a Registry history query.
 
-当前分发的 Forge Skill profile 应使用 Dora CLI v0.4.1 与 `dora-message` v0.7.0 开发和验收。
-Skill lock 与主机基线整体升级前，Node 构建必须保持在同一协议代际。
+## 6. Design the Dora profile
 
-Dataflow 为每个 Node 定义明确 inputs/outputs，并使用 Gateway profile 声明的 Tool request/
-response ports。必需 executable 从不可变 Runtime environment 解析；assets 保留在 Skill Bundle
-中并使用可重定位路径。
+Develop and validate the currently distributed Forge Skill profiles with Dora CLI v0.4.1 and
+`dora-message` v0.7.0. Keep Node builds on that protocol generation until the Skill locks and host
+baseline are upgraded together.
 
-RuntimeManager 创建确定 flow name，校验 Dora 与必需文件，启动 flow，再等待 Gateway
-`/tools` 与全部 required Tool context。Manifest URL 已有 Gateway 监听时不会静默接管。
+The dataflow should give each node explicit inputs/outputs and use the Gateway Tool request/response
+ports declared in its profile. Required executables are resolved from the immutable Runtime
+environment. Assets remain in the Skill Bundle and are referenced with relocatable paths.
 
-Tool API 作为物理执行面时，应在 profile 禁用 Gateway Agent API：
+RuntimeManager creates a deterministic flow name, verifies Dora and required files, starts the
+flow, then waits for Gateway `/tools` and every required Tool context. A Gateway already listening
+at the manifest URL is not silently adopted.
+
+When Tool API is the physical execution plane, disable the Gateway Agent API in the profile:
 
 ```yaml
 agent:
@@ -231,67 +218,78 @@ tools:
   enabled: true
 ```
 
-## 7. 编写工作流说明
+## 7. Write workflow guidance
 
-`SKILL.md` 应说明何时激活、检查哪些 context、Query → Action/Session 顺序、task binding、
-ownership、终态核对、
-verification checkpoint 与安全恢复规则。不得嵌入 secret、Registry URL、任务特定坐标或绕过
-Gateway/verification 的指令。
+`SKILL.md` should tell the Agent when to activate the Skill, which contexts to inspect, the Query →
+Action/Session ordering, task binding, ownership, terminal reconciliation, verification checkpoints, and safe recovery
+rules. It must not embed secrets, Registry URLs, task-specific coordinates, or instructions to
+bypass Gateway/verification.
 
-验证型工作流应在本轮激活 primary Skill，再由 activation 创建一个 AgentTask，把全部相关
-Query/Action/Session 绑定到同一 task，全部 task-owned 执行终结后 finalize，并只在 recovery
-verdict 允许时追加 PlanRevision。
+For a verified workflow, activate the primary Skill in the current turn, create one AgentTask from
+that activation, bind every contributing Query/Action/Session to the same task, finalize after all
+task-owned executions terminate, and append a PlanRevision only when recovery verdict
+allows it.
 
-## 8. Evidence 与 verification
+## 8. Evidence and verification
 
-机器人能力接入应暴露 Tool execution facts，而不是编写 action-specific verifier code。PAOS 在
-AgentTask finalize 时采集配置的 image/state source 并应用通用 verification contract。
-Tool output schema 应包含有用的终态 result semantics、final state/error 和相关 tolerance。
+Robot capability integration should expose Tool execution facts, not action-specific verifier code.
+PAOS captures configured image/state sources and applies the generic verification contract at
+AgentTask finalize. Tool output schemas should contain useful terminal result semantics, final
+state/error data, and tolerances where relevant.
 
-未来若引入 authoritative evidence，应显式升级 evidence contract；不能用约定把 best-effort
-WebSocket association 提升为权威。
+If authoritative evidence is introduced later, version the evidence contract explicitly. Do not
+upgrade best-effort WebSocket association by convention.
 
-## 9. Fake Gateway 与 conformance 测试
+## 9. Fake Gateway and conformance tests
 
-进入真机或仿真前，使用 mock HTTP transport 测试：
+Before real hardware or simulation, use a mock HTTP transport to test:
 
-- Tool list/spec/context 与 Query binding resolution；
-- activation candidate 复核以及 ToolSpec/Runtime 漂移拒绝；
-- Action HTTP 202 admission 及 invocation/attempt identity；
-- Session admission、ownership、status/result 与 stop；
-- pending status/result 与已知终态；
-- cancel requested/accepted 不产生虚假停止；
-- timeout/unknown 不盲目重试；
-- endpoint concurrency rejection；
-- 诊断 Query 与绑定调用经过相同 routes；
-- AgentTask 单活动限制、revisions、evidence 与聚合 verification；
-- archive traversal/link/collision/digest 攻击与事务 rollback；
-- 有/无 `start.sh` 的启动、Bash 缺失与钩子非零退出；
-- Skill identity 注入 dataflow/Dora 环境，以及 profile 内容或 dataflow 路径变化后的重新物化；
-- 同一 Skill 的 start/stop/install/remove 跨进程冲突；
-- Runtime start/status/log/stop 与 availability 传播。
+- Tool list/spec/context and Query binding resolution;
+- activation candidate revalidation and ToolSpec/runtime drift rejection;
+- Action HTTP 202 admission with invocation and attempt identities;
+- Session admission, ownership, status/result, and stop;
+- pending status/result and known terminal results;
+- cancellation requested/accepted without false stop;
+- timeout and unknown without blind retry;
+- endpoint concurrency rejection behavior;
+- diagnostic Query and bound calls through identical routes;
+- AgentTask one-active constraint, revisions, evidence, and aggregate verification;
+- archive traversal/link/collision/digest attacks and transactional rollback;
+- startup with and without `start.sh`, missing Bash, and non-zero hook exit;
+- Skill identity injection into dataflow/Dora environments and rematerialization after profile
+  content or dataflow-path changes;
+- cross-process start/stop/install/remove conflicts for one Skill;
+- Runtime start/status/log/stop and availability propagation.
 
-随后完成模拟工作流。真实机器人或 MuJoCo 验收必须记录确切 Bundle、node digests、profile 与
-环境。
+Then run a complete simulated workflow. Real robot or MuJoCo acceptance must identify the exact
+Bundle, node digests, profile, and environment used.
 
-## 10. 接入验收清单
+## 10. Integration acceptance checklist
 
-- [ ] Tool semantics 与 schema 明确、严格；
-- [ ] Frame、unit、tolerance 与 readiness 可检查；
-- [ ] Gateway operation 负责 `max_concurrency`；
-- [ ] Query/Action/Session 使用文档 HTTP 契约；
-- [ ] Skill/Runtime/ToolSpec binding 被冻结，并在每次受治理执行前复核；
-- [ ] Invocation/attempt ID 与 PAOS task ID 分离；
-- [ ] Cancel、stop、timeout、unknown 不推断物理停止，也不触发盲目 POST 重试；
-- [ ] Bundle/Node artifacts 有不可变 size/digest metadata；
-- [ ] Bundle 经仓库打包脚本和本地安装闭环验证，Registry 的 Skill 与全部 Node 端点可解析；
-- [ ] 可选启动钩子的参数、失败状态、重复执行与外部资源摘要经过验证；
-- [ ] Runtime profile 从干净环境启动并使全部 Tool context ready；
-- [ ] Tool-only profile 禁用 Gateway Agent API；
-- [ ] 通用 Agent tools、verification、experience、evolution 不需要能力专用分支。
+- [ ] Tool semantics and schemas are explicit and strict.
+- [ ] Frame, unit, tolerance, and readiness conventions are inspectable.
+- [ ] Gateway operation owns `max_concurrency`.
+- [ ] Query, Action, and Session use the documented HTTP contracts.
+- [ ] Skill/Runtime/ToolSpec binding is frozen and revalidated for every governed execution.
+- [ ] Invocation and attempt IDs remain separate from PAOS task IDs.
+- [ ] Cancel, stop, timeout, and unknown do not imply physical stop or trigger a blind POST retry.
+- [ ] Bundle and Node artifacts have immutable size/digest metadata.
+- [ ] The Bundle passes repository packaging and the local install loop, and Registry Skill and Node
+      endpoints all resolve.
+- [ ] Optional startup-hook arguments, failure state, repeated execution, and external-resource
+      digests are verified.
+- [ ] Runtime profile starts from a clean environment and reaches all Tool contexts.
+- [ ] Gateway Agent API is disabled for the Tool-only profile.
+- [ ] General Agent tools, verification, experience, and evolution require no capability-specific fork.
 
-## 后续阅读
+## Next reading
 
-- [开发者手册](../zh/03-developer-manual.md)
-- [通信架构](COMMUNICATION.md)
-- [Forge Tool API 契约](../forge/README_zh.md)
+- [Core Developer Manual](../en/03-developer-manual.md)
+- [Core Communication Architecture](COMMUNICATION.md)
+- [Forge Tool API Contract](../forge/README.md)
+
+## TrackB framework and Skill development
+
+- [TrackB overview](track_b/README.md): execution architecture and repository ownership.
+- [Skill development manual](track_b/SKILL_DEVELOPMENT.md): three extension modes and delivery procedures.
+- [Piper X MuJoCo example](PIPER_X_DEMO.md): worked model/profile integration and both control modes.

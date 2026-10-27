@@ -2,7 +2,7 @@
 
 [中文](../zh/02-user-manual.md) · [Documentation index](../README.md)
 
-> Documentation version: 1.0.0.
+> Documentation version: 1.1.1.
 
 ## 1. Install and initialize
 
@@ -31,7 +31,7 @@ The default configuration is `~/.PhyAgentOS/config.json`; the default workspace 
 
 Dora is not needed to run the general Agent, search for a Skill, or complete `paos skill install`.
 It is a host prerequisite for `paos skill start`, because RuntimeManager uses the `dora` command to
-manage the selected profile. PhyAgentOS 1.0.0 uses Dora CLI v0.4.1 and `dora-message` v0.7.0 as its
+manage the selected profile. PhyAgentOS 1.1.1 uses Dora CLI v0.4.1 and `dora-message` v0.7.0 as its
 Forge Skill compatibility baseline; pin this exact release for reproducible deployments.
 
 Linux or macOS, using the versioned official installer:
@@ -229,6 +229,22 @@ In an existing session, run `/effort none`, then `/provider api_route`, followed
 `/model <model-id>` using a bare model ID available to your key. Without
 `providers.api_route.defaultModel`, switching providers retains the previous model,
 including any vendor prefix.
+
+**[Opper](https://opper.ai)** (`opper`) uses the same gateway configuration. Create a key at
+https://platform.opper.ai and put it in `providers.opper.apiKey`, or supply `OPPER_API_KEY` /
+`PAOS_OPPER_API_KEY` at startup. The default endpoint is `https://api.opper.ai/v3/compat`. Use a
+pool name such as `claude-sonnet-4-6` or `gpt-5.4-mini`, which Opper routes across the providers
+serving that model, or a `provider/model` ID such as `anthropic/claude-sonnet-4-6` to pin one
+route. This integration also uses PAOS's conservative gateway effort validation, so clear any
+explicit reasoning effort when selecting it:
+
+```bash
+paos provider use opper --model claude-sonnet-4-6 --reasoning-effort none
+```
+
+In an existing session, run `/effort none`, then `/provider opper`, followed by
+`/model <model-id>`. Without `providers.opper.defaultModel`, switching providers retains the
+previous model ID.
 
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
@@ -496,5 +512,5 @@ does not delete execution records or evolution history.
 ## Next reading
 
 - [Forge Configuration Reference](04-forge-configuration-reference.md)
-- [Operations Manual](../user_manual/README_en.md)
+- [Operations Manual](../user_manual/README.md)
 - [Forge Tool API Integration Contract](../forge/README.md)

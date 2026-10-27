@@ -2,6 +2,46 @@
 
 All notable changes to PhyAgentOS are documented here. Categories follow Keep a Changelog.
 
+## [v1.1.1] - 2026-10-23
+
+Skill development, execution reliability and the Opper gateway. Changes since v1.1.0.
+
+### Added
+
+- Opper as an OpenAI-compatible gateway, with provider selection, environment
+  credentials and model identifiers preserved in routed requests.
+- Bilingual Track B development guides and an independent Piper X simulation
+  Skill example covering model conversion, original Node locks, packaging,
+  and validation with its recorded runtime baseline.
+- Bilingual contribution guides, MuJoCo Quickstart GIFs, and a GOSIM Shenzhen
+  2026 announcement.
+
+### Changed
+
+- Local workflow-document and Node-executable modifications produce warnings
+  during task creation and Runtime startup. Bindings freeze the activated
+  workflow document hash and experience records use it for attribution.
+- Consolidate bilingual manuals, developer references and documentation
+  navigation while retaining benchmark documentation links.
+- Synchronize package, CLI, bundled bridge, Docker, release-build defaults,
+  README and current documentation versions to 1.1.1.
+
+### Fixed
+
+- Keep explicit Node verification and install-cache acceptance strict for
+  modified executables, and retain Skill/Runtime version compatibility checks.
+- Record structured Gateway rejections known to occur before Action dispatch
+  as failed, allowing a later retry without the unknown-execution guard.
+  Timeouts, transport failures and identified remote invocations remain unknown.
+- Exclude pre-dispatch rejections from task finalization and cancellation
+  execution facts; a task with no executed calls still fails. Structured
+  admission rejection codes require Forge Gateway 1.1.2 or newer; older
+  unstructured responses retain conservative handling.
+- Add regression coverage for Opper routing, local Node modifications and
+  pre-dispatch Action rejection handling.
+
+[Full comparison: v1.1.0...v1.1.1](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.1.0...v1.1.1)
+
 ## [v1.1.0] - 2026-10-09
 
 Provider management, Skill Runtime and governed interactions. Changes since v1.0.0.

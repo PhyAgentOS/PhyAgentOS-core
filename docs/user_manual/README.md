@@ -1,60 +1,62 @@
-# PhyAgentOS 运行手册
+# PhyAgentOS Operations Manual
 
-[English](README_en.md) · [文档索引](../README.md)
+[English](README.md) | [简体中文](README_zh.md)
 
-> 版本：1.0.0
+> Version: 1.1.1
 
-## 1. 运行模型
+This is the operations reference for startup, reconciliation, stop, recovery and backups. Development starts with the [contribution guide](../../CONTRIBUTING.md). If the optional [interaction extension](../interaction/README.md) is enabled, also follow its journal/Runner ownership and shutdown limits; ordinary robot procedures do not replace them.
+
+## 1. Runtime model
 
 ```text
-用户/渠道 → AgentLoop → Forge task 与 Tool API tools
-                              │
-                       绑定调用或诊断 Query
-                              ▼
-                     ForgeToolClient
-                              ▼
-Gateway /tools → ToolInvocation → ToolEndpoint → Dora → 机器人/仿真器
+User/Channel → AgentLoop → Forge task and Tool API tools
+                                  │
+                   bound call or diagnostic Query
+                                  ▼
+                         ForgeToolClient
+                                  ▼
+Gateway /tools → ToolInvocation → ToolEndpoint → Dora → robot/simulator
 
-绑定调用 → 不可变 Skill binding → AgentTask SQLite → verification/experience
+bound calls → immutable Skill binding → AgentTask SQLite → verification/experience
 ```
 
-Gateway 负责执行，PAOS 负责用户任务聚合与语义判定。Skill Runtime 负责已安装 Bundle profile
-的显式生命周期，但不替代 Gateway execution truth。
+Gateway owns execution. PAOS owns user-task aggregation and semantic verdicts. Skill Runtime owns
+the explicit lifecycle of installed Bundle profiles; it does not replace Gateway execution truth.
 
-## 2. 上线前检查
+## 2. Pre-deployment checks
 
-### PAOS 主机
+### PAOS host
 
-- 已安装 Python 3.11/3.12 和目标 v1.0.0 环境；
-- `paos status` 指向预期 config、workspace、model 和 provider；
-- Workspace、PAOS data paths 和 artifact paths 具备权限与磁盘空间；
-- 允许非 `off` 任务时，Verification provider 凭据可用。
+- Python 3.11 or 3.12 and the intended v1.1.1 environment are installed.
+- `paos status` resolves the expected config, workspace, model, and provider.
+- Workspace, PAOS data paths, and artifact paths have sufficient permissions and disk space.
+- Verification provider credentials are available when non-`off` tasks are allowed.
 
 ### Skill Runtime
 
-- Skill Bundle metadata 包含 size 与 SHA-256，每个 Node lock 具有精确 SHA-256，并能解析为大小
-  明确的直接下载；
-- required binaries 可执行，required assets 存在，required environment 已设置；
-- Dora CLI v0.4.1 与 `dora-message` v0.7.0（当前 Forge Skill 兼容基线）已安装且位于
-  `PATH`，`dora --version` 同时指向预期版本；安装方式见
-  [用户手册](../zh/02-user-manual.md#托管-skill-profile-所需的-dora-cli)；
-- profile Gateway 地址没有被非托管进程占用。
+- Skill Bundle metadata includes size and SHA-256; every Node lock has an exact SHA-256 and resolves
+  to a sized direct download.
+- Required binaries are executable, required assets exist, and required environment variables are set.
+- Dora CLI v0.4.1 with `dora-message` v0.7.0, the current Forge Skill compatibility baseline, is
+  installed and on `PATH`; `dora --version` reports both expected versions. Installation is
+  documented in the [user manual](../en/02-user-manual.md#dora-cli-for-managed-skill-profiles).
+- The profile Gateway address is not occupied by an unmanaged process.
 
 ### Forge Gateway
 
-- `GET /tools` 返回成功 object envelope；
-- required ToolSpecs 与 `/tools/{tool_id}/context` 存在并 ready；
-- Endpoint operation `max_concurrency` 符合机器人安全并发；
-- ToolSpec semantics、schema、binding 和 readiness 与已安装 Skill manifest 一致。
+- `GET /tools` returns a successful object envelope.
+- Required ToolSpecs and `/tools/{tool_id}/context` are present and ready.
+- Endpoint operation `max_concurrency` matches the robot's safe concurrency.
+- ToolSpec semantics, schemas, bindings, and readiness match the installed Skill manifest.
 
-### 持久化
+### Persistence
 
-- `.paos/agent_tasks`、`.paos/evolution`、Agent conversation history 与 Skill Runtime state 位于可靠存储；
-- 轮转机器人证据时，备份和 retention 不删除 evolution 数据。
+- `.paos/agent_tasks`, `.paos/evolution`, Agent conversation history, and Skill Runtime state are on durable storage.
+- Backup and retention procedures do not delete evolution data when rotating robot evidence.
 
-## 3. 启动与健康检查
+## 3. Startup and health
 
-托管 Skill profile：
+For a managed Skill profile:
 
 ```bash
 paos skill inspect <skill-name>
@@ -62,89 +64,94 @@ paos skill start <skill-name> --profile <profile>
 paos skill status <skill-name>
 paos skill switch <other-skill-name> --profile <profile>
 paos agent
-# 或：paos gateway
+# or: paos gateway
 ```
 
-`paos skill start` 会运行 `dora check`，本地 coordinator 和 daemon 尚未 ready 时调用
-`dora up`；运维人员无需另行启动。Runtime 启动后，`dora check` 应当成功。
+`paos skill start` runs `dora check` and invokes `dora up` if the local coordinator and daemon are
+not ready; operators do not need to start them separately. After startup, `dora check` should
+succeed.
 
-Runtime 健康要求持久化状态为 `running`、命名 Dora flow 存活、Gateway `/tools` 可用，并且
-manifest 中每个 `required_tool` context ready。使用 `paos skill logs <name>` 查看生命周期和
-Dora launch 日志。仅在没有非终态 AgentTask 时允许切换 Runtime；目标通过 ready 校验后才会
-被选中，共用 Gateway 的目标启动失败时恢复先前 Runtime。长期运行的 Agent 会在下一次
-activation 或 Tool call 前跟随持久化选择。
+Healthy Runtime status requires persisted `running`, a live named Dora flow, Gateway `/tools`, and
+ready context for every Tool resolved from the selected profile's `required_tools` override, or the manifest-wide `required_tools` when the profile omits it. Use `paos skill logs <name>` for lifecycle and
+Dora launch logs. Runtime switching is permitted only with no non-terminal AgentTask; the target
+must become ready before selection, and a failed same-Gateway switch restores the previous
+Runtime. Long-running Agents follow the persisted selection before the next activation or Tool
+call.
 
-Agent 只使用该托管活动 Runtime 的 Gateway identity 与 URL。`paos status` 只检查本地配置；
-实时 Tool readiness 应使用 `forge_tool_context`。
+The Agent uses only the Gateway identity and URL of this managed active Runtime. `paos status`
+checks local configuration only; use `forge_tool_context` for live Tool readiness.
 
-## 4. 任务监控
+## 4. Task monitoring
 
-分别记录以下 identity：
+Record these identities separately:
 
-| Identity | 责任方 | 用途 |
-|:---------|:-------|:-----|
-| `task_id` | PAOS | 用户任务聚合与验证 |
-| `binding_id` | PAOS | 冻结的 Skill 版本、Runtime 与 ToolSpec 集合 |
-| `revision_id` | PAOS | 只追加规划世代 |
-| `record_id` | PAOS | 一次绑定 Query、Action 或 Session record |
-| `caller_id` | PAOS | 异步 admission 前持久化的身份 |
-| `invocation_id` | Gateway | 一次异步 Action 或 Session 生命周期 |
-| `attempt_id` | Gateway | 一次执行尝试 |
+| Identity | Owner | Use |
+|:---------|:------|:----|
+| `task_id` | PAOS | User-visible aggregate and verification |
+| `binding_id` | PAOS | Frozen Skill version, Runtime, and ToolSpec set |
+| `revision_id` | PAOS | Append-only planning generation |
+| `record_id` | PAOS | One bound Query, Action, or Session record |
+| `caller_id` | PAOS | Persisted before asynchronous admission |
+| `invocation_id` | Gateway | One asynchronous Action or Session lifecycle |
+| `attempt_id` | Gateway | One execution attempt |
 
-使用 `forge_task_get(task_id)` 读取聚合状态与 Tool records；使用
-对应 task-bound Action 或 Session status/result tool 读取执行事实。result endpoint 在 pending
-时可以返回 HTTP 202。
+Use `forge_task_get(task_id)` for aggregate state and Tool records. Use
+the task-bound Action or Session status/result tools for execution truth. A result endpoint may
+return HTTP 202 while pending.
 
-任务状态：
+Expected task states:
 
-| 状态 | 运维含义 |
-|:-----|:---------|
-| `executing` | 规划或绑定 Tool calls 仍在继续。 |
-| `cancelling` | 已请求取消，但尚未证明物理停止。 |
-| `awaiting_replan` | Verification 允许在 deadline 前追加有预算 PlanRevision。 |
-| `succeeded` / `failed` / `cancelled` | PAOS 聚合终结；必要时仍独立检查 invocation facts。 |
+| State | Operator meaning |
+|:------|:-----------------|
+| `executing` | Planning or bound Tool calls continue. |
+| `cancelling` | Cancellation was requested; physical stop is not yet proven. |
+| `awaiting_replan` | Verification permits a bounded new PlanRevision before its deadline. |
+| `succeeded` / `failed` / `cancelled` | PAOS aggregate is terminal. Inspect invocation facts separately when needed. |
 
-## 5. 取消与停止
+## 5. Cancellation and stop
 
-取消单个 Action 时调用 `forge_tool_cancel_action(task_id, invocation_id)`，随后继续核对 status/result。
-取消一个任务的全部 Action 时调用 `forge_task_cancel(task_id, reason)`，核对每个 invocation，
-物理效果不确定时检查现场。Task cancel 同时停止 task-owned Session；shared 与 runtime-owned
-Session 保持各自独立生命周期。
+For one Action, call `forge_tool_cancel_action(task_id, invocation_id)`, then continue status/result
+reconciliation. For all Actions bound to a task, call `forge_task_cancel(task_id, reason)`, reconcile
+each invocation, and inspect physical state when effects are uncertain. Task cancellation also
+stops task-owned Sessions; shared and runtime-owned Sessions retain their independent lifecycle.
 
-绝不能把 `requested`、`accepted`、timeout 或 `unknown` 报告成物理停止证明。效果核实完成前
-不要重试运动。
+Never report `requested`, `accepted`, a timeout, or `unknown` as proof of physical stop. Do not
+retry the motion until effect reconciliation is complete.
 
-被追踪 invocation、Session 全部终结且无 task binding 后再停止托管 Runtime：
+Stop a managed Runtime only after tracked invocations and Sessions are terminal and no task binding remains:
 
 ```bash
 paos skill stop <skill-name>
 ```
 
-`--force` 只供已独立评估物理系统的运维人员使用。停止托管 Dora flow 前，它会尽力向已追踪
-Action/Session 发出 cancel/stop，并把请求结果与未决引用写入 Runtime audit。请求被接受不证明
-执行已终止，也不会改写 Gateway invocation result。
+`--force` is reserved for an operator who has independently assessed the physical system. Before
+stopping the managed Dora flow it makes best-effort cancel/stop requests for tracked Actions and
+Sessions, then records each request and unresolved reference in the Runtime audit. Acceptance does
+not prove termination and Gateway invocation results are not rewritten.
 
-## 6. 正常停机
+## 6. Graceful shutdown
 
-1. 停止接纳新用户任务；
-2. 读取活动 AgentTask 并核对每个 Action/Session invocation；
-3. Finalize，或 cancel 后 finalize AgentTask；
-4. 停止 PAOS channels 或 Agent；
-5. 停止 Skill Runtime profile；
-6. 只有没有其他 profile 使用时才停止共享基础设施。
+1. Stop admitting new user tasks.
+2. Read the active AgentTask and reconcile every Action/Session invocation.
+3. Finalize or cancel/finalize the AgentTask.
+4. Stop PAOS channels or Agent.
+5. Stop the Skill Runtime profile.
+6. Stop shared infrastructure only if no other profile uses it.
 
-## 7. 异常重启
+## 7. Crash restart
 
-PAOS 重启后，用已知 `task_id` 打开持久化 AgentTask。不要根据本地 intent 重建或重发 Action/Session。
-查询每个已保存 `invocation_id`，根据 Gateway status/result 更新 record。Gateway 无法解析
-invocation 时，将效果视为 unknown 并升级到物理现场检查。
+After a PAOS restart, open the persisted AgentTask with its known `task_id`. Do not recreate or
+resubmit an Action or Session from local intent. Query every persisted `invocation_id` and update the record
+from Gateway status/result. If Gateway can no longer resolve an invocation, treat the effect as
+unknown and escalate to physical-state inspection.
 
-`paos skill status <name>` 会根据 Dora 与 Gateway health 核对 Runtime state。当 flow 或 Tool
-contexts 不可用时，它可将持久化 starting/running 改为 failed；重新启动前先诊断原 flow。
+`paos skill status <name>` reconciles Runtime state against Dora and Gateway health. It can move a
+persisted starting/running state to failed when the flow or Tool contexts are unavailable; restart
+only after diagnosing the previous flow.
 
-## 8. 备份与磁盘管理
+## 8. Backup and disk management
 
-停止 PAOS 后，将数据库、WAL/SHM 和引用目录一起备份：
+With PAOS stopped, back up the database together with WAL/SHM files and the referenced trees:
 
 ```text
 <workspace>/.paos/agent_tasks/tasks.sqlite3*
@@ -154,39 +161,39 @@ contexts 不可用时，它可将持久化 starting/running 改为 failed；重�
 <workspace>/skills/
 ```
 
-还应按部署的 PAOS data-path 策略保留 installed Bundle/Node manifest、Runtime state 与生命周期
-日志。Evidence retention 可以在验证后清理实体文件，但不能删除 task records、invocation
-references 或 evolution 历史。
+Also retain installed Bundle/Node manifests, Runtime state, and lifecycle logs according to the
+deployment's PAOS data-path policy. Evidence retention may prune entity files after verification;
+it must not remove task records, invocation references, or evolution history.
 
-## 9. 故障分层
+## 9. Failure layers
 
-| 层级 | 常见现象 | 首要处置 |
-|:-----|:---------|:---------|
-| Registry/install | Digest、size、manifest 或 lock 失败 | 修正可信 metadata 或 artifact，不绕过校验。 |
-| Runtime | Dora flow 或 Gateway health 不可用 | 检查 `paos skill status` 与 `logs`。 |
-| Tool context | Tool 缺失、未绑定或未 ready | 检查 ToolSpec、Endpoint、frame 与 required profile。 |
-| Admission | HTTP/contract 失败 | 保留响应中已有 invocation ID，判断 Gateway 是否接纳。 |
-| Execution | pending、failed、cancelled 或 unknown | 使用相同 invocation ID 核对；不确定时检查现场。 |
-| Evidence | before/after source 缺失 | 检查 source readiness 与 bundle errors，ToolResult 仍为权威。 |
-| Verification | invalid/inconclusive/service error | 检查任务契约、evidence、provider 与 mode。 |
-| Evolution | reflection 或 promotion blocked | 检查 evolution events；执行不受影响。 |
+| Layer | Typical symptom | First action |
+|:------|:----------------|:-------------|
+| Registry/install | Digest, size, manifest, or lock failure | Correct the signed metadata or artifact; do not bypass validation. |
+| Runtime | Dora flow or Gateway health unavailable | Inspect `paos skill status` and `logs`. |
+| Tool context | Tool missing, unbound, or not ready | Inspect ToolSpec, Endpoint, frame, and required profile. |
+| Admission | HTTP/contract failure | Preserve any returned invocation ID; determine whether Gateway accepted work. |
+| Execution | pending, failed, cancelled, or unknown | Reconcile using the same invocation ID and inspect physical state when uncertain. |
+| Evidence | before/after source missing | Inspect source readiness and bundle errors; keep ToolResult authoritative. |
+| Verification | invalid/inconclusive/service error | Inspect task contract, evidence, provider, and mode semantics. |
+| Evolution | reflection or promotion blocked | Inspect evolution events; execution remains unaffected. |
 
-## 10. 运行验收清单
+## 10. Operational acceptance checklist
 
-- [ ] Package 与 runtime version 均为 1.0.0；
-- [ ] 通用 Agent tools 与动态 MCP tools 仍注册；
-- [ ] 所需 Skill Bundle 与全部 Node artifact 校验通过；
-- [ ] 托管 Runtime ready，所有 Tool contexts 健康；
-- [ ] 诊断 Query 与绑定 Query/Action/Session 使用同一 Gateway Tool API；
-- [ ] 已覆盖 Action/Session admission、pending、terminal、cancel/stop、timeout、ownership 与 unknown；
-- [ ] 已覆盖单活动 AgentTask 与 PlanRevision recovery；
-- [ ] 绑定工作流完成 evidence 与任务级 verification；
-- [ ] Experience 记录 AgentTask、Skill activation、verification 与 invocation references；
-- [ ] 备份包含 AgentTask 与 evolution 持久化；
-- [ ] 具体 Skill/硬件验收单独记录确切 assets、nodes 与环境。
+- [ ] Package and runtime version report 1.1.1.
+- [ ] General Agent tools and dynamic MCP tools remain registered.
+- [ ] Required Skill Bundle and all node artifacts verify.
+- [ ] Managed Runtime reaches ready and all Tool contexts are healthy.
+- [ ] Diagnostic Query and bound Query/Action/Session use the same Gateway Tool API.
+- [ ] Action/Session admission, pending, terminal, cancel/stop, timeout, ownership, and unknown behavior are exercised.
+- [ ] One-active-AgentTask enforcement and PlanRevision recovery are exercised.
+- [ ] Evidence and task-level verification complete for a bound workflow.
+- [ ] Experience records AgentTask, Skill activation, verification, and invocation references.
+- [ ] Backups include AgentTask and evolution persistence.
+- [ ] Concrete Skill/hardware acceptance is recorded separately with exact assets, nodes, and environment.
 
-## 后续阅读
+## Next reading
 
-- [用户手册](../zh/02-user-manual.md)
-- [通信架构](../user_development_guide/COMMUNICATION.md)
-- [Forge Tool API 契约](../forge/README_zh.md)
+- [User Manual](../en/02-user-manual.md)
+- [Core Communication Architecture](../user_development_guide/COMMUNICATION.md)
+- [Forge Tool API Contract](../forge/README.md)

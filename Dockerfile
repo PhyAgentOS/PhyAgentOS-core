@@ -1,7 +1,7 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 LABEL org.opencontainers.image.title="PhyAgentOS" \
-      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.version="1.1.1" \
       org.opencontainers.image.source="https://github.com/PhyAgentOS/PhyAgentOS-core"
 
 # Install Node.js 20 for the WhatsApp bridge

@@ -1,8 +1,8 @@
 # PhyAgentOS 框架介绍
 
-[English](../en/01-framework-introduction.md) · [文档索引](../README.md)
+[English](../en/01-framework-introduction.md) · [文档索引](../README_zh.md)
 
-> 文档版本：1.0.0 · 实现基线：2026-08-30 源码、配置 Schema 与测试。
+> 文档版本：1.1.1 · 实现基线：2026-10-23 源码、配置 Schema 与测试。
 
 ## 1. 项目定位
 
@@ -165,6 +165,6 @@ Runtime 清理不会删除现有 evolution 数据。
 ## 后续阅读
 
 - [用户手册](02-user-manual.md)
-- [开发者手册](03-developer-manual.md)
+- [Core 开发者手册](03-developer-manual.md)
 - [Forge Tool API 接入契约](../forge/README_zh.md)
 - [Agent 经验与 Skill 自进化](05-agent-experience-and-skill-evolution.md)

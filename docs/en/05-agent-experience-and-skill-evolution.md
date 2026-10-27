@@ -1,6 +1,6 @@
 # Agent Experience and Skill Evolution
 
-> Documentation version: 1.0.0. This manual describes the implemented Agent-side validation, experience, Lesson, and Skill-evolution path over AgentTask records.
+> Documentation version: 1.1.1. This manual describes the implemented Agent-side validation, experience, Lesson, and Skill-evolution path over AgentTask records.
 
 ## 1. Purpose and boundary
 
@@ -202,6 +202,6 @@ This boundary also allows other trusted task providers to reuse Lesson clusterin
 
 - [Framework Introduction](01-framework-introduction.md)
 - [User Manual](02-user-manual.md)
-- [Developer Manual](03-developer-manual.md)
+- [Core Developer Manual](03-developer-manual.md)
 - [Forge Configuration Reference](04-forge-configuration-reference.md)
 - [Documentation Index](../README.md)

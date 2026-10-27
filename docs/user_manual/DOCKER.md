@@ -1,108 +1,110 @@
-# Docker 部署指南
+# Docker Deployment Guide
 
-> 版本：1.0.0 · [English](DOCKER_en.md)
+> Version: 1.1.1 · [中文](DOCKER_zh.md)
 
-PhyAgentOS 提供基于 Docker 的快速部署方案，无需手动配置 Python / Node.js 环境。配合 [`scripts/install.sh`](../../scripts/install.sh) 一键脚本，可在一分钟内完成构建、初始化与运行。
+PhyAgentOS ships with a Docker-based quick deployment that requires no manual Python / Node.js setup. Together with the [`scripts/install.sh`](../../scripts/install.sh) one-click script, you can build, initialize, and run in under a minute.
 
-> 镜像基础：`ghcr.io/astral-sh/uv:python3.12-bookworm-slim`（CPU，约几百 MB）
+> Image base: `ghcr.io/astral-sh/uv:python3.12-bookworm-slim` (CPU, a few hundred MB)
 
 ---
 
-## 📦 镜像包含什么
+## 📦 What's in the Image
 
-| 组件 | 说明 |
+| Component | Description |
 |:-----|:-----|
-| Python 3.12 运行时 | 由 `uv` 安装 `pyproject.toml` 中的全部依赖 |
-| `paos` CLI | 已注册为入口命令（`ENTRYPOINT`） |
-| Node.js 20 | 从锁定的 npm 依赖严格编译 WhatsApp bridge |
-| 配置目录 | `/root/.PhyAgentOS`（通过卷挂载到宿主机持久化） |
-| 默认服务 | 交互式 CLI（`paos agent`），可切换为长驻网关 |
+| Python 3.12 runtime | All `pyproject.toml` deps installed via `uv` |
+| `paos` CLI | Registered as the entrypoint (`ENTRYPOINT`) |
+| Node.js 20 | Strictly builds the WhatsApp bridge from locked npm dependencies |
+| Config directory | `/root/.PhyAgentOS` (persisted to the host via a volume mount) |
+| Default service | Interactive CLI (`paos agent`); switchable to a long-running gateway |
 
-镜像**不包含** Dora CLI、具体 Forge Skill 或 Node、GPU / CUDA、Isaac Sim、BEHAVIOR-1K
-及其他机器人 Runtime 依赖。标准镜像运行通用 Agent 与消息总线 gateway，不提供托管 Forge
-Skill Runtime。需要该 Runtime 时，应按[用户手册](../zh/02-user-manual.md#托管-skill-profile-所需的-dora-cli)
-使用宿主机原生 PhyAgentOS 环境运行，或者构建包含 Dora CLI v0.4.1、`dora-message` v0.7.0
-与所选 Skill profile 全部前置条件的定制镜像。仅在宿主机安装 Dora 不会使其出现在标准容器内。
+The image does **not** include Dora CLI, concrete Forge Skills or nodes, GPU / CUDA, Isaac Sim,
+BEHAVIOR-1K, or other robot Runtime dependencies. The stock image runs the general Agent and its
+message-bus gateway; it does not provide a managed Forge Skill Runtime. Run that Runtime from a
+host-native PhyAgentOS installation following the
+[user manual](../en/02-user-manual.md#dora-cli-for-managed-skill-profiles), or build a custom image
+containing Dora CLI v0.4.1 with `dora-message` v0.7.0 and every prerequisite of the selected Skill
+profile. Installing Dora only on the host does not make it visible inside the stock container.
 
-> **关于网关端口**：`paos gateway` 是消息总线服务（Agent + 频道 + Cron + Heartbeat + Forge 编排），**仅主动外连**（连接 LLM provider、Telegram/钉钉等频道），不监听入站端口。`config.json` 中的 `gateway.port` 当前仅用于启动日志展示，未绑定 socket，因此容器**无需** `-p` 端口映射。
+> **About the gateway port**: `paos gateway` is a message-bus service (Agent + channels + Cron + Heartbeat + Forge orchestration) that makes **outbound connections only** (LLM providers, Telegram/DingTalk, etc.) and does **not** bind an inbound port. `gateway.port` in `config.json` is currently shown only in the startup log and is not bound to a socket, so the container needs **no** `-p` port mapping.
 
 ---
 
-## ✅ 前置条件
+## ✅ Prerequisites
 
-- **Docker 20.10+**（含 daemon 运行中）
-- 可选：**Docker Compose v2**（若使用 `docker-compose.yml`）
+- **Docker 20.10+** (with the daemon running)
+- Optional: **Docker Compose v2** (if you use `docker-compose.yml`)
 
-检查环境：
+Check your environment:
 
 ```bash
 docker --version
-docker info   # 确认 daemon 正常运行
+docker info   # confirm the daemon is up
 ```
 
 ---
 
-## 🚀 一键安装与运行
+## 🚀 One-click install & run
 
-> 以下 `./scripts/install.sh` 命令均在**仓库根目录**执行。
+> The `./scripts/install.sh` commands below are run from the **repository root**.
 
-最简流程，两条命令：
+Minimal flow, two commands:
 
 ```bash
-# 1. 构建镜像 + 写入默认配置（首次使用）
+# 1. Build the image + write the default config (first run)
 ./scripts/install.sh
 
-# 2. 编辑配置，填入 LLM API Key
+# 2. Edit the config and add your LLM API key
 #    macOS / Linux:  vi ~/.PhyAgentOS/config.json
-#    在 providers.<name>.apiKey 处填入你的密钥
+#    Put it under providers.<name>.apiKey
 
-# 3. 进入交互式 CLI
+# 3. Enter the interactive CLI
 ./scripts/install.sh chat
 ```
 
-### 完整命令列表
+### Full command list
 
-| 命令 | 作用 |
+| Command | Purpose |
 |:-----|:-----|
-| `./scripts/install.sh` | （默认）构建镜像 + 初始化配置 |
-| `./scripts/install.sh build` | 仅构建镜像 |
-| `./scripts/install.sh onboard` | 仅写入默认配置到 `~/.PhyAgentOS/config.json` |
-| `./scripts/install.sh chat` | 交互式 CLI（镜像默认服务） |
-| `./scripts/install.sh gateway` | 启动长驻网关（消息总线，仅外连，无入站端口） |
-| `./scripts/install.sh status` | 查看 PhyAgentOS 状态 |
-| `./scripts/install.sh stop` | 停止网关容器 |
-| `./scripts/install.sh logs` | 跟踪网关日志 |
-| `./scripts/install.sh help` | 显示帮助 |
+| `./scripts/install.sh` | (default) build image + initialize config |
+| `./scripts/install.sh build` | build the image only |
+| `./scripts/install.sh onboard` | write the default config to `~/.PhyAgentOS/config.json` only |
+| `./scripts/install.sh chat` | interactive CLI (default service) |
+| `./scripts/install.sh gateway` | long-running gateway (message bus, outbound only, no inbound port) |
+| `./scripts/install.sh status` | show PhyAgentOS status |
+| `./scripts/install.sh stop` | stop the gateway container |
+| `./scripts/install.sh logs` | tail gateway logs |
+| `./scripts/install.sh help` | show help |
 
 ---
 
-## ⚙️ 配置与环境变量
+## ⚙️ Configuration & environment
 
-### 数据目录
+### Data directory
 
-所有配置、工作区、会话历史都保存在宿主机的 `~/.PhyAgentOS`，通过卷挂载（`-v`）注入容器：
+All config, workspace, and session history live on the host under `~/.PhyAgentOS`, injected into the container via a volume mount (`-v`):
 
 ```
-宿主机 ~/.PhyAgentOS  ⟷  容器 /root/.PhyAgentOS
+Host ~/.PhyAgentOS  ⟷  Container /root/.PhyAgentOS
 ```
 
-因此**卸载镜像不会丢失数据**，重新运行脚本即可恢复。
+So **removing the image does not lose data**; re-running the script restores everything.
 
-### 可配置环境变量
+### Configurable environment variables
 
-| 变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 |:-----|:-------|:-----|
-| `PAOS_DATA_DIR` | `~/.PhyAgentOS` | 配置与工作区目录 |
+| `PAOS_DATA_DIR` | `~/.PhyAgentOS` | Config & workspace directory |
 
-示例：自定义数据目录启动网关。
+Example: start the gateway with a custom data directory.
 
 ```bash
 PAOS_DATA_DIR=/data/paos ./scripts/install.sh gateway
 ```
 
-### API Key 配置
+### API key configuration
 
-交互式 CLI 与网关都需要 LLM provider 的 API Key。安装脚本会在 `onboard` 阶段写入默认配置模板，编辑其中的 `providers` 段：
+Both the interactive CLI and the gateway need an LLM provider API key. The install script writes a default config template during `onboard`; edit the `providers` section:
 
 ```json
 {
@@ -114,42 +116,42 @@ PAOS_DATA_DIR=/data/paos ./scripts/install.sh gateway
 }
 ```
 
-支持的 provider 及 OAuth 流程见 `paos provider login`。
+See `paos provider login` for supported providers and OAuth flows.
 
 ---
 
-## 🧩 使用 Docker Compose
+## 🧩 Using Docker Compose
 
-仓库已提供 [`docker-compose.yml`](../../docker-compose.yml)，适合需要常驻服务的场景。
+The repo ships a [`docker-compose.yml`](../../docker-compose.yml) for scenarios that need a persistent service.
 
 ```bash
-# 启动网关（后台常驻，自动重启）
+# Start the gateway (background, auto-restart)
 docker compose up -d phyagentos-gateway
 
-# 查看日志
+# View logs
 docker compose logs -f phyagentos-gateway
 
-# 进入交互式 CLI（独立 profile）
+# Enter the interactive CLI (separate profile)
 docker compose run --rm phyagentos-cli
 ```
 
 ---
 
-## 🔧 直接使用 Docker（不用脚本）
+## 🔧 Using Docker directly (without the script)
 
-如需完全手动控制（`docker build` 需在**仓库根目录**执行）：
+For full manual control (`docker build` must be run from the **repository root**):
 
 ```bash
-# 构建
+# Build
 docker build -t phyagentos:latest .
 
-# 初始化配置（首次）
+# Initialize config (first run)
 docker run --rm -v ~/.PhyAgentOS:/root/.PhyAgentOS phyagentos:latest onboard
 
-# 交互式 CLI
+# Interactive CLI
 docker run --rm -it -v ~/.PhyAgentOS:/root/.PhyAgentOS phyagentos:latest agent
 
-# 长驻网关（消息总线，仅外连，无需端口映射）
+# Long-running gateway (message bus, outbound only, no port mapping needed)
 docker run -d --name phyagentos-gateway \
   -v ~/.PhyAgentOS:/root/.PhyAgentOS \
   phyagentos:latest gateway
@@ -157,40 +159,41 @@ docker run -d --name phyagentos-gateway \
 
 ---
 
-## ⚠️ 已知限制
+## ⚠️ Known limitations
 
-### 1. 不包含托管 Forge Skill Runtime
+### 1. Managed Forge Skill Runtime is not included
 
-标准镜像没有 Dora CLI 或具体 Forge Runtime 制品。因此，除非显式扩展镜像并安装 Dora CLI
-v0.4.1、`dora-message` v0.7.0 与所选 Skill 的平台依赖，否则该镜像不支持
-`paos skill start`。仅使用 Agent 和消息渠道时不需要 Dora。
+The stock image has no Dora CLI or concrete Forge Runtime artifacts. `paos skill start` therefore
+is not supported in this image without an explicitly extended image containing Dora CLI v0.4.1,
+`dora-message` v0.7.0, and the selected Skill's platform dependencies. Agent-only and
+message-channel use does not require Dora.
 
-### 2. 容器以 root 运行
+### 2. Container runs as root
 
-为保持与 `~/.PhyAgentOS:/root/.PhyAgentOS` 的卷挂载约定一致，镜像默认以 root 用户运行。如需生产硬化，建议后续添加非 root 用户与 healthcheck。
+To stay consistent with the `~/.PhyAgentOS:/root/.PhyAgentOS` volume-mount convention, the image runs as root by default. For production hardening, consider adding a non-root user and a healthcheck later.
 
-### 3. 不含 GPU 支持
+### 3. No GPU support
 
-本镜像为 CPU 版，不支持 Isaac Sim / BEHAVIOR-1K 等需要 CUDA 的仿真。如需 GPU，需改用 `nvidia/cuda` 基础镜像并以 `--gpus all` 运行。
+This is a CPU image and does not support Isaac Sim / BEHAVIOR-1K or other CUDA-based simulation. For GPU, switch the base image to `nvidia/cuda` and run with `--gpus all`.
 
 ---
 
-## 🧯 排错
+## 🧯 Troubleshooting
 
-| 现象 | 解决方案 |
+| Symptom | Solution |
 |:-----|:---------|
-| `docker: command not found` | 安装 Docker：<https://docs.docker.com/get-docker> |
-| `Cannot connect to the Docker daemon` | 启动 Docker Desktop 或 `sudo systemctl start docker` |
-| 构建 OOM / 过慢 | 增大 Docker 内存分配；首次构建需下载依赖，后续走缓存 |
-| `paos agent` 报 `No API key configured` | 编辑 `~/.PhyAgentOS/config.json` 填入 `apiKey` |
-| 网关启动后立即退出 | 多为缺 API Key；`./scripts/install.sh logs` 查看日志确认 |
-| 网关容器无法启动 | `docker rm -f phyagentos-gateway` 后重试 |
+| `docker: command not found` | Install Docker: <https://docs.docker.com/get-docker> |
+| `Cannot connect to the Docker daemon` | Start Docker Desktop or `sudo systemctl start docker` |
+| Build OOM / slow | Increase Docker memory; first build downloads deps, later builds use cache |
+| `paos agent` reports `No API key configured` | Edit `~/.PhyAgentOS/config.json` and set `apiKey` |
+| Gateway exits immediately after start | Usually a missing API key; confirm with `./scripts/install.sh logs` |
+| Gateway container fails to start | `docker rm -f phyagentos-gateway` and retry |
 
 ---
 
-## 📚 相关文件
+## 📚 Related files
 
-- [`Dockerfile`](../../Dockerfile) — 镜像构建定义
-- [`docker-compose.yml`](../../docker-compose.yml) — Compose 编排
-- [`.dockerignore`](../../.dockerignore) — 构建忽略规则
-- [`scripts/install.sh`](../../scripts/install.sh) — 一键安装脚本
+- [`Dockerfile`](../../Dockerfile) — image build definition
+- [`docker-compose.yml`](../../docker-compose.yml) — Compose orchestration
+- [`.dockerignore`](../../.dockerignore) — build-ignore rules
+- [`scripts/install.sh`](../../scripts/install.sh) — one-click install script
