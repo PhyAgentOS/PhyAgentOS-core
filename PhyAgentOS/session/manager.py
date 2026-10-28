@@ -6,10 +6,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger
 
 from PhyAgentOS.config.paths import get_legacy_sessions_dir
+from PhyAgentOS.utils.atomic_file import atomic_write_text
 from PhyAgentOS.utils.helpers import ensure_dir, safe_filename
 
 
@@ -21,8 +23,8 @@ class Session:
     Stores messages in JSONL format for easy reading and persistence.
 
     Important: Messages are append-only for LLM cache efficiency.
-    The consolidation process writes summaries to MEMORY.md/HISTORY.md
-    but does NOT modify the messages list or get_history() output.
+    Consolidation writes summaries to MEMORY.md/HISTORY.md without changing
+    the messages list. Its cursor controls the history returned to the LLM.
     """
 
     key: str  # channel:chat_id
@@ -164,20 +166,25 @@ class SessionManager:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
 
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        metadata_line = {
+            "_type": "metadata", "key": session.key,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "metadata": session.metadata, "last_consolidated": session.last_consolidated,
+        }
+        lines = [json.dumps(metadata_line, ensure_ascii=False)]
+        lines.extend(json.dumps(msg, ensure_ascii=False) for msg in session.messages)
+        atomic_write_text(path, "\n".join(lines) + "\n")
 
         self._cache[session.key] = session
+
+    def backup(self, session: Session) -> Path:
+        """Durably preserve the complete raw session before /new can clear it."""
+        self.save(session)
+        source = self._get_session_path(session.key)
+        path = self.sessions_dir / "archives" / f"{source.stem}-{uuid4().hex}.jsonl"
+        atomic_write_text(path, source.read_text(encoding="utf-8"))
+        return path
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""

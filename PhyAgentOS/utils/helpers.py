@@ -127,25 +127,17 @@ def estimate_prompt_tokens(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> int:
-    """Estimate prompt tokens with tiktoken."""
+    """Count the full payload, including tool arguments and reasoning fields.
+
+    UTF-8 byte length is a conservative fallback when the tokenizer/cache is
+    unavailable. Returning zero would silently disable context protection.
+    """
+    payload = json.dumps({"messages": messages, "tools": tools or []}, ensure_ascii=False)
     try:
         enc = tiktoken.get_encoding("cl100k_base")
-        parts: list[str] = []
-        for msg in messages:
-            content = msg.get("content")
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        txt = part.get("text", "")
-                        if txt:
-                            parts.append(txt)
-        if tools:
-            parts.append(json.dumps(tools, ensure_ascii=False))
-        return len(enc.encode("\n".join(parts)))
+        return len(enc.encode(payload)) + 8 * len(messages)
     except Exception:
-        return 0
+        return max(1, len(payload.encode("utf-8"))) + 8 * len(messages)
 
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:

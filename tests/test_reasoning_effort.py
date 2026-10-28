@@ -335,7 +335,7 @@ async def test_memory_consolidation_does_not_combine_thinking_and_forced_tools(t
     memory = MemoryStore(tmp_path)
     assert await memory.consolidate([{"role": "user", "content": "remember this"}], provider, provider.default_model)
     assert "thinking" not in requests[0]
-    assert requests[0]["tool_choice"] == {"type": "any"}
+    assert requests[0]["tool_choice"] == {"type": "auto"}
     assert memory.read_long_term() == "Stored test memory"
     assert provider.generation.reasoning_effort == "high"
 

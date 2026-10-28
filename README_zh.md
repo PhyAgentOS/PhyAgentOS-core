@@ -273,6 +273,12 @@ paos skill stop robot-control-sim
 - [Piper X 二次开发 demo](docs/user_development_guide/PIPER_X_DEMO_zh.md)：为 `robot-control-sim` 接入另一种机械臂，包含模型转换与两种控制方式。
 - [Bundle 与 Tool 接入参考](docs/user_development_guide/README_zh.md)：manifest 字段、打包和本地安装。
 
+### 会话记忆与恢复
+
+`contextWindowTokens` 控制会话归档阈值及保守的请求预算。每次模型请求都预留输出空间并保留最近一轮完整对话；旧轮次可以从请求中移除，但不会从原始会话中删除。如果当前轮次或系统指令本身已超预算，PAOS 会明确报错停止，不发送超限请求，也不移除执行证据。
+
+记忆归档采用自动工具选择，并严格校验 `save_memory` 的返回结果。超大历史按预算分片处理，持久化进度以支持失败续跑。归档失败会显示在回复中，自动重试暂停 60 秒。`/new` 首先将完整原始会话备份到 `<workspace>/sessions/archives/`；即使模型归档失败，仍会开启新会话并告知备份路径。原始备份保留对话和待完成的归档检查点，供后续恢复；备份不等于已完成记忆摘要。
+
 <a id="quickstart-examples"></a>
 ## 更多示例
 

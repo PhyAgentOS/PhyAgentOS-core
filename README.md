@@ -272,6 +272,12 @@ paos skill stop robot-control-sim
 - [Piper X development demo](docs/user_development_guide/PIPER_X_DEMO.md): adapt `robot-control-sim` to another arm, including model conversion and both control modes.
 - [Bundle and Tool integration reference](docs/user_development_guide/README.md): manifest fields, packaging and local installation.
 
+### Session memory and recovery
+
+`contextWindowTokens` controls the session consolidation threshold and a conservative request budget. Each model request reserves output space and keeps the latest complete turn; older turns may be omitted from the request without deleting the session. If the current turn or system instructions alone exceed the budget, PAOS stops with an explicit error instead of sending an oversized request or removing execution evidence.
+
+Memory archival uses automatic tool selection with validated `save_memory` results. Large histories are processed in bounded fragments with durable progress checkpoints. Archival failures appear in the reply and retries pause for 60 seconds. `/new` first saves the complete raw session under `<workspace>/sessions/archives/`; if LLM archival fails, it still starts a new session and reports the backup path. Raw backups retain the original conversation and any pending archival checkpoint for later recovery; a backup is not a completed memory summary.
+
 <a id="quickstart-examples"></a>
 ## More examples
 

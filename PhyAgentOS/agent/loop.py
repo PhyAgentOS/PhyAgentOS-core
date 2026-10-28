@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
+from PhyAgentOS.agent.budget import fit_history, request_budget
 from PhyAgentOS.agent.context import ContextBuilder
 from PhyAgentOS.agent.memory import MemoryConsolidator
 from PhyAgentOS.agent.subagent import SubagentManager
@@ -353,13 +354,23 @@ class AgentLoop:
         provider = runtime.provider if runtime else self.provider
         model = runtime.model if runtime else self.model
 
+        context_notice_sent = False
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
 
+            budget, _ = request_budget(provider, model, self.context_window_tokens)
+            try:
+                request_messages, reduced = fit_history(messages, provider, model, budget, tool_defs)
+            except ValueError as exc:
+                raise LLMCallError(str(exc), messages=messages) from None
+            if reduced and not context_notice_sent:
+                context_notice_sent = True
+                if on_progress:
+                    await on_progress("Context budget reached; using recent complete turns. Original history is preserved.")
             response = await provider.chat_with_retry(
-                messages=messages,
+                messages=request_messages,
                 tools=tool_defs,
                 model=model,
             )
@@ -613,7 +624,7 @@ class AgentLoop:
                     str(task_ref)
                 )
             session = self.sessions.get_or_create(key)
-            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            memory_notice = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(
                 channel,
                 chat_id,
@@ -635,9 +646,13 @@ class AgentLoop:
                 )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
-            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+            post_notice = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+            notice = post_notice if isinstance(post_notice, str) else memory_notice
+            content = final_content or "Background task completed."
+            if isinstance(notice, str):
+                content += "\n\n" + notice
+            return OutboundMessage(channel=channel, chat_id=chat_id, content=content,
+                                   metadata=dict(msg.metadata or {}))
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -649,26 +664,30 @@ class AgentLoop:
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
+            # Never make session recovery depend on a working model. Failure to
+            # create the raw backup still prevents clearing anything.
             try:
-                if not await self.memory_consolidator.archive_unconsolidated(session):
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content="Memory archival failed, session not cleared. Please try again.",
-                    )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
+                backup = self.sessions.backup(session)
+            except OSError:
                 return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Session backup failed; the session was not cleared. Check workspace storage.",
+                    metadata=dict(msg.metadata or {}),
                 )
-
+            archived = False
+            try:
+                archived = await self.memory_consolidator.archive_unconsolidated(session)
+            except Exception:
+                logger.warning("/new memory archival failed for {}", session.key)
             session.clear()
+            session.metadata.pop("memory_archive_progress", None)
+            session.metadata.pop("memory_retry_after", None)
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            detail = "" if archived else f" Memory archival is pending; complete history is backed up at {backup}."
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
+                                   content="New session started." + detail,
+                                   metadata=dict(msg.metadata or {}))
         if cmd == "/help":
             lines = [
                 "🍞 PhyAgentOS commands:",
@@ -685,7 +704,7 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
             )
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        memory_notice = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(
             msg.channel,
@@ -730,7 +749,10 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        post_notice = await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        notice = post_notice if isinstance(post_notice, str) else memory_notice
+        if isinstance(notice, str):
+            final_content += "\n\n" + notice
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
