@@ -56,6 +56,7 @@ class ProvidersManager:
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         mode: str = "",
     ) -> LLMResponse:
         """
@@ -67,6 +68,8 @@ class ProvidersManager:
             model: Model identifier (overrides mode's model if provided).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            tool_choice: Tool selection strategy ("auto", "required", or a
+                specific tool dict), forwarded to the provider only when set.
             mode: Mode to use for this chat ("main", "coding", "multimodal", or "auto")
 
         Returns:
@@ -119,6 +122,9 @@ class ProvidersManager:
             raise ValueError(f"Unknown mode: {mode} and no fallback available")
 
         # Make the chat request
+        chat_kwargs: dict[str, Any] = {}
+        if tool_choice is not None:
+            chat_kwargs["tool_choice"] = tool_choice
         return await provider.chat_with_retry(
             messages=messages,
             tools=tools,
@@ -126,6 +132,7 @@ class ProvidersManager:
             max_tokens=max_tokens,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
+            **chat_kwargs,
         )
 
     def add_mode(self, mode: str, model_id: str, describe: str) -> None:
