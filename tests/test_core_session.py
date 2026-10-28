@@ -108,12 +108,19 @@ def _completed(turn: str = "turn-1", reply: str | None = "done") -> RuntimeEvent
     )
 
 
-def _tool(event_type: EventType, call_id: str, **payload: object) -> RuntimeEvent:
+def _tool(
+    event_type: EventType,
+    call_id: str,
+    *,
+    turn: str = "turn-1",
+    step: str = "step-1",
+    **payload: object,
+) -> RuntimeEvent:
     return RuntimeEvent(
         type=event_type,
         session_id=SESSION,
-        turn_id="turn-1",
-        step_id="step-1",
+        turn_id=turn,
+        step_id=step,
         payload={"tool_call_id": call_id, **payload},
     )
 
@@ -377,6 +384,38 @@ async def test_recover_distinguishes_intent_only_from_dispatched() -> None:
 
     assert again.unfinished_calls == ()
     assert after == events
+
+
+async def test_recover_keeps_reused_call_ids_in_separate_turns() -> None:
+    async with _open(":memory:") as store:
+        await store.append(_started("turn-1"))
+        await store.append(_started("turn-2"))
+        await store.append(
+            _tool(EventType.TOOL_INTENT, "call-same", turn="turn-1", step="turn-1:step:1")
+        )
+        await store.append(
+            _tool(EventType.TOOL_DISPATCHED, "call-same", turn="turn-1", step="turn-1:step:1")
+        )
+        await store.append(
+            _tool(EventType.TOOL_INTENT, "call-same", turn="turn-2", step="turn-2:step:1")
+        )
+
+        report = await store.recover(SESSION)
+        events = await store.read_session(SESSION)
+
+    calls = {(call.turn_id, call.step_id): call for call in report.unfinished_calls}
+    assert set(calls) == {("turn-1", "turn-1:step:1"), ("turn-2", "turn-2:step:1")}
+    assert calls[("turn-1", "turn-1:step:1")].dispatched is True
+    assert calls[("turn-2", "turn-2:step:1")].dispatched is False
+
+    settled = {
+        (event.turn_id, event.step_id): event.payload
+        for event in events
+        if event.type is EventType.TOOL_SETTLED
+    }
+    assert settled[("turn-1", "turn-1:step:1")]["status"] == ToolStatus.UNKNOWN.value
+    assert settled[("turn-2", "turn-2:step:1")]["status"] == ToolStatus.FAILED.value
+    assert settled[("turn-2", "turn-2:step:1")]["error"]["code"] == "not_dispatched"
 
 
 async def test_recover_does_not_close_turns_or_claim_success() -> None:

@@ -403,6 +403,23 @@ def test_event_payload_is_read_only_and_sequence_belongs_to_the_store() -> None:
         )
 
 
+def test_event_payload_deep_copies_nested_containers() -> None:
+    options = {"retries": 1}
+    arguments: dict[str, object] = {"text": "hello", "options": options}
+    event = RuntimeEvent(
+        type=EventType.TOOL_INTENT,
+        session_id="session-1",
+        turn_id="turn-1",
+        step_id="step-1",
+        payload={"tool_call_id": "call-1", "arguments": arguments},
+    )
+
+    arguments["text"] = "mutated after construction"
+    options["retries"] = 99
+
+    assert event.payload["arguments"] == {"text": "hello", "options": {"retries": 1}}
+
+
 def test_turn_result_refuses_contradictory_states() -> None:
     with pytest.raises(ValueError):
         TurnResult(

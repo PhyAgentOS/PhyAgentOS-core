@@ -36,6 +36,7 @@ One event must not claim more than was observed. In particular:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -120,7 +121,8 @@ def _payload_text(payload: Mapping[str, Any], key: str) -> str | None:
 class RuntimeEvent:
     """One append-only event.
 
-    ``payload`` is copied and made read-only on construction. Its schema is
+    ``payload`` is deep-copied and made read-only on construction: nested
+    containers no longer alias the caller's objects. Its schema is
     owned by the event type: model events carry ``model_call_id``, tool events
     carry ``tool_call_id``, and ``tool.settled`` carries a terminal
     :class:`ToolStatus`. Domain state is never copied here; only references
@@ -165,7 +167,7 @@ class RuntimeEvent:
 
         if not isinstance(self.payload, Mapping):
             raise TypeError("payload must be a mapping")
-        payload = MappingProxyType(dict(self.payload))
+        payload = MappingProxyType(deepcopy(dict(self.payload)))
         object.__setattr__(self, "payload", payload)
 
         if event_type in _MODEL_CALL_EVENTS and not _payload_text(payload, "model_call_id"):

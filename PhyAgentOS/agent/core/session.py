@@ -140,15 +140,20 @@ def _call_payload(payload: Mapping[str, Any], key: str) -> str | None:
 
 def _unfinished_state(
     session_id: str, events: Sequence[RuntimeEvent]
-) -> tuple[tuple[str, ...], dict[tuple[CallKind, str], UnfinishedCall]]:
+) -> tuple[tuple[str, ...], dict[tuple[CallKind, str, str, str], UnfinishedCall]]:
     """Fold the log into unfinished turns and unfinished calls.
 
     The fold is order-sensitive by ``sequence``: a start event opens the call,
     a terminal event of the matching kind closes it. Calls still open at the
     end were interrupted by whatever stopped the writer.
+
+    A call is keyed by kind plus its full scope (turn, step, call id).
+    Provider call ids are only unique within one response, so two turns of the
+    same session can legitimately reuse the same id without being the same
+    call.
     """
     open_turns: dict[str, None] = {}
-    open_calls: dict[tuple[CallKind, str], UnfinishedCall] = {}
+    open_calls: dict[tuple[CallKind, str, str, str], UnfinishedCall] = {}
 
     for event in events:
         event_type = event.type
@@ -164,18 +169,17 @@ def _unfinished_state(
             continue
         if event_type in _MODEL_CALL_EVENTS:
             call_id = _call_payload(event.payload, "model_call_id")
-            if call_id is None:
+            if call_id is None or turn_id is None or event.step_id is None:
                 continue
-            key = (CallKind.MODEL, call_id)
+            key = (CallKind.MODEL, turn_id, event.step_id, call_id)
             if event_type is EventType.MODEL_ATTEMPT_STARTED:
-                if turn_id is not None and event.step_id is not None:
-                    open_calls[key] = UnfinishedCall(
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        step_id=event.step_id,
-                        kind=CallKind.MODEL,
-                        call_id=call_id,
-                    )
+                open_calls[key] = UnfinishedCall(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    step_id=event.step_id,
+                    kind=CallKind.MODEL,
+                    call_id=call_id,
+                )
             elif event_type in _TERMINAL_MODEL_EVENTS:
                 open_calls.pop(key, None)
             continue
@@ -183,7 +187,7 @@ def _unfinished_state(
             call_id = _call_payload(event.payload, "tool_call_id")
             if call_id is None or turn_id is None or event.step_id is None:
                 continue
-            key = (CallKind.TOOL, call_id)
+            key = (CallKind.TOOL, turn_id, event.step_id, call_id)
             previous = open_calls.get(key)
             # Later events for the same call update it in sequence order; once
             # a dispatch was durable the call may have run, even if a later
@@ -202,8 +206,8 @@ def _unfinished_state(
             continue
         if event_type is EventType.TOOL_SETTLED:
             call_id = _call_payload(event.payload, "tool_call_id")
-            if call_id is not None:
-                open_calls.pop((CallKind.TOOL, call_id), None)
+            if call_id is not None and turn_id is not None and event.step_id is not None:
+                open_calls.pop((CallKind.TOOL, turn_id, event.step_id, call_id), None)
 
     return tuple(open_turns), open_calls
 
