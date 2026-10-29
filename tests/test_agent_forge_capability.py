@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -9,7 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from PhyAgentOS.agent.capabilities.forge import ForgeCapability
+from PhyAgentOS.agent.capabilities.forge_capability import ForgeCapability
+from PhyAgentOS.agent.capabilities.forge_task_tools import execute_task_tool
+from PhyAgentOS.agent.capabilities.forge_tool_api import execute_tool_api_tool
 from PhyAgentOS.agent.composition import compose_agent
 from PhyAgentOS.agent.core import (
     EventType,
@@ -24,9 +27,13 @@ from PhyAgentOS.agent.core.types import (
     ToolCall,
     ToolStatus,
 )
-from PhyAgentOS.agent_legacy.tools.forge_task import build_forge_task_tools
+from PhyAgentOS.agent_legacy.tools.forge_task import (
+    ForgeTaskCreateTool,
+    build_forge_task_tools,
+)
 from PhyAgentOS.agent_legacy.tools.forge_tool_api import build_forge_tool_api_tools
 from PhyAgentOS.forge.task import (
+    AgentTaskError,
     AgentTaskRecord,
     AgentTaskStatus,
     PlanRevision,
@@ -480,6 +487,200 @@ def test_task_status_in_prompt_does_not_claim_success() -> None:
     record = _task(status=AgentTaskStatus.CANCELLING)
     assert record.status is AgentTaskStatus.CANCELLING
     assert record.status.value not in {"succeeded", "completed"}
+
+
+def test_legacy_wrappers_share_the_native_definitions() -> None:
+    coordinator = _FakeCoordinator()
+    client = _FakeClient()
+    capability = ForgeCapability(coordinator, client=client)  # type: ignore[arg-type]
+    legacy_tools = list(build_forge_task_tools(coordinator)) + list(  # type: ignore[arg-type]
+        build_forge_tool_api_tools(client, coordinator=coordinator)  # type: ignore[arg-type]
+    )
+    registrations = capability.tool_registrations()
+
+    assert [item.definition.name for item in registrations] == [
+        tool.name for tool in legacy_tools
+    ]
+    for registration, tool in zip(registrations, legacy_tools, strict=True):
+        assert registration.definition.description == tool.description
+        assert registration.definition.parameters == tool.parameters
+        assert registration.parallel_safe is False
+        assert tool.parallel_safe is False
+
+
+async def test_native_handler_does_not_use_legacy_wrappers_or_json_decode(
+    monkeypatch,
+) -> None:
+    from PhyAgentOS.agent_legacy.tools import forge_task as legacy_task
+    from PhyAgentOS.agent_legacy.tools import forge_tool_api as legacy_tool_api
+
+    def legacy_used(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("the native handler must not call legacy wrappers")
+
+    def json_decode_used(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("the native handler must not decode a JSON string")
+
+    monkeypatch.setattr(legacy_task, "execute_task_tool", legacy_used)
+    monkeypatch.setattr(legacy_tool_api, "execute_tool_api_tool", legacy_used)
+    monkeypatch.setattr("json.loads", json_decode_used)
+
+    coordinator = _FakeCoordinator()
+    capability = ForgeCapability(coordinator, client=_FakeClient())  # type: ignore[arg-type]
+
+    created = await _invoke(
+        capability,
+        "forge_task_create",
+        {
+            "task_description": "native path",
+            "activation_id": "activation_test",
+            "verification": {"mode": "off"},
+        },
+    )
+    started = await _invoke(
+        capability,
+        "forge_tool_start_action",
+        {"task_id": "task_1", "tool_id": "motion.move", "arguments": {}},
+    )
+
+    assert created.status is ToolStatus.SUCCEEDED
+    assert started.status is ToolStatus.UNKNOWN
+
+
+async def test_explicit_session_cannot_be_overridden_by_model_arguments() -> None:
+    coordinator = _FakeCoordinator()
+    capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
+
+    outcome = await _invoke(
+        capability,
+        "forge_task_create",
+        {
+            "task_description": "session isolation",
+            "activation_id": "activation_test",
+            "verification": {"mode": "off"},
+            "origin_session_key": "session-from-model",
+        },
+        context=_context("session-from-context"),
+    )
+
+    assert outcome.status is ToolStatus.SUCCEEDED
+    assert coordinator.created[0]["origin_session_key"] == "session-from-context"
+
+
+async def test_two_sessions_create_concurrently_without_crossing() -> None:
+    coordinator = _FakeCoordinator()
+    capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
+    arguments = {
+        "task_description": "concurrent",
+        "activation_id": "activation_test",
+        "verification": {"mode": "off"},
+    }
+
+    await asyncio.gather(
+        _invoke(capability, "forge_task_create", dict(arguments), context=_context("a")),
+        _invoke(capability, "forge_task_create", dict(arguments), context=_context("b")),
+    )
+
+    assert sorted(item["origin_session_key"] for item in coordinator.created) == [
+        "a",
+        "b",
+    ]
+
+
+async def test_action_read_ownership_failure_is_failed_before_gateway() -> None:
+    coordinator = _FakeCoordinator()
+    client = _FakeClient()
+    capability = ForgeCapability(coordinator, client=client)  # type: ignore[arg-type]
+
+    def reject(_task_id: str, _invocation_id: str) -> None:
+        raise AgentTaskError("invocation is not owned by this task")
+
+    coordinator.require_action_invocation = reject  # type: ignore[method-assign]
+    outcome = await _invoke(
+        capability,
+        "forge_tool_action_status",
+        {"task_id": "task_1", "invocation_id": "inv_foreign"},
+    )
+
+    assert outcome.status is ToolStatus.FAILED
+    assert outcome.error is not None
+    assert outcome.error.code == "forge_agent_task"
+    assert client.calls == []
+
+
+async def test_stop_session_requested_is_unknown_and_stopped_is_success() -> None:
+    coordinator = _FakeCoordinator()
+    capability = ForgeCapability(coordinator, client=_FakeClient())  # type: ignore[arg-type]
+    arguments = {"task_id": "task_1", "invocation_id": "inv_session"}
+
+    requested = await _invoke(capability, "forge_tool_stop_session", arguments)
+    assert requested.status is ToolStatus.UNKNOWN
+    assert requested.content["domain_status"] == "requested"
+
+    async def stopped(_task_id: str, _invocation_id: str) -> dict[str, Any]:
+        return {"ok": True, "data": {"status": "stopped"}}
+
+    coordinator.stop_session = stopped  # type: ignore[method-assign]
+    confirmed = await _invoke(capability, "forge_tool_stop_session", arguments)
+    assert confirmed.status is ToolStatus.SUCCEEDED
+
+
+async def test_legacy_wrappers_and_native_operations_return_the_same_payload() -> None:
+    task = _task()
+    legacy_coordinator = _FakeCoordinator(task=task)
+    native_coordinator = _FakeCoordinator(task=task)
+    create_arguments = {
+        "task_description": "legacy parity",
+        "activation_id": "activation_test",
+        "verification": {"mode": "off"},
+    }
+
+    legacy = ForgeTaskCreateTool(legacy_coordinator)  # type: ignore[arg-type]
+    legacy.set_context("session-1")
+    legacy_payload = json.loads(await legacy.execute(**create_arguments))
+    native_payload = await execute_task_tool(
+        "forge_task_create",
+        native_coordinator,  # type: ignore[arg-type]
+        create_arguments,
+        session_id="session-1",
+    )
+
+    assert isinstance(native_payload, dict)
+    assert legacy_payload == native_payload
+    assert (
+        legacy_coordinator.created[0]["origin_session_key"]
+        == native_coordinator.created[0]["origin_session_key"]
+        == "session-1"
+    )
+
+
+async def test_legacy_and_native_error_payloads_match() -> None:
+    legacy_coordinator = _FakeCoordinator()
+    native_coordinator = _FakeCoordinator()
+    error = ForgeToolAPIError("invalid tool", status_code=400, error_code="invalid_tool")
+    legacy_coordinator.start_action_error = error
+    native_coordinator.start_action_error = error
+
+    legacy_tools = {
+        tool.name: tool
+        for tool in build_forge_tool_api_tools(
+            _FakeClient(), coordinator=legacy_coordinator  # type: ignore[arg-type]
+        )
+    }
+    legacy_payload = json.loads(
+        await legacy_tools["forge_tool_start_action"].execute(
+            "task_1", "motion.move", {}
+        )
+    )
+    native_payload = await execute_tool_api_tool(
+        "forge_tool_start_action",
+        _FakeClient(),  # type: ignore[arg-type]
+        native_coordinator,  # type: ignore[arg-type]
+        {"task_id": "task_1", "tool_id": "motion.move", "arguments": {}},
+    )
+
+    assert legacy_payload == native_payload
+    assert native_payload["error"]["code"] == "invalid_tool"
+    assert native_payload["error"]["status_code"] == 400
 
 
 # ---------------------------------------------------------------------------

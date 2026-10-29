@@ -1,75 +1,48 @@
-"""Agent tools for explicit PAOS AgentTask lifecycle management."""
+"""Legacy AgentTask tool wrappers over the native Forge definitions.
+
+The tool names, descriptions, schemas and operations live in
+:mod:`PhyAgentOS.agent.capabilities.forge_task_tools`. This module keeps the
+historical ``Tool`` class shapes, the ``ContextVar`` session context and the
+JSON string return contract used by the old loop. No lifecycle logic is
+duplicated here.
+"""
 
 from __future__ import annotations
 
-import inspect
+import copy
 import json
 from contextvars import ContextVar
 from typing import Any
 
+from PhyAgentOS.agent.capabilities.forge_task_tools import (
+    TASK_TOOL_DEFINITIONS,
+    execute_task_tool,
+)
 from PhyAgentOS.agent_legacy.tools.base import Tool
-from PhyAgentOS.forge.task import AgentTaskCoordinator, AgentTaskRecord
-from PhyAgentOS.verification.contracts import TaskVerificationContract
+from PhyAgentOS.forge.task import AgentTaskCoordinator
 
-_SUPPORTED_EVIDENCE_KINDS = ("rgb_image", "robot_state")
-_DEFAULT_EVIDENCE_KINDS = ["robot_state"]
-
-
-def _prepare_verification(
-    verification: dict[str, Any],
-    *,
-    image_sources: list[str],
-) -> dict[str, Any]:
-    """Reject evidence policies this Forge path cannot satisfy.
-
-    A classic AgentTask Evidence Bundle is built from observation snapshots only:
-    each phase can hold rgb_image artifacts (when the Gateway publishes images)
-    and one robot_state artifact from /ws/state. Query and Action results live in
-    the execution records, not in the bundle, so requiring them as artifact kinds
-    can never complete.
-    """
-    prepared = dict(verification)
-    raw_policy = prepared.get("evidence_policy")
-    policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
-    kinds = policy.get("required_kinds")
-    if kinds is None:
-        kinds = list(_DEFAULT_EVIDENCE_KINDS)
-    unsupported = [
-        str(kind) for kind in kinds if kind not in _SUPPORTED_EVIDENCE_KINDS
-    ]
-    if unsupported:
-        raise ValueError(
-            "unsupported evidence required_kinds: "
-            + ", ".join(unsupported)
-            + "; this Forge path records only "
-            + ", ".join(_SUPPORTED_EVIDENCE_KINDS)
-            + " artifacts (query/action results stay in execution records)"
-        )
-    association = policy.get("minimum_association", "best_effort")
-    if association != "best_effort":
-        raise ValueError(
-            "minimum_association=authoritative is unavailable for AgentTask evidence; "
-            "PAOS Forge collection records best-effort observation evidence"
-        )
-    if "rgb_image" in kinds and not image_sources:
-        raise ValueError(
-            "rgb_image evidence requires forge.evidence.requiredImageSources and a Gateway "
-            "image stream; this runtime has neither. Use robot_state evidence instead."
-        )
-    policy["required_kinds"] = list(kinds)
-    prepared["evidence_policy"] = policy
-    return prepared
+__all__ = [
+    "ForgeTaskBeginRevisionTool",
+    "ForgeTaskCancelTool",
+    "ForgeTaskCreateTool",
+    "ForgeTaskFinalizeTool",
+    "ForgeTaskGetTool",
+    "build_forge_task_tools",
+]
 
 
-def _task_response(task: AgentTaskRecord) -> str:
-    return json.dumps(
-        {
-            "ok": True,
-            "data": task.model_dump(mode="json", exclude_none=True),
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+def _definition(name: str):
+    return next(item for item in TASK_TOOL_DEFINITIONS if item.name == name)
+
+
+def _parameters(name: str) -> dict[str, Any]:
+    return copy.deepcopy(dict(_definition(name).parameters))
+
+
+def _dump(name: str, payload: dict[str, Any]) -> str:
+    if name == "forge_task_get":
+        return json.dumps(payload, ensure_ascii=False)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 class ForgeTaskCreateTool(Tool):
@@ -84,36 +57,15 @@ class ForgeTaskCreateTool(Tool):
 
     @property
     def name(self) -> str:
-        return "forge_task_create"
+        return _definition("forge_task_create").name
 
     @property
     def description(self) -> str:
-        return (
-            "Create the single active AgentTask before a task-bound Forge Tool sequence. "
-            "This records planning and verification context but does not execute the robot. "
-            "Evidence is captured in two phases: before evidence when the first bound Action "
-            "starts (confirm before_snapshot_ref and an empty evidence_errors via "
-            "forge_task_get after that Action is admitted), and after evidence when "
-            "forge_task_finalize runs after every Action is terminal. Keep observation "
-            "sources live before the first Action; the agent cannot create evidence itself."
-        )
+        return _definition("forge_task_create").description
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "task_description": {"type": "string", "minLength": 1},
-                "activation_id": {
-                    "type": "string",
-                    "pattern": "^activation_[a-z0-9]+$",
-                    "description": "Primary activate_skill result from this session turn",
-                },
-                "verification": _verification_schema(),
-            },
-            "required": ["task_description", "activation_id", "verification"],
-            "additionalProperties": False,
-        }
+        return _parameters("forge_task_create")
 
     async def execute(
         self,
@@ -123,31 +75,17 @@ class ForgeTaskCreateTool(Tool):
         *,
         origin_session_key: str | None = None,
     ) -> str:
-        """Create one AgentTask.
-
-        ``origin_session_key`` lets a caller pass the session explicitly
-        instead of using the legacy ``set_context`` ContextVar. The legacy
-        loop keeps using the ContextVar; the new capability passes the value
-        from its ``ExecutionContext``.
-        """
-        image_sources: list[str] = []
-        coordinator_config = getattr(self.coordinator, "config", None)
-        evidence_config = getattr(coordinator_config, "evidence", None)
-        if evidence_config is not None:
-            image_sources = list(evidence_config.required_image_sources)
-        verification = _prepare_verification(
-            verification,
-            image_sources=image_sources,
+        payload = await execute_task_tool(
+            self.name,
+            self.coordinator,
+            {
+                "task_description": task_description,
+                "activation_id": activation_id,
+                "verification": verification,
+            },
+            session_id=origin_session_key or self.session_key.get(),
         )
-        task = self.coordinator.create_task(
-            task_description=task_description,
-            activation_id=activation_id,
-            verification=TaskVerificationContract.model_validate(verification),
-            origin_session_key=origin_session_key or self.session_key.get(),
-        )
-        if inspect.isawaitable(task):
-            task = await task
-        return _task_response(task)
+        return _dump(self.name, payload)
 
 
 class ForgeTaskGetTool(Tool):
@@ -156,23 +94,21 @@ class ForgeTaskGetTool(Tool):
 
     @property
     def name(self) -> str:
-        return "forge_task_get"
+        return _definition("forge_task_get").name
 
     @property
     def description(self) -> str:
-        return "Read persisted AgentTask, PlanRevision, Tool execution, evidence and verdict state."
+        return _definition("forge_task_get").description
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return _task_id_schema()
+        return _parameters("forge_task_get")
 
     async def execute(self, task_id: str) -> str:
-        response = json.loads(_task_response(self.coordinator.get_task(task_id)))
-        interaction = getattr(self.coordinator, "interaction", None)
-        summary = interaction.summary(task_id) if interaction is not None else None
-        if summary is not None:
-            response["interaction"] = summary
-        return json.dumps(response, ensure_ascii=False)
+        payload = await execute_task_tool(
+            self.name, self.coordinator, {"task_id": task_id}
+        )
+        return _dump(self.name, payload)
 
 
 class ForgeTaskBeginRevisionTool(Tool):
@@ -181,24 +117,21 @@ class ForgeTaskBeginRevisionTool(Tool):
 
     @property
     def name(self) -> str:
-        return "forge_task_begin_revision"
+        return _definition("forge_task_begin_revision").name
 
     @property
     def description(self) -> str:
-        return (
-            "Append a new immutable PlanRevision to the same task after verification requests "
-            "replanning."
-        )
+        return _definition("forge_task_begin_revision").description
 
     @property
     def parameters(self) -> dict[str, Any]:
-        schema = _task_id_schema()
-        schema["properties"]["reason"] = {"type": "string", "minLength": 1}
-        schema["required"].append("reason")
-        return schema
+        return _parameters("forge_task_begin_revision")
 
     async def execute(self, task_id: str, reason: str) -> str:
-        return _task_response(self.coordinator.begin_revision(task_id, reason=reason))
+        payload = await execute_task_tool(
+            self.name, self.coordinator, {"task_id": task_id, "reason": reason}
+        )
+        return _dump(self.name, payload)
 
 
 class ForgeTaskFinalizeTool(Tool):
@@ -207,25 +140,21 @@ class ForgeTaskFinalizeTool(Tool):
 
     @property
     def name(self) -> str:
-        return "forge_task_finalize"
+        return _definition("forge_task_finalize").name
 
     @property
     def description(self) -> str:
-        return (
-            "Finalize a task after every bound Action is terminal. Before calling it, confirm "
-            "with forge_task_get that before_snapshot_ref is present and evidence_errors is "
-            "empty; finalize then captures after evidence and judges the user-level "
-            "verification contract. If finalize reports an incomplete Evidence Bundle, use "
-            "read-only tools to inspect the missing kinds; do not resubmit the same Action or "
-            "replay finalize with unchanged evidence."
-        )
+        return _definition("forge_task_finalize").description
 
     @property
     def parameters(self) -> dict[str, Any]:
-        return _task_id_schema()
+        return _parameters("forge_task_finalize")
 
     async def execute(self, task_id: str) -> str:
-        return _task_response(await self.coordinator.finalize_task(task_id))
+        payload = await execute_task_tool(
+            self.name, self.coordinator, {"task_id": task_id}
+        )
+        return _dump(self.name, payload)
 
 
 class ForgeTaskCancelTool(Tool):
@@ -234,97 +163,36 @@ class ForgeTaskCancelTool(Tool):
 
     @property
     def name(self) -> str:
-        return "forge_task_cancel"
+        return _definition("forge_task_cancel").name
 
     @property
     def description(self) -> str:
-        return (
-            "Request cancellation for every non-terminal Action bound to an AgentTask. "
-            "Cancellation acceptance is not proof that motion stopped."
-        )
+        return _definition("forge_task_cancel").description
 
     @property
     def parameters(self) -> dict[str, Any]:
-        schema = _task_id_schema()
-        schema["properties"]["reason"] = {"type": "string", "minLength": 1}
-        return schema
+        return _parameters("forge_task_cancel")
 
     async def execute(self, task_id: str, reason: str = "agent_requested") -> str:
-        return _task_response(await self.coordinator.cancel_task(task_id, reason=reason))
+        payload = await execute_task_tool(
+            self.name,
+            self.coordinator,
+            {"task_id": task_id, "reason": reason},
+        )
+        return _dump(self.name, payload)
+
+
+_TASK_TOOL_CLASSES = {
+    "forge_task_create": ForgeTaskCreateTool,
+    "forge_task_get": ForgeTaskGetTool,
+    "forge_task_begin_revision": ForgeTaskBeginRevisionTool,
+    "forge_task_finalize": ForgeTaskFinalizeTool,
+    "forge_task_cancel": ForgeTaskCancelTool,
+}
 
 
 def build_forge_task_tools(coordinator: AgentTaskCoordinator) -> list[Tool]:
     return [
-        ForgeTaskCreateTool(coordinator),
-        ForgeTaskGetTool(coordinator),
-        ForgeTaskBeginRevisionTool(coordinator),
-        ForgeTaskFinalizeTool(coordinator),
-        ForgeTaskCancelTool(coordinator),
+        _TASK_TOOL_CLASSES[definition.name](coordinator)
+        for definition in TASK_TOOL_DEFINITIONS
     ]
-
-
-def _task_id_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {"task_id": {"type": "string", "minLength": 1}},
-        "required": ["task_id"],
-        "additionalProperties": False,
-    }
-
-
-def _verification_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "mode": {
-                "type": "string",
-                "enum": ["off", "audit", "enforce", "recovery"],
-            },
-            "goal": {"type": "string"},
-            "success_criteria": {"type": "array", "items": {"type": "string"}},
-            "constraints": {"type": "array", "items": {"type": "string"}},
-            "evidence_policy": {
-                "type": "object",
-                "description": (
-                    "Observation evidence requirements. This Forge path can produce "
-                    "rgb_image and robot_state artifacts. rgb_image also needs a Gateway "
-                    "image stream and forge.evidence.requiredImageSources; robot_state "
-                    "reads /ws/state. Defaults to robot_state."
-                ),
-                "properties": {
-                    "profile": {"type": "string"},
-                    "required_kinds": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "enum": list(_SUPPORTED_EVIDENCE_KINDS),
-                        },
-                    },
-                    "required_sources": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "minimum_association": {
-                        "type": "string",
-                        "enum": ["best_effort"],
-                        "description": (
-                            "PAOS Forge observation evidence is best-effort; "
-                            "authoritative association is not available here."
-                        ),
-                    },
-                },
-                "additionalProperties": False,
-            },
-        },
-        "additionalProperties": False,
-    }
-
-
-__all__ = [
-    "ForgeTaskBeginRevisionTool",
-    "ForgeTaskCancelTool",
-    "ForgeTaskCreateTool",
-    "ForgeTaskFinalizeTool",
-    "ForgeTaskGetTool",
-    "build_forge_task_tools",
-]

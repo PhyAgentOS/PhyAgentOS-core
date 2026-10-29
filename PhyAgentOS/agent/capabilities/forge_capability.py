@@ -1,20 +1,17 @@
-"""Agent-side Forge capability.
+"""Agent-side Forge capability over native adapter definitions.
 
-Forge owns AgentTask, invocation, and remote execution state. This module only
-translates the core's generic tool contract into the existing Forge task and
-Gateway Tool API wrappers, and translates their JSON responses back into
-``ToolOutcome`` values. It does not reimplement Forge lifecycle rules: task
-creation, cancellation, ownership checks, and remote stop requests stay in
-``PhyAgentOS.forge.task`` and the legacy Forge tool wrappers.
+Forge owns AgentTask, invocation, and remote execution state. This module
+translates the core's generic tool contract into the native Forge operations
+in :mod:`PhyAgentOS.agent.capabilities.forge_task_tools` and
+:mod:`PhyAgentOS.agent.capabilities.forge_tool_api`, and maps their structured
+responses to ``ToolOutcome`` values. It does not reimplement Forge lifecycle
+rules: task creation, cancellation, ownership checks, and remote stop requests
+stay in ``PhyAgentOS.forge.task``.
 
-During the core split those wrappers still live in
-:mod:`PhyAgentOS.agent_legacy.tools`. That import is deliberate, not an
-accidental duplicate: the wrappers own the accepted Gateway call shapes and
-the single physical execution path (``ForgeToolClient`` -> Gateway Tool API ->
-ToolEndpoint). :func:`PhyAgentOS.agent.composition.compose_agent` injects the
-already-built coordinator and client; the capability integration tests drive
-the wrappers through the core executor. When the legacy package is retired the
-wrappers can move behind this module without changing the capability contract.
+The adapter layer imports only the core contracts and ``PhyAgentOS.forge``; it
+does not import :mod:`PhyAgentOS.agent_legacy`. The legacy tool classes keep
+their public shapes but delegate to the same definitions and operations, so
+the native and legacy paths cannot drift apart.
 
 Outcome rules:
 * a local API call that was accepted or is still pending is ``UNKNOWN``, not
@@ -38,20 +35,16 @@ from PhyAgentOS.agent.core.types import (
     DomainRefs,
     ExecutionContext,
     ToolCall,
-    ToolDefinition,
     ToolError,
     ToolOutcome,
     ToolRegistration,
     ToolStatus,
 )
-from PhyAgentOS.agent_legacy.tools.base import Tool
-from PhyAgentOS.agent_legacy.tools.forge_task import (
-    ForgeTaskCreateTool,
-    build_forge_task_tools,
-)
-from PhyAgentOS.agent_legacy.tools.forge_tool_api import build_forge_tool_api_tools
 from PhyAgentOS.forge.task import AgentTaskCoordinator, AgentTaskRecord
 from PhyAgentOS.forge.tool_client import ForgeToolClient
+
+from .forge_task_tools import TASK_TOOL_DEFINITIONS, execute_task_tool
+from .forge_tool_api import TOOL_API_DEFINITIONS, execute_tool_api_tool
 
 __all__ = ["ForgeCapability"]
 
@@ -118,19 +111,17 @@ def _domain_status(data: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _ok_payload(result: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Split a legacy tool response into data and error objects."""
-    try:
-        payload = json.loads(result)
-    except (TypeError, ValueError):
-        return None, None
-    if not isinstance(payload, dict):
+def _split_payload(
+    payload: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Split one structured operation response into data and error objects."""
+    if not isinstance(payload, Mapping):
         return None, None
     if payload.get("ok") is False:
         error = payload.get("error")
         return None, error if isinstance(error, dict) else {}
     data = payload.get("data")
-    return data if isinstance(data, dict) else payload, None
+    return data if isinstance(data, dict) else dict(payload), None
 
 
 def _domain_refs(
@@ -429,6 +420,25 @@ def _outcome_for_success(
     return _success_outcome(call, data, arguments)
 
 
+def _outcome(
+    call: ToolCall,
+    payload: Mapping[str, Any] | None,
+    arguments: Mapping[str, Any],
+) -> ToolOutcome:
+    data, error = _split_payload(payload)
+    if error is not None:
+        return _error_outcome(call, error, arguments)
+    if data is None:
+        return _unknown_outcome(
+            call,
+            "Forge returned a response this capability could not parse; "
+            "remote state is unknown.",
+            None,
+            arguments,
+        )
+    return _outcome_for_success(call, data, arguments)
+
+
 class ForgeCapability:
     """Expose the Forge AgentTask and Tool API groups to the agent core.
 
@@ -445,21 +455,23 @@ class ForgeCapability:
         client: ForgeToolClient | None = None,
     ) -> None:
         self._coordinator = coordinator
-        tools: list[Tool] = list(build_forge_task_tools(coordinator))
-        if client is not None:
-            tools.extend(build_forge_tool_api_tools(client, coordinator=coordinator))
-        self._registrations = tuple(
+        self._client = client
+        registrations: list[ToolRegistration] = [
             ToolRegistration(
-                definition=ToolDefinition(
-                    name=tool.name,
-                    description=tool.description,
-                    parameters=tool.parameters,
-                ),
-                handler=self._handler(tool),
-                parallel_safe=tool.parallel_safe,
+                definition=definition,
+                handler=self._task_handler(definition.name),
             )
-            for tool in tools
-        )
+            for definition in TASK_TOOL_DEFINITIONS
+        ]
+        if client is not None:
+            registrations.extend(
+                ToolRegistration(
+                    definition=definition,
+                    handler=self._tool_api_handler(definition.name),
+                )
+                for definition in TOOL_API_DEFINITIONS
+            )
+        self._registrations = tuple(registrations)
 
     @property
     def name(self) -> str:
@@ -468,26 +480,29 @@ class ForgeCapability:
     def tool_registrations(self) -> tuple[ToolRegistration, ...]:
         return self._registrations
 
-    def _handler(self, tool: Tool):
+    def _task_handler(self, name: str):
         async def handle(call: ToolCall, context: ExecutionContext) -> ToolOutcome:
             arguments = call.arguments_dict()
-            if isinstance(tool, ForgeTaskCreateTool):
-                # The legacy ContextVar stays for the legacy loop; this path
-                # passes the core's session identity explicitly.
-                arguments["origin_session_key"] = context.session_id
-            result = await tool.execute(**arguments)
-            data, error = _ok_payload(result)
-            if error is not None:
-                return _error_outcome(call, error, arguments)
-            if data is None:
-                return _unknown_outcome(
-                    call,
-                    "Forge returned a response this capability could not parse; "
-                    "remote state is unknown.",
-                    None,
-                    arguments,
-                )
-            return _outcome_for_success(call, data, arguments)
+            # Session identity is explicit on this path and cannot come from
+            # the model's arguments.
+            payload = await execute_task_tool(
+                name,
+                self._coordinator,
+                arguments,
+                session_id=context.session_id,
+            )
+            return _outcome(call, payload, arguments)
+
+        return handle
+
+    def _tool_api_handler(self, name: str):
+        async def handle(call: ToolCall, context: ExecutionContext) -> ToolOutcome:
+            arguments = call.arguments_dict()
+            assert self._client is not None
+            payload = await execute_tool_api_tool(
+                name, self._client, self._coordinator, arguments
+            )
+            return _outcome(call, payload, arguments)
 
         return handle
 

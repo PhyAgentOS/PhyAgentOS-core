@@ -4,7 +4,7 @@ This is the one production-side place that builds the standard core objects
 for an entry point:
 
     AgentHostImpl -> AgentRuntimeImpl -> LoopDriverImpl -> ToolExecutorImpl
-                  -> ForgeCapability -> legacy Forge task/Tool API wrappers
+                  -> ForgeCapability -> native Forge task/Tool API adapters
                   -> AgentTaskCoordinator / ForgeToolClient
 
 Every collaborator is injected: this module creates no provider, session
@@ -12,13 +12,13 @@ store, Forge client, or background task, and reads no global config. The
 returned :class:`AgentAssembly` owns shutdown through ``host.aclose()``, which
 closes the runtime and then the injected store in the contract order.
 
-The Forge capability deliberately keeps using the existing wrappers in
-:mod:`PhyAgentOS.agent_legacy.tools`. Those wrappers hold the accepted Gateway
-call shapes and the only physical execution path
-(``ForgeToolClient -> Gateway Tool API -> ToolEndpoint``); duplicating them
-here would create a second implementation. The dependency is explicit in
-:mod:`PhyAgentOS.agent.capabilities.forge` and covered by the capability
-integration tests.
+The Forge capability uses the native adapter modules in
+:mod:`PhyAgentOS.agent.capabilities`; it does not import
+:mod:`PhyAgentOS.agent_legacy`. Those adapters hold the accepted Gateway call
+shapes and the only physical execution path
+(``ForgeToolClient -> Gateway Tool API -> ToolEndpoint``). The legacy tool
+classes delegate to the same definitions and operations, so the two paths
+cannot drift apart.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from PhyAgentOS.forge.task import AgentTaskCoordinator
 from PhyAgentOS.forge.tool_client import ForgeToolClient
 
-from .capabilities.forge import ForgeCapability
+from .capabilities.forge_capability import ForgeCapability
 from .core import (
     AgentHostImpl,
     AgentRuntimeImpl,

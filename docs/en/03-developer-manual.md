@@ -21,8 +21,9 @@ This manual covers Core implementation: AgentTask coordination, persistence, bin
 | Module | Responsibility |
 |:-------|:---------------|
 | `agent_legacy/loop.py` | Existing Agent loop, general tools, dynamic MCP, Forge tool registration, context, and lifecycle |
-| `agent_legacy/tools/forge_tool_api.py` | Governed Query/Action/Session Tool API Agent wrappers |
-| `agent_legacy/tools/forge_task.py` | Five AgentTask lifecycle tools |
+| `agent/capabilities/` | Native Forge tool definitions and operations, plus Core `ToolOutcome` mapping |
+| `agent_legacy/tools/forge_tool_api.py` | Compatibility wrappers for the ten Gateway Tool API tools |
+| `agent_legacy/tools/forge_task.py` | Compatibility wrappers for the five AgentTask lifecycle tools |
 | `forge/tool_client.py` | Strict asynchronous HTTP client and response validation |
 | `forge/binding.py`, `forge/task.py` | Immutable Runtime/ToolSpec binding, AgentTask models/store, evidence, verification, and recovery |
 | `forge/observation.py`, `forge/evidence.py` | Best-effort image/state collection and artifact writing |
@@ -43,7 +44,7 @@ requires `attempt_id`. A timeout leaves an unknown record and recovery never rep
 
 ## 4. Agent-facing tools
 
-The public Agent-facing tool catalog is maintained in the [API contract](../forge/README.md#6-agent-tools). Implement wrappers in `agent_legacy/tools/forge_tool_api.py` and `agent_legacy/tools/forge_task.py`; keep transport handling in `forge/tool_client.py` and coordination in `forge/task.py`.
+The public Agent-facing tool catalog is maintained in the [API contract](../forge/README.md#6-agent-tools). Tool names, descriptions, JSON Schemas, and operations live in `agent/capabilities/forge_tool_api.py` and `agent/capabilities/forge_task_tools.py`; `agent_legacy/tools/` only keeps compatibility wrappers over them. Keep transport handling in `forge/tool_client.py` and coordination in `forge/task.py`.
 
 Diagnostic Query and bound calls invoke the same HTTP methods. Every mutating or task-attributed
 wrapper validates ownership and the frozen Tool binding before network access. Tool wrappers must
