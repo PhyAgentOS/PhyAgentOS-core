@@ -23,6 +23,7 @@ cannot drift apart.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from PhyAgentOS.forge.task import AgentTaskCoordinator
@@ -69,6 +70,8 @@ def compose_agent(
     tool_choice: str | None = None,
     max_steps: int = 16,
     deadline_seconds: float | None = None,
+    additional_capabilities: Sequence[Capability] = (),
+    forge_capability: Capability | None = None,
 ) -> AgentAssembly:
     """Build the Forge-enabled host from already-built collaborators.
 
@@ -79,9 +82,16 @@ def compose_agent(
     through the runtime as the core contract requires. ``system_instructions``
     and the generation parameters are the core's own configuration; none of
     them is read from a file or environment here.
+
+    ``additional_capabilities`` are registered in the given order and receive
+    the prompt fragment hook before Forge. ``forge_capability`` may be an
+    already-built Forge capability so several assemblies can share one
+    coordinator/client pair; when omitted this function builds the standard
+    one. Forge always stays last, so capability order is stable for both
+    callers.
     """
-    capability = ForgeCapability(coordinator, client=client)
-    capabilities: tuple[Capability, ...] = (capability,)
+    capability = forge_capability or ForgeCapability(coordinator, client=client)
+    capabilities: tuple[Capability, ...] = (*additional_capabilities, capability)
 
     registrations = tuple(
         registration

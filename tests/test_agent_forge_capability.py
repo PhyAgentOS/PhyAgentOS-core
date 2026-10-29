@@ -33,6 +33,7 @@ from PhyAgentOS.agent_legacy.tools.forge_task import (
 )
 from PhyAgentOS.agent_legacy.tools.forge_tool_api import build_forge_tool_api_tools
 from PhyAgentOS.forge.task import (
+    AgentTaskBusyError,
     AgentTaskError,
     AgentTaskRecord,
     AgentTaskStatus,
@@ -419,6 +420,94 @@ async def test_cancel_uses_latest_task_for_the_session() -> None:
     await capability.cancel("other-session", None)
 
     assert coordinator.cancelled == ["task_for_session"]
+
+
+async def test_busy_create_exposes_blocking_task_and_invocation() -> None:
+    coordinator = _FakeCoordinator()
+    arguments = {
+        "task_description": "move",
+        "activation_id": "activation_test",
+        "verification": {"mode": "off"},
+    }
+
+    def busy(**_kwargs: Any) -> AgentTaskRecord:
+        raise AgentTaskBusyError(
+            'an earlier Action invocation still has unknown remote state: '
+            'task_id="task_other" invocation_id="inv_other" status=unknown. '
+            "Inspect forge_task_get and forge_tool_action_status; do not resend.",
+            task_id="task_other",
+            invocation_id="inv_other",
+            status="unknown",
+            blocking=[
+                {
+                    "task_id": "task_other",
+                    "invocation_id": "inv_other",
+                    "status": "unknown",
+                    "semantics": "action",
+                    "origin_session_key": "cli:other",
+                }
+            ],
+        )
+
+    coordinator.create_task = busy  # type: ignore[method-assign]
+    capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
+
+    outcome = await _invoke(
+        capability, "forge_task_create", arguments, context=_context("cli:mine")
+    )
+
+    assert outcome.status is ToolStatus.FAILED
+    assert outcome.error is not None
+    assert outcome.error.code == "forge_agent_task"
+    assert outcome.content["blocked_task_id"] == "task_other"
+    assert outcome.content["blocked_invocation_id"] == "inv_other"
+    assert outcome.content["blocked_status"] == "unknown"
+    assert outcome.content["blocking"][0]["origin_session_key"] == "cli:other"
+    assert outcome.domain_refs.task_id == "task_other"
+    assert outcome.domain_refs.invocation_id == "inv_other"
+    shown = outcome.for_model()
+    assert "task_other" in shown and "inv_other" in shown
+    assert "do not resend" in shown
+
+
+async def test_busy_create_without_invocation_identity_does_not_invent_one() -> None:
+    coordinator = _FakeCoordinator()
+    arguments = {
+        "task_description": "move",
+        "activation_id": "activation_test",
+        "verification": {"mode": "off"},
+    }
+
+    def busy(**_kwargs: Any) -> AgentTaskRecord:
+        raise AgentTaskBusyError(
+            "an earlier Action invocation still has unknown remote state: "
+            "invocation_id=None (Gateway identity was never confirmed); "
+            "do not resend.",
+            task_id="task_other",
+            invocation_id=None,
+            status="unknown",
+            blocking=[
+                {
+                    "task_id": "task_other",
+                    "invocation_id": None,
+                    "status": "unknown",
+                    "semantics": "action",
+                    "origin_session_key": "cli:other",
+                }
+            ],
+        )
+
+    coordinator.create_task = busy  # type: ignore[method-assign]
+    capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
+
+    outcome = await _invoke(capability, "forge_task_create", arguments)
+
+    assert outcome.status is ToolStatus.FAILED
+    assert outcome.content["blocked_invocation_id"] is None
+    assert outcome.content["blocking"][0]["invocation_id"] is None
+    assert outcome.domain_refs.invocation_id is None
+    assert outcome.domain_refs.task_id == "task_other"
+    assert "never confirmed" in outcome.for_model()
 
 
 def test_prompt_context_uses_authoritative_store_state() -> None:

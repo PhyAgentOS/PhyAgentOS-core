@@ -29,7 +29,7 @@ from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.channels.base import BaseChannel
 from PhyAgentOS.channels.manager import ChannelManager
-from PhyAgentOS.cli import commands
+from PhyAgentOS.cli.command_groups import gateway_commands
 from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest
 from PhyAgentOS.session.manager import SessionManager
 
@@ -110,7 +110,7 @@ async def test_two_chat_sessions_and_cron_stay_isolated(tmp_path):
     try:
         await _send("A", "session-A")
         await _send("B", "session-B")
-        cron_task = asyncio.create_task(commands._process_direct_for_scheduler(
+        cron_task = asyncio.create_task(gateway_commands._process_direct_for_scheduler(
             loop, source="cron:job-1", content="cron-job", session_key="cron:job-1",
         ))
         running = {"session-A", "session-B", "cron-job"}
@@ -142,7 +142,7 @@ async def test_two_chat_sessions_and_cron_stay_isolated(tmp_path):
         job = SimpleNamespace(payload=SimpleNamespace(
             deliver=True, to="cron-target", channel="cli", message="cron-job",
         ))
-        await commands._deliver_cron_response(job, cron_reply, loop.bus)
+        await gateway_commands._deliver_cron_response(job, cron_reply, loop.bus)
         await _wait_until(lambda: {
             message.chat_id
             for message in outbound

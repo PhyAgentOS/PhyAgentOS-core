@@ -13,14 +13,16 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from PhyAgentOS import __logo__
 from PhyAgentOS.config.loader import load_config
 from PhyAgentOS.config.schema import ProviderConfig
 from PhyAgentOS.providers.service import (
     ProviderError,
     ProviderService,
-    SessionRuntimes,
     provider_spec,
 )
+
+from ..interaction import model_picker
 
 provider_app = typer.Typer(help="Manage providers")
 console = Console()
@@ -47,83 +49,12 @@ def _provider_errors():
         raise typer.Exit(1) from None
 
 
-def _interactive() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()
-
-
-def _select_provider(service: ProviderService, *, action: str = "Configure") -> str:
-    """Keyboard-only, inline selection; never uses the terminal alternate screen."""
-    from prompt_toolkit.application import Application
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.layout import Layout
-    from prompt_toolkit.layout.containers import Window
-    from prompt_toolkit.layout.controls import FormattedTextControl
-
-    rows = service.list()
-    if action in {"Test", "Use"}:
-        rows = [row for row in rows if row["configured"]]
-    elif action in {"Show", "Remove"}:
-        rows = [
-            row for row in rows
-            if row["configured"]
-            or getattr(service.config.providers, row["name"]).model_dump(
-                exclude_defaults=True, exclude={"enabled"},
-            )
-        ]
-    elif action == "Login":
-        rows = [row for row in rows if row["auth"] == "oauth"]
-    if not rows:
-        raise ProviderError("No providers available. Run 'paos provider configure' first.")
-    selected = next((i for i, row in enumerate(rows) if row["default"]), 0)
-    bindings = KeyBindings()
-
-    @bindings.add("up")
-    def previous(event):
-        nonlocal selected
-        selected = (selected - 1) % len(rows)
-
-    @bindings.add("down")
-    def following(event):
-        nonlocal selected
-        selected = (selected + 1) % len(rows)
-
-    @bindings.add("enter")
-    def choose(event):
-        event.app.exit(result=rows[selected]["name"])
-
-    @bindings.add("escape")
-    @bindings.add("c-c")
-    def cancel(event):
-        event.app.exit(exception=KeyboardInterrupt())
-
-    def render():
-        lines = [f"Select a provider to {action.lower()}\n\n"]
-        for index, row in enumerate(rows):
-            status = "configured" if row["configured"] else "not configured"
-            if row["auth"] == "oauth" and row["configured"]:
-                status = "OAuth logged in (local credentials; not tested)"
-            elif row["auth"] == "aws" and row["configured"]:
-                status = "AWS credential chain (not tested)"
-            if row["default"]:
-                status += " · default"
-            lines.append(f"  {'●' if index == selected else '○'} {row['label']}  {status}\n")
-        lines.append(f"\n↑/↓ Select   Enter {action}   Esc / Ctrl+C Cancel\n")
-        return [("", "".join(lines))]
-
-    return Application(
-        layout=Layout(Window(FormattedTextControl(render))),
-        key_bindings=bindings,
-        full_screen=False,
-        mouse_support=False,
-    ).run()
-
-
 def _provider_argument(provider: str | None, service: ProviderService, *, action: str) -> str:
     if provider:
         return provider_spec(provider).name
-    if not _interactive():
+    if not model_picker._interactive():
         raise ProviderError("A provider name is required outside a TTY. Run 'paos provider list'.")
-    return _select_provider(service, action=action)
+    return model_picker._select_provider(service, action=action)
 
 
 def _prompt(message: str, *, default: str = "", secret: bool = False) -> str:
@@ -147,134 +78,6 @@ def _prompt(message: str, *, default: str = "", secret: bool = False) -> str:
         )
         or default
     )
-
-
-def _model_picker(
-    models: list[str], *, selected: list[str] | None = None, multiple: bool = False,
-    title: str | None = None,
-):
-    """Inline model picker with a bounded viewport, also usable for a single default."""
-    from prompt_toolkit.application import Application
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.layout import Layout
-    from prompt_toolkit.layout.containers import Window
-    from prompt_toolkit.layout.controls import FormattedTextControl
-
-    if not models:
-        raise ProviderError("No saved models. Run 'paos provider configure <provider>' first.")
-    checked = set(selected or []).intersection(models)
-    cursor = next((i for i, model in enumerate(models) if model in checked), 0)
-    bindings = KeyBindings()
-
-    @bindings.add("up")
-    def previous(event):
-        nonlocal cursor
-        cursor = (cursor - 1) % len(models)
-
-    @bindings.add("down")
-    def following(event):
-        nonlocal cursor
-        cursor = (cursor + 1) % len(models)
-
-    @bindings.add(" ")
-    def toggle(event):
-        if multiple:
-            model = models[cursor]
-            if model in checked:
-                checked.remove(model)
-            else:
-                checked.add(model)
-
-    @bindings.add("enter")
-    def choose(event):
-        if multiple and checked:
-            event.app.exit(result=[model for model in models if model in checked])
-        elif not multiple:
-            event.app.exit(result=[models[cursor]])
-
-    @bindings.add("escape")
-    @bindings.add("c-c")
-    def cancel(event):
-        event.app.exit(exception=KeyboardInterrupt())
-
-    def render():
-        heading = title or ("Select models to add" if multiple else "Select a model")
-        start = max(0, min(cursor - 5, len(models) - 12))
-        lines = [f"{heading} ({cursor + 1}/{len(models)})\n\n"]
-        for index in range(start, min(start + 12, len(models))):
-            marker = "[x]" if models[index] in checked else "[ ]"
-            lines.append(f"  {'>' if index == cursor else ' '} {marker if multiple else ''} {models[index]}\n")
-        action = f"Space Toggle ({len(checked)} selected; at least one required)   " if multiple else ""
-        lines.append(f"\n↑/↓ Select   {action}Enter Confirm   Esc / Ctrl+C Cancel\n")
-        return [("", "".join(lines))]
-
-    return Application(
-        layout=Layout(Window(FormattedTextControl(render))),
-        key_bindings=bindings,
-        full_screen=False,
-        mouse_support=False,
-    )
-
-
-def _select_models(
-    models: list[str], *, selected: list[str] | None = None, multiple: bool = False,
-) -> list[str]:
-    return _model_picker(models, selected=selected, multiple=multiple).run()
-
-
-async def _switch_session_model(sessions: SessionRuntimes, key: str) -> str:
-    """Choose and atomically switch a saved provider/model from the active chat loop."""
-    current = sessions.get(key)
-    choices: dict[str, tuple[str, str]] = {}
-    for row in sessions.service.list():
-        if not row["configured"]:
-            continue
-        models = sessions.service.models(row["name"])
-        if row["name"] == current.name and current.model not in models:
-            models.append(current.model)
-        for model in models:
-            choices[f"{row['label']} / {model}"] = (row["name"], model)
-    selected = [label for label, value in choices.items() if value == (current.name, current.model)]
-    chosen = await _model_picker(list(choices), selected=selected).run_async()
-    name, model = choices[chosen[0]]
-    return sessions.select(key, name, model)
-
-
-async def _interactive_model_command(
-    command: str, sessions: SessionRuntimes | None, key: str,
-) -> str | None:
-    parts = command.strip().lower().split(maxsplit=1)
-    if not parts or not _interactive() or sessions is None:
-        return None
-    if parts[0] == "/effort":
-        from PhyAgentOS.providers.effort import effort_error, supported_efforts
-
-        current = sessions.get(key)
-        try:
-            argument = parts[1] if len(parts) > 1 else ""
-            if not argument:
-                levels = supported_efforts(provider_spec(current.name), current.model)
-                if not levels:
-                    raise ProviderError(effort_error())
-                chosen = await _model_picker(
-                    ["none", *levels],
-                    selected=[current.effort or "none"],
-                    title="Select reasoning effort (none = model default)",
-                ).run_async()
-                argument = chosen[0]
-            return sessions.command(key, f"/effort {argument}")
-        except ProviderError as exc:
-            return str(exc)
-        except (KeyboardInterrupt, EOFError, typer.Abort):
-            return "Effort selection cancelled; current effort unchanged."
-    if command.strip().lower() != "/model":
-        return None
-    try:
-        return await _switch_session_model(sessions, key)
-    except (KeyboardInterrupt, EOFError, typer.Abort):
-        return "Model selection cancelled; current model unchanged."
-    except ProviderError as exc:
-        return str(exc)
 
 
 @provider_app.command("list")
@@ -334,14 +137,14 @@ def provider_configure(
 ):
     """Configure a registered provider; keys are never command-line arguments."""
     with _provider_errors():
-        interactive = _interactive() and not api_key_stdin
+        interactive = model_picker._interactive() and not api_key_stdin
         service = ProviderService.load(config)
         if not provider:
             if not interactive:
                 raise ProviderError(
                     "A provider name is required outside a TTY. Run 'paos provider list'."
                 )
-            provider = _select_provider(service)
+            provider = model_picker._select_provider(service)
         spec = provider_spec(provider)
         # Load stored settings separately so ambient secrets for unrelated providers
         # cannot accidentally be copied into config.json.
@@ -420,7 +223,7 @@ def provider_configure(
                     if not available:
                         console.print("No routable models returned; select a saved model or enter one manually.")
             if available:
-                additions = _select_models(
+                additions = model_picker._select_models(
                     available,
                     selected=[*candidate.models, candidate.default_model] if candidate.default_model else candidate.models,
                     multiple=True,
@@ -430,7 +233,7 @@ def provider_configure(
                     *candidate.models, *([candidate.default_model] if candidate.default_model else []),
                 ]))
                 candidate.default_model = (
-                    _select_models(choices, selected=[candidate.default_model] if candidate.default_model else [additions[0]])[0]
+                    model_picker._select_models(choices, selected=[candidate.default_model] if candidate.default_model else [additions[0]])[0]
                     if len(choices) > 1 else choices[0]
                 )
             elif model is None:
@@ -438,7 +241,7 @@ def provider_configure(
                     *candidate.models, *([candidate.default_model] if candidate.default_model else []),
                 ]))
                 if choices:
-                    candidate.default_model = _select_models(
+                    candidate.default_model = model_picker._select_models(
                         choices, selected=[candidate.default_model] if candidate.default_model else None,
                     )[0]
                 else:
@@ -502,11 +305,11 @@ def provider_use(
     with _provider_errors():
         service = ProviderService.load(config)
         provider = _provider_argument(provider, service, action="Use")
-        if model is None and _interactive():
+        if model is None and model_picker._interactive():
             choices = service.models(provider)
             if choices:
                 cfg = getattr(service.config.providers, provider_spec(provider).name)
-                model = _select_models(
+                model = model_picker._select_models(
                     choices, selected=[cfg.default_model] if cfg.default_model else None,
                 )[0]
         runtime = ProviderService.use(config, provider, model, reasoning_effort)
@@ -514,3 +317,84 @@ def provider_use(
             f"Default: {runtime.name} / {runtime.model}, effort={runtime.effort or 'none'}. "
             "Running processes are unchanged."
         )
+
+
+_LOGIN_HANDLERS: dict[str, callable] = {}
+
+
+def _register_login(name: str):
+    def decorator(fn):
+        _LOGIN_HANDLERS[name] = fn
+        return fn
+    return decorator
+
+
+@provider_app.command("login")
+def provider_login(
+    provider: str | None = typer.Argument(None, help="OAuth provider; omit to select interactively"),
+):
+    """Authenticate with an OAuth provider."""
+    from PhyAgentOS.config.schema import Config
+    from PhyAgentOS.providers.registry import PROVIDERS
+
+    with _provider_errors():
+        key = _provider_argument(provider, ProviderService(Config()), action="Login")
+    spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
+    if not spec:
+        names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
+        console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
+        raise typer.Exit(1)
+
+    handler = _LOGIN_HANDLERS.get(spec.name)
+    if not handler:
+        console.print(f"[red]Login not implemented for {spec.label}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} OAuth Login - {spec.label}\n")
+    handler()
+
+
+@_register_login("openai_codex")
+def _login_openai_codex() -> None:
+    try:
+        from oauth_cli_kit import get_token, login_oauth_interactive
+        token = None
+        try:
+            token = get_token()
+        except Exception:
+            pass
+        if not (token and token.access):
+            console.print("[cyan]Starting interactive OAuth login...[/cyan]\n")
+            token = login_oauth_interactive(
+                print_fn=lambda s: console.print(s),
+                prompt_fn=lambda s: typer.prompt(s),
+            )
+        if not (token and token.access):
+            console.print("[red]✗ Authentication failed[/red]")
+            raise typer.Exit(1)
+        console.print(f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]")
+    except ImportError:
+        console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
+        raise typer.Exit(1)
+
+
+@_register_login("github_copilot")
+def _login_github_copilot() -> None:
+    import asyncio
+
+    console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
+
+    async def _trigger():
+        from litellm import acompletion
+        await acompletion(model="github_copilot/gpt-4o", messages=[{"role": "user", "content": "hi"}], max_tokens=1)
+
+    try:
+        asyncio.run(_trigger())
+        console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
+    except Exception as e:
+        console.print(f"[red]Authentication error: {e}[/red]")
+        raise typer.Exit(1)
+
+
+def register_provider_commands(app) -> None:
+    app.add_typer(provider_app, name="provider")

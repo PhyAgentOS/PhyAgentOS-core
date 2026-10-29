@@ -20,8 +20,18 @@
 
 | 模块 | 职责 |
 |:-----|:-----|
+| `agent/core/` | 七个 Core 组件（入口壳、回合、循环驱动、模型适配、提示组装、工具执行、SQLite 事件存储）；契约在 `types.py`、`events.py`、`protocols.py` |
+| `agent/composition.py` | `compose_agent`：用注入的协作对象装配 Core，并固定能力顺序 |
+| `agent/capabilities/` | Forge 工具的原生定义与操作、到 Core `ToolOutcome` 的映射，以及 `activate_skill` |
+| `agent/services/skill_documents.py`、`agent/services/turn_activation.py` | Skill 文档发现与按回合的激活身份 |
+| `agent/bootstrap.py`、`agent/services/forge_verifier.py` | 共享的 Forge 构造工厂与语义验证器；`agent_legacy/session_verifier.py` 只保留别名 |
+| `cli/commands.py` | 单一 Typer app、全局 callback 与命令组注册，包括唯一的 `agent` 命令 |
+| `cli/command_groups/agent_commands.py` | Core 路径 `paos agent --runtime core`：依赖构造、逐回合装配、`CoreAgentSession` 与进程生命周期 |
+| `cli/command_groups/`（其余模块） | provider、gateway、Skill、Forge Node、channels 与 onboard/status 命令组，由 `commands.py` 统一注册 |
+| `cli/configuration.py` | gateway 与 legacy 路径共用的配置加载和启动选择（provider/evolution） |
+| `cli/legacy/legacy_agent.py`、`cli/legacy/legacy_support.py` | 默认的旧 `paos agent`、其终端交互与旧 prompt 会话 helper |
+| `cli/interaction/interactive_session.py`、`cli/interaction/agent_output.py`、`cli/interaction/terminal_input.py`、`cli/interaction/terminal_display.py`、`cli/interaction/model_picker.py` | Core 的输入调度与取消、消息展示、终端输入、实时状态与工具区，以及 provider/model/effort 选择器 |
 | `agent_legacy/loop.py` | 现有 Agent Loop、通用工具、动态 MCP、Forge tools 注册、上下文与生命周期 |
-| `agent/capabilities/` | Forge 工具的原生定义与操作，以及到 Core `ToolOutcome` 的映射 |
 | `agent_legacy/tools/forge_tool_api.py` | 十个 Gateway Tool API 工具的兼容 wrapper |
 | `agent_legacy/tools/forge_task.py` | 五个 AgentTask 生命周期工具的兼容 wrapper |
 | `forge/tool_client.py` | 严格异步 HTTP client 与响应校验 |
@@ -45,6 +55,8 @@ Timeout 形成 unknown record，恢复不会重复 POST。
 ## 4. Agent tools
 
 公开的 Agent 工具清单统一维护在 [API 契约](../forge/README_zh.md#6-agent-tools)。工具名、描述、JSON Schema 与操作位于 `agent/capabilities/forge_tool_api.py` 和 `agent/capabilities/forge_task_tools.py`；`agent_legacy/tools/` 只保留兼容 wrapper。传输处理放在 `forge/tool_client.py`，任务协调放在 `forge/task.py`。
+
+Core 路径还注册 `agent/capabilities/skill_access_capability.py` 提供的 `activate_skill`。它读取已注册的 Skill 文档并返回本轮有效的 `activation_id`；不启动 Skill runtime，也不属于 Forge 工具。
 
 诊断 Query 与绑定调用使用相同 HTTP 方法；每个变更或任务归因 wrapper 都在网络访问前校验
 ownership 与冻结 binding。Tool wrapper 不能自行生成 Gateway identity 或 result。
@@ -151,7 +163,56 @@ attempt。Outcome source 将每个 revision verdict 映射到该 revision
 
 可选的[交互基础](../interaction/README_zh.md)是独立受限扩展，Core 改动也需遵守其部署限制。
 
-## 13. 测试门禁
+## 13. CLI 入口归属与生命周期
+
+`paos agent` 只在 `cli/commands.py` 注册一次。命令必须显式选择运行时；失败后不会切到另一条路径：
+
+| 选择 | 归属 | 状态 |
+|:-----|:-----|:-----|
+| `--runtime legacy`（默认） | `cli/legacy/legacy_agent.py` | 现有路径；仍是默认 |
+| `--runtime core` | `cli/command_groups/agent_commands.py` | 新 Core 路径；显式启用，缺口见下文 |
+
+`commands.py` 保留 Typer app、全局 callback 和唯一的注册点；各命令组自己持有 Typer app 或 `register_*` 函数。`configuration.py` 存放 gateway 与 legacy 路径共用的配置加载及启动时的 provider/evolution 选择。`agent_commands.py` 只负责 Core 路径：读配置、建依赖、每回合建一次装配、结束时关闭会话；它目前仍持有 `CoreAgentSession` 和 Core 依赖装配，不是单一职责模块。`interaction/interactive_session.py` 调度 Core 输入，`interaction/agent_output.py` 负责消息展示，`interaction/terminal_input.py` 负责 prompt_toolkit 输入和终端状态，`interaction/terminal_display.py` 持有实时状态与工具区，`interaction/model_picker.py` 存放共用的终端选择器。Core 的 prompt 代理使用原始 ANSI 直通，Rich 样式会正常显示，不再变成可见的 `?[36m`；模型、工具和异常文本在渲染前会去掉控制字符，转义序列只由 Rich 产生。
+
+终端只有一个实时区域写入者：prompt_toolkit 的底栏渲染回合阶段（准备、思考、调用工具、本地停止）、转圈和耗时，以及本回合最近 4 次工具调用、隐藏数量和总数。没有第二个 `Live` 或 `status` 写入者，因此输入框、动画和工具区不会互相移动光标。动画只由 prompt_toolkit 的刷新定时器驱动；状态变化只来自已经持久化的事件和会话的提交/取消回调。工具调用按 `(session_id, turn_id, tool_call_id)` 建键，从 `tool.intent` 到 `tool.dispatched` 再到 `tool.settled` 原地更新，重复事件不会增加总数；新回合开始时清空旧行，避免继承上一回合状态。没有 prompt 时（单次 `-m`、启动阶段、重定向流），同一份状态按变化打印普通行，不做动画，也不输出转义序列。`/tools` 按需打印脱敏记录：只有工具名、本地状态和限长错误摘要，不打印参数、结果或凭证。
+
+session/provider/model/effort 一行放在 prompt message 里、输入框上方；底部工具栏只在回合运行中挂上。运行中通过 layout 的 `always_hide_cursor` 隐藏 `You:` 和真实光标，buffer 只读，Enter 被拦截；普通按键不进入 buffer，也不会被偷偷排进模型队列，回合开始前已有的草稿保留，回合结束恢复提示和光标。非终端输入仍保持逐行文本行为。
+
+在终端里，不带参数的 `/model` 与 `/effort` 复用行内选择器。打开第二个 prompt_toolkit 应用前先暂停 reader（结束当前 prompt，且不再启动新 prompt），菜单返回后才恢复；Esc 或 Ctrl+C 只关闭菜单，会话和当前选择都不变。未提交的半行会带入下一条 prompt，不会因菜单丢失。每次模型命令结束（文本、菜单、reset、取消或失败）都从会话实际选择重发工具栏标签。带参数的写法和非终端输入不经过选择器。
+
+legacy 路径的生命周期留在 `legacy/legacy_agent.py`：建 `AgentLoop`，跑单次或终端流程，最后停 loop 并关 MCP；旧 prompt 会话 helper 在 `legacy/legacy_support.py`。下面的步骤只讲新的 Core 路径。
+
+### Core 进程生命周期
+
+1. 读取并校验配置，应用 `--workspace`，拒绝 fleet 模式。
+2. 解析 provider/model/effort 选择；选择在回合真正开始时读取，排队中的提交因此会用运行前的最新选择，运行中的回合保留它开始时的选择。
+3. 构造 Forge 组件：Skill catalog 与 runtime availability、`ForgeToolClient`、`AgentTaskCoordinator` 和可选验证器。
+4. 在这个 coordinator 上做一次 Forge 未知 Action/Session 恢复，且在任何一个回合被提交之前完成。`reconcile_nonterminal()` 只发 Gateway GET 查询；不重发 Action 或 Session 的 POST，也不把仍未确认的 unknown 改成终态。Core 没有交互 supervisor，因此这里不会请求机器人停止。恢复本身失败时会报告一次并继续打开会话；未解决的 unknown 仍然阻塞新任务。
+5. 创建 `SkillDocumentLoader` 与 `TurnSkillActivationManager`，把激活管理器注册给 coordinator，使 `forge_task_create` 能校验 `activation_id`。
+6. 打开会话存储 `<workspace>/sessions/core.db`。
+7. 用 `compose_agent` 建种子装配；`SkillAccessCapability` 在前，`ForgeCapability` 在后。
+8. 跑单条消息或交互循环。每回合在真正开始时读取该 session 的选择并新建面向模型的装配；这份装配只服务一个回合，回合结束立即 `runtime.stop()`（不关 host），不再等下次 submit。store、Forge coordinator/client 与激活管理器保持共享。同一 session 的提交按登记顺序串行，不同 session 可并发；`cancel` 只取消当前装配，排队中的回合不会继承这次取消。
+9. 只关闭一次：先拒绝新提交并让排队中的提交在开回合前退出，再停仍可能持有回合的 runtime，等已进入本 session 的提交返回，对每个已接受的 session 通知各能力，关闭规范能力一次，最后关 store。Forge client 与验证器由资源栈在会话之后关闭。
+
+只要还有更早的 Action/Session 调用处于 unknown，`forge_task_create` 就拒绝建新任务，跨 session 的旧任务也算在内。拒绝结果会给出权威的 `task_id`、已确认的 `invocation_id`（Gateway 身份从未确认时明确写 `None`）、记录状态与语义，以及该用哪个 status 工具查询；不会建议去试列表工具，不会重发旧请求，也不会建议删 store 或靠重启清除。
+
+运行中只用 Esc 停止：第一次 Esc 进入两秒窗口并显示黄色提示，第二次 Esc 通过原有 session cancel 路径请求本地取消。超时、其他按键、方向键或新回合都会清除已 arm 状态，单次 Esc 和方向/Alt 组合不会停止任务；模型菜单里的 Esc 只关闭菜单。取消会请求 Forge 取消该 session 的最新任务，但不能证明远端动作已停止；状态明确写"本地"和"远端未确认"。本地命令（`/help`、`/tools`、`/correct`，以及被拒绝的未知斜杠命令）由 reader 立即处理；`/stop` 只返回提示，不取消也不发模型。非终端输入捕获不到 Esc，只能靠 Ctrl+C。普通文本和模型命令仍按 FIFO 顺序，模型命令只在回合之间执行；程序注入的排队消息只回执序号和处理通知，不回显内容。
+
+`agent/services/forge_verifier.py` 是两条路径共用的唯一验证器实现；`agent_legacy/session_verifier.py` 只是重新导出，原有 import 和模块 patch 仍然生效。
+
+### Skill 激活作用域
+
+`activate_skill` 是 `agent/capabilities/skill_access_capability.py` 提供的 Core 工具。一次激活只属于一个 `session_id` 和一个 `turn_id`；上一回合、其他 session 或上一个进程的 id 都会被拒绝。激活记录只在内存里，重启后必须重新激活。一回合允许一个 primary Skill 和任意多个 supporting Skill。激活只读 Skill 文档，不启动 Skill runtime。
+
+### Core 路径未覆盖的部分
+
+通用工具、流式回复、`/correct`、memory 与 evolution、managed interaction Sessions、fleet 模式，以及 cron、heartbeat、channels 入口都还没迁移。Forge interaction supervisor 没有接进 Core CLI，因此不能把交互迁移说成已完成。旧 JSONL 会话不导入；Core 使用独立的 SQLite 文件。Provider 错误只给简短的脱敏诊断：保留异常类型和 HTTP 状态，不回显响应体与凭证。
+
+### 测试
+
+相关用例覆盖文档发现、激活作用域、验证器别名、Core CLI 单条请求与逐回合装配，以及交互 FIFO、取消、展示、排队回执、本地命令和工具区记录。终端行为用真实的 prompt_toolkit pipe input 和 Vt100 output 验证：session 行在输入框上方、忙时隐藏 You 与光标并禁键、草稿保留、第一次 Esc 提示、第二次 Esc 只取消一次、超时/其他键/方向键清除、菜单 Esc 不取消、resize 与菜单前暂停 reader；不只依赖 mock 的 TTY 开关。测试使用本地 fake provider、fake Forge client 和临时 store；不包含真实 provider 或 Gateway 请求。全量门禁仍是 `pytest`、`ruff check PhyAgentOS tests` 和 `compileall`。
+
+## 14. 测试门禁
 
 ```bash
 ruff check PhyAgentOS tests
@@ -161,8 +222,9 @@ pytest -q
 
 测试应覆盖响应契约、Session ownership、pending/cancel/stop/timeout/unknown、单活动任务、
 诊断 Query、不可变 binding、无 POST 恢复、revision recovery、evidence、按版本 episode、归档
-攻击、事务回滚、Registry 校验、Runtime health/切换与模拟工作流。具体硬件/仿真测试以独立安装
-匹配制品和 Dora 可用为条件。
+攻击、事务回滚、Registry 校验、Runtime health/切换、模拟工作流、CLI 运行时选择、Core 逐回合
+装配、交互 FIFO/取消、Skill 文档优先级与激活作用域。具体硬件/仿真测试以独立安装匹配制品和
+Dora 可用为条件。
 
 ## 后续阅读
 

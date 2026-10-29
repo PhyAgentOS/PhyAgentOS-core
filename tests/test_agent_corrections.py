@@ -21,8 +21,8 @@ from PhyAgentOS.agent_legacy.tools.base import Tool
 from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
-from PhyAgentOS.cli import commands
-from PhyAgentOS.cli.commands import _InteractiveRuntime
+from PhyAgentOS.cli.legacy import legacy_agent
+from PhyAgentOS.cli.legacy.legacy_agent import _InteractiveRuntime
 from PhyAgentOS.providers.base import LLMResponse, StreamEvent, ToolCallRequest
 
 
@@ -359,7 +359,7 @@ def _user_texts(snapshot: list[dict]) -> list[str]:
 def _capture_console(monkeypatch):
     buffer = io.StringIO()
     monkeypatch.setattr(
-        commands, "console",
+        legacy_agent, "console",
         Console(file=buffer, force_terminal=False, color_system=None, width=200),
     )
     yield buffer

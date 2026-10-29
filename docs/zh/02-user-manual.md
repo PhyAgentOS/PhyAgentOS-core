@@ -163,6 +163,8 @@ Agent 内 `/help` 列出全部命令。使用 `/provider [list|<provider>]`、
 供应商。上下键选择、Enter 确认后立即切换当前会话的供应商和模型，下一条消息使用新选择。
 Esc 或 Ctrl+C 取消选择并返回聊天。`/model list` 只查看列表；非终端渠道保留文字列表与编号选择。
 `/model list` 展示当前 Provider 已保存模型及编号，例如 `/model 2` 选择第 2 个模型。
+选择器用于终端聊天；`--runtime core` 在不带参数的 `/model`、`/effort` 上打开同一选择器，
+带参数写法和非终端输入仍保留文字列表。
 旧配置中的默认模型也会保留为选项。列表不代表已经验证聊天可用；不兼容的模型路由、
 思考程度会被拒绝，保留原选择。`none` 表示移除显式思考程度，采用模型默认行为。
 Custom endpoint 或 Azure 部署别名的能力未知时应使用 `none`；显式指定思考程度需要可识别的
@@ -364,6 +366,26 @@ paos agent -m "检查运动 Tool context，将夹爪向前移动 5 cm，并验�
 # 长期运行消息渠道、Cron、Heartbeat 与 Agent
 paos gateway
 ```
+
+`paos agent` 默认使用旧 runtime。新 Core runtime 需要显式启用：
+
+```bash
+paos agent --runtime core
+paos agent --runtime core -m "检查运动 Tool context。"
+```
+
+Core runtime 仍是实验入口：回复不流式输出，没有 `/correct`。在终端里，不带参数的 `/model` 与
+`/effort` 会打开与默认 runtime 相同的行内选择器；带参数的写法（如 `/model 2`、`/effort high`）
+和非终端输入仍使用文字列表。选择器里按 Esc 或 Ctrl+C 只关闭菜单，会话和当前选择都不变。
+`/help` 列出本地命令，`/tools [on|off]` 展开或收起本回合完整工具调用记录。运行中要停止，
+请在两秒内连续按两次 Esc：第一次显示黄色提示，第二次请求本地取消；它不能证明远端动作已停。
+非终端输入捕获不到 Esc，请用 Ctrl+C 中断本地回合。`/stop` 不是命令，也不会提交模型回合；
+未知斜杠命令在本地拒绝。session/model 一行在输入框上方；运行中隐藏 `You:` 和光标，普通按键
+不进入输入框（已有草稿保留），不会暗中排队。运行中的回合显示带耗时的转圈，并在准备、思考、
+调用工具、本地停止之间切换；底部工具区显示最近 4 次调用以及隐藏数量和总数。它的历史存在
+`<workspace>/sessions/core.db`；默认 runtime 继续用 `<workspace>/sessions/` 下的 JSONL。
+两份历史不导入、不合并。Core 失败时直接退出，不会回退到旧 runtime。fleet 模式仍要求默认
+runtime。
 
 ## 5. 检查 Tool context
 

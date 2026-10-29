@@ -5,13 +5,11 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-from PhyAgentOS.cli.commands import (
-    _apply_startup_overrides,
-    _make_evolution_provider,
-    _make_forge_verifier,
-    _make_provider,
-    app,
-)
+from PhyAgentOS.agent.bootstrap import build_forge_verifier
+from PhyAgentOS.cli.commands import app
+from PhyAgentOS.cli.configuration import apply_startup_overrides as _apply_startup_overrides
+from PhyAgentOS.cli.configuration import make_evolution_provider as _make_evolution_provider
+from PhyAgentOS.cli.configuration import make_provider as _make_provider
 from PhyAgentOS.config.loader import load_config, save_config
 from PhyAgentOS.config.schema import Config
 from PhyAgentOS.providers.discovery import ModelDiscoveryUnavailableError
@@ -95,7 +93,7 @@ def test_bedrock_startup_and_background_use_aws_credentials(config, monkeypatch,
     evolution, model = _make_evolution_provider(changed, main)
     assert evolution is main
     assert model == BEDROCK_MODEL
-    verifier = _make_forge_verifier(changed, main)
+    verifier = build_forge_verifier(changed, main)
     child_spec = verifier.service.provider_spec
     assert child_spec["provider_name"] == "bedrock"
     assert child_spec["api_key"] == ""

@@ -41,7 +41,29 @@ class AgentTaskError(RuntimeError):
 
 
 class AgentTaskBusyError(AgentTaskError):
-    """Raised when the global non-terminal AgentTask slot is occupied."""
+    """Raised when the global non-terminal AgentTask slot is occupied.
+
+    ``blocking`` carries the authoritative owner of the busy state: the task,
+    the invocation identity the Gateway confirmed (``None`` when dispatch was
+    never confirmed), the record status and semantics, and the originating
+    session. Callers can show these instead of asking the model to guess a
+    listing tool. It never reclassifies or resolves an unknown state.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        task_id: str | None = None,
+        invocation_id: str | None = None,
+        status: str | None = None,
+        blocking: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.task_id = task_id
+        self.invocation_id = invocation_id
+        self.status = status
+        self.blocking = tuple(dict(item) for item in (blocking or ()))
 
 
 class AgentTaskStatus(StrEnum):
@@ -277,16 +299,44 @@ class AgentTaskStore:
         """True when any past Action/Session invocation still has unknown remote state."""
         return bool(self.tasks_with_unknowns())
 
+    def unknown_remote_invocations(
+        self,
+    ) -> list[tuple[AgentTaskRecord, ToolExecutionRecord]]:
+        """Return the task and record for every unresolved Action/Session identity."""
+        found: list[tuple[AgentTaskRecord, ToolExecutionRecord]] = []
+        for task in self.tasks_with_unknowns():
+            for record in task.execution_records:
+                if (
+                    record.status == "unknown"
+                    and record.semantics in {"action", "session"}
+                ):
+                    found.append((task, record))
+        return found
+
     def create(self, record: AgentTaskRecord) -> AgentTaskRecord:
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
-                "SELECT task_id FROM agent_tasks WHERE status NOT IN (?, ?, ?) LIMIT 1",
+                "SELECT task_id, status FROM agent_tasks "
+                "WHERE status NOT IN (?, ?, ?) LIMIT 1",
                 tuple(item.value for item in TERMINAL_TASK_STATUSES),
             ).fetchone()
             if active is not None:
                 raise AgentTaskBusyError(
-                    f"AgentTask {active['task_id']} is still non-terminal"
+                    f"AgentTask {active['task_id']} is still non-terminal "
+                    f"(status={active['status']}); finish or cancel it before "
+                    "creating a new AgentTask",
+                    task_id=active["task_id"],
+                    status=active["status"],
+                    blocking=[
+                        {
+                            "task_id": active["task_id"],
+                            "invocation_id": None,
+                            "status": active["status"],
+                            "semantics": "task",
+                            "origin_session_key": None,
+                        }
+                    ],
                 )
             self._insert(connection, record)
             self._event(connection, record.task_id, "task_created", {})
@@ -462,12 +512,70 @@ class AgentTaskCoordinator:
         self.activation_manager = activation_manager
 
     def _assert_no_unknown_remote_state(self) -> None:
-        """Refuse a new AgentTask while an older invocation may still be moving."""
-        if self.store.has_unresolved_unknowns():
-            raise AgentTaskBusyError(
-                "an earlier Action/Session invocation still has unknown remote state; "
-                "reconcile it before creating a new AgentTask"
+        """Refuse a new AgentTask while an older invocation may still be moving.
+
+        The diagnostic names the authoritative blocking task and invocation,
+        including an explicitly absent invocation identity. It never asks the
+        caller to list tasks, resend the old Action/Session, or treat unknown
+        as terminal.
+        """
+        blockers = self.unknown_remote_blockers()
+        if not blockers:
+            return
+        first = blockers[0]
+        semantics = first["semantics"]
+        status_tool = (
+            "forge_tool_session_status"
+            if semantics == "session"
+            else "forge_tool_action_status"
+        )
+        task_id = first["task_id"]
+        invocation = first["invocation_id"]
+        if invocation:
+            recovery = (
+                "Reconcile it before creating a new AgentTask: call "
+                f'forge_task_get(task_id="{task_id}") and '
+                f'{status_tool}(task_id="{task_id}", invocation_id="{invocation}"). '
+                "Do not call forge_task_create again while this blocker is unchanged, "
+                "and do not resend the old Action/Session."
             )
+        else:
+            recovery = (
+                "Gateway identity was never confirmed for this record, so the existing "
+                "status tools cannot locate it (they require both task_id and "
+                "invocation_id). Keep the record unknown and verify the original "
+                "Gateway record; do not invent an invocation_id and do not resend the "
+                "old Action/Session. Do not call forge_task_create again while this "
+                "blocker is unchanged."
+            )
+        raise AgentTaskBusyError(
+            "an earlier Action/Session invocation still has unknown remote state: "
+            f'task_id="{task_id}" '
+            + (
+                f'invocation_id="{invocation}"'
+                if invocation
+                else "invocation_id=None"
+            )
+            + f" status={first['status']} semantics={semantics}. "
+            + recovery,
+            task_id=task_id,
+            invocation_id=invocation,
+            status=first["status"],
+            blocking=blockers,
+        )
+
+    def unknown_remote_blockers(self) -> list[dict[str, Any]]:
+        """Describe unresolved Action/Session records across every session."""
+        return [
+            {
+                "task_id": task.task_id,
+                "invocation_id": record.invocation_id,
+                "status": record.status,
+                "semantics": record.semantics,
+                "origin_session_key": task.origin_session_key,
+            }
+            for task, record in self.store.unknown_remote_invocations()
+        ]
 
     def create_task(
         self,

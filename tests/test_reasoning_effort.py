@@ -122,13 +122,13 @@ def test_openai_xhigh_reaches_native_payload():
 
 
 def test_new_effort_is_shared_by_startup_commands_and_session_listing():
-    from PhyAgentOS.cli.commands import _apply_startup_overrides
+    from PhyAgentOS.cli.configuration import apply_startup_overrides
 
     config = Config()
     config.agents.defaults.provider = "openai"
     config.agents.defaults.model = "gpt-5.2"
     config.providers.openai.api_key = "test"
-    changed = _apply_startup_overrides(config, None, None, "xhigh")
+    changed = apply_startup_overrides(config, None, None, "xhigh")
     assert changed.agents.defaults.reasoning_effort == "xhigh"
     service = ProviderService(changed)
     sessions = SessionRuntimes(service, service.resolve())
@@ -389,7 +389,7 @@ async def test_effort_picker_is_transactional(monkeypatch, model, command, resul
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    from PhyAgentOS.cli.providers import _interactive_model_command
+    from PhyAgentOS.cli.interaction.model_picker import _interactive_model_command
 
     config = Config()
     config.agents.defaults.provider = "openai"
@@ -398,7 +398,7 @@ async def test_effort_picker_is_transactional(monkeypatch, model, command, resul
     service = ProviderService(config)
     startup = service.resolve()
     sessions = SessionRuntimes(service, startup)
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
             if result == "cancel":

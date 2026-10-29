@@ -22,6 +22,7 @@ botpy.log
 nano.*.save
 SECURITY.md
 .meta
+runtime_test/
 *.codegraph
 uv.lock
 plan/

@@ -11,13 +11,11 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from PhyAgentOS.cli.commands import (
-    _apply_startup_overrides,
-    _make_evolution_provider,
-    _make_forge_verifier,
-    _make_provider,
-    app,
-)
+from PhyAgentOS.agent.bootstrap import build_forge_verifier
+from PhyAgentOS.cli.commands import app
+from PhyAgentOS.cli.configuration import apply_startup_overrides as _apply_startup_overrides
+from PhyAgentOS.cli.configuration import make_evolution_provider as _make_evolution_provider
+from PhyAgentOS.cli.configuration import make_provider as _make_provider
 from PhyAgentOS.config.loader import load_config, save_config
 from PhyAgentOS.config.schema import Config
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -145,7 +143,7 @@ def test_startup_provider_override_does_not_retarget_model_based_background_prov
 
     main = ProviderService(changed).resolve()
     evolution, model = _make_evolution_provider(changed, main.provider)
-    verifier = _make_forge_verifier(changed, main.provider)
+    verifier = build_forge_verifier(changed, main.provider)
     child_spec = verifier.service.provider_spec
     child = _provider(child_spec, 30)
 
@@ -183,7 +181,7 @@ def test_background_provider_inheritance_and_explicit_override(config, backgroun
     main = RecordingProvider()
 
     evolution, model = _make_evolution_provider(changed, main)
-    verifier = _make_forge_verifier(changed, main)
+    verifier = build_forge_verifier(changed, main)
     child_spec = verifier.service.provider_spec
     assert model == "gpt-5"
     if background_provider:
@@ -228,7 +226,7 @@ def test_independent_background_model_does_not_inherit_main_effort(
     main = ProviderService(config).resolve().provider
 
     evolution, model = _make_evolution_provider(config, main)
-    verifier = _make_forge_verifier(config, main)
+    verifier = build_forge_verifier(config, main)
 
     assert model == background_model
     assert evolution is not main
@@ -245,7 +243,7 @@ def test_background_same_target_keeps_startup_effort(config):
     main = ProviderService(config).resolve().provider
 
     evolution, model = _make_evolution_provider(config, main)
-    verifier = _make_forge_verifier(config, main)
+    verifier = build_forge_verifier(config, main)
 
     assert evolution is main
     assert model == config.agents.defaults.model
@@ -373,9 +371,9 @@ def test_invalid_json_cannot_be_overwritten_by_management_commands(config_path):
 
 
 def test_failed_wizard_connection_test_preserves_original_config(config_path, monkeypatch):
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     answers = iter(["new-secret", "https://new.example.test/v1", "{}", "Y"])
-    monkeypatch.setattr("PhyAgentOS.cli.providers._prompt", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr("PhyAgentOS.cli.command_groups.provider_commands._prompt", lambda *args, **kwargs: next(answers))
     monkeypatch.setattr(
         ProviderService, "discover_models", AsyncMock(side_effect=ProviderError("Authentication failed"))
     )
@@ -415,10 +413,10 @@ def test_cli_secret_sources(source, monkeypatch, config_path, tmp_path):
 @pytest.mark.parametrize("arguments", [[], ["deepseek"], ["deepseek", "--api-key-stdin"]])
 def test_non_tty_missing_parameters_never_prompt(arguments, config_path, monkeypatch):
     monkeypatch.setattr(
-        "PhyAgentOS.cli.providers._select_provider", lambda *_: pytest.fail("selector opened")
+        "PhyAgentOS.cli.interaction.model_picker._select_provider", lambda *_: pytest.fail("selector opened")
     )
     monkeypatch.setattr(
-        "PhyAgentOS.cli.providers._prompt", lambda *_args, **_kwargs: pytest.fail("prompt opened")
+        "PhyAgentOS.cli.command_groups.provider_commands._prompt", lambda *_args, **_kwargs: pytest.fail("prompt opened")
     )
     before = config_path.read_bytes()
     result = CliRunner().invoke(app, ["provider", "configure", *arguments, "-c", str(config_path)])
@@ -428,8 +426,8 @@ def test_non_tty_missing_parameters_never_prompt(arguments, config_path, monkeyp
 
 @pytest.mark.parametrize("cancel_at", [0, 1, 2, 3, 4])
 def test_wizard_cancellation_never_writes_partial_settings(cancel_at, config_path, monkeypatch):
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
-    monkeypatch.setattr("PhyAgentOS.cli.providers._select_provider", lambda _: "openai")
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._select_provider", lambda _: "openai")
     answers = iter(["new-hidden-secret", "https://new.example.test/v1", "{}", "n", "gpt-5"])
     count = 0
 
@@ -440,7 +438,7 @@ def test_wizard_cancellation_never_writes_partial_settings(cancel_at, config_pat
         count += 1
         return next(answers)
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._prompt", prompt)
+    monkeypatch.setattr("PhyAgentOS.cli.command_groups.provider_commands._prompt", prompt)
     before = config_path.read_bytes()
     result = CliRunner().invoke(app, ["provider", "configure", "-c", str(config_path)])
     assert result.exit_code == 1
@@ -450,7 +448,7 @@ def test_wizard_cancellation_never_writes_partial_settings(cancel_at, config_pat
 
 
 def test_selector_is_inline_keyboard_only_and_can_cancel(config, monkeypatch):
-    from PhyAgentOS.cli.providers import _select_provider
+    from PhyAgentOS.cli.interaction.model_picker import _select_provider
 
     captured = {}
 
@@ -479,7 +477,7 @@ def test_selector_real_keyboard_cancel(config, keypress):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    from PhyAgentOS.cli.providers import _select_provider
+    from PhyAgentOS.cli.interaction.model_picker import _select_provider
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
@@ -493,7 +491,7 @@ def test_selector_real_keyboard_selection(config):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    from PhyAgentOS.cli.providers import _select_provider
+    from PhyAgentOS.cli.interaction.model_picker import _select_provider
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
@@ -823,9 +821,9 @@ def test_discovery_timeout_is_safe(config, discovery_transport):
 
 
 def test_wizard_discovers_adds_models_and_reuses_them(config_path, monkeypatch, discovery_transport):
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     answers = iter(["new-secret", "https://new.example.test/v1", "{}", "Y"])
-    monkeypatch.setattr("PhyAgentOS.cli.providers._prompt", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr("PhyAgentOS.cli.command_groups.provider_commands._prompt", lambda *args, **kwargs: next(answers))
     requests = []
 
     def respond(request):
@@ -845,7 +843,7 @@ def test_wizard_discovers_adds_models_and_reuses_them(config_path, monkeypatch, 
         assert models == ["gpt-5", "gpt-4o"]
         return ["gpt-4o"]
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._select_models", select)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._select_models", select)
     runner = CliRunner()
     result = runner.invoke(app, ["provider", "configure", "openai", "-c", str(config_path)])
     assert result.exit_code == 0, result.output
@@ -862,9 +860,9 @@ def test_wizard_discovers_adds_models_and_reuses_them(config_path, monkeypatch, 
 
 @pytest.mark.parametrize("discover", [False, True])
 def test_wizard_manual_fallback(config_path, monkeypatch, discovery_transport, discover):
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     answers = iter(["new-secret", "https://new.example.test/v1", "{}", "Y" if discover else "n", "gpt-4o"])
-    monkeypatch.setattr("PhyAgentOS.cli.providers._prompt", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr("PhyAgentOS.cli.command_groups.provider_commands._prompt", lambda *args, **kwargs: next(answers))
 
     def respond(request):
         assert discover, "Skipping the test must not make network requests"
@@ -878,15 +876,15 @@ def test_wizard_manual_fallback(config_path, monkeypatch, discovery_transport, d
 
 
 def test_cancelling_model_picker_keeps_existing_file(config_path, monkeypatch):
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     answers = iter(["new-secret", "https://new.example.test/v1", "{}", "Y"])
-    monkeypatch.setattr("PhyAgentOS.cli.providers._prompt", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr("PhyAgentOS.cli.command_groups.provider_commands._prompt", lambda *args, **kwargs: next(answers))
     monkeypatch.setattr(ProviderService, "discover_models", AsyncMock(return_value=["gpt-5"]))
 
     def cancel(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._select_models", cancel)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._select_models", cancel)
     before = config_path.read_bytes()
     result = CliRunner().invoke(app, ["provider", "configure", "openai", "-c", str(config_path)])
     assert result.exit_code == 1
@@ -922,7 +920,7 @@ def test_model_picker_real_keyboard(multiple, keys, expected):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    from PhyAgentOS.cli.providers import _select_models
+    from PhyAgentOS.cli.interaction.model_picker import _select_models
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
@@ -936,7 +934,7 @@ def test_model_picker_real_keyboard_cancel(keys):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    from PhyAgentOS.cli.providers import _select_models
+    from PhyAgentOS.cli.interaction.model_picker import _select_models
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
@@ -947,7 +945,7 @@ def test_model_picker_real_keyboard_cancel(keys):
 
 @pytest.mark.parametrize("command", ["show", "test", "use", "remove"])
 def test_provider_commands_offer_picker_when_name_is_omitted(command, config_path, monkeypatch):
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     selections = []
 
     def select(service, *, action):
@@ -955,8 +953,8 @@ def test_provider_commands_offer_picker_when_name_is_omitted(command, config_pat
         assert service.config.providers.custom.api_base == "https://custom.example.test/v1"
         return "custom"
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._select_provider", select)
-    monkeypatch.setattr("PhyAgentOS.cli.providers._select_models", lambda models, **kwargs: [models[0]])
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._select_provider", select)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._select_models", lambda models, **kwargs: [models[0]])
     test = AsyncMock(return_value="Connection successful.")
     monkeypatch.setattr(ProviderService, "test", test)
     result = CliRunner().invoke(app, ["provider", command, "-c", str(config_path)])
@@ -977,9 +975,9 @@ def test_provider_commands_offer_picker_when_name_is_omitted(command, config_pat
 
 @pytest.mark.parametrize("command", ["show", "test", "use", "remove", "login"])
 def test_provider_commands_without_tty_require_name(command, config_path, monkeypatch):
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: False)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: False)
     monkeypatch.setattr(
-        "PhyAgentOS.cli.providers._select_provider", lambda *args, **kwargs: pytest.fail("picker opened"),
+        "PhyAgentOS.cli.interaction.model_picker._select_provider", lambda *args, **kwargs: pytest.fail("picker opened"),
     )
     before = config_path.read_bytes()
     args = ["provider", command]
@@ -993,12 +991,12 @@ def test_provider_commands_without_tty_require_name(command, config_path, monkey
 
 @pytest.mark.parametrize("command", ["show", "test", "use", "remove"])
 def test_provider_command_picker_cancel_has_no_side_effects(command, config_path, monkeypatch):
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
 
     def cancel(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._select_provider", cancel)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._select_provider", cancel)
     test = AsyncMock()
     monkeypatch.setattr(ProviderService, "test", test)
     before = config_path.read_bytes()
@@ -1013,11 +1011,11 @@ def test_provider_command_picker_cancel_has_no_side_effects(command, config_path
 def test_login_accepts_picker_and_case_insensitive_names(argument, monkeypatch):
     from unittest.mock import Mock
 
-    from PhyAgentOS.cli.commands import _LOGIN_HANDLERS
+    from PhyAgentOS.cli.command_groups.provider_commands import _LOGIN_HANDLERS
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     selected = Mock(return_value="openai_codex")
-    monkeypatch.setattr("PhyAgentOS.cli.providers._select_provider", selected)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._select_provider", selected)
     handler = Mock()
     monkeypatch.setitem(_LOGIN_HANDLERS, "openai_codex", handler)
     result = CliRunner().invoke(app, ["provider", "login", *([argument] if argument else [])])
@@ -1030,7 +1028,7 @@ def test_login_accepts_picker_and_case_insensitive_names(argument, monkeypatch):
 
 @pytest.mark.parametrize("action", ["Test", "Use", "Show", "Remove", "Login"])
 def test_provider_picker_filters_rows_for_action(config, monkeypatch, action):
-    from PhyAgentOS.cli.providers import _select_provider
+    from PhyAgentOS.cli.interaction.model_picker import _select_provider
 
     config.providers.deepseek.default_model = "deepseek-chat"  # Stored but missing credentials.
     rendered = []
@@ -1057,7 +1055,7 @@ def test_provider_picker_filters_rows_for_action(config, monkeypatch, action):
 
 
 def test_provider_picker_handles_empty_configuration(monkeypatch):
-    from PhyAgentOS.cli.providers import _select_provider
+    from PhyAgentOS.cli.interaction.model_picker import _select_provider
 
     service = ProviderService(Config())
     monkeypatch.setattr(service, "list", lambda: [])
@@ -1073,10 +1071,10 @@ def test_bare_model_opens_async_picker_and_switches_provider(
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    from PhyAgentOS.cli.providers import _interactive_model_command
+    from PhyAgentOS.cli.interaction.model_picker import _interactive_model_command
 
     config.providers.custom.default_model = "gpt-5"  # Same model ID at a different endpoint.
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     monkeypatch.setattr(
         ProviderService, "create_provider", staticmethod(lambda _s, _c, model, _e: RecordingProvider(model)),
     )
@@ -1105,10 +1103,10 @@ def test_bare_model_opens_async_picker_and_switches_provider(
 
 
 def test_model_picker_failed_selection_preserves_runtime(config, monkeypatch):
-    from PhyAgentOS.cli.providers import _interactive_model_command
+    from PhyAgentOS.cli.interaction.model_picker import _interactive_model_command
 
     config.providers.openai.models = ["gpt-5", "gpt-4o"]
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     monkeypatch.setattr(
         ProviderService, "create_provider", staticmethod(lambda _s, _c, model, _e: RecordingProvider(model)),
     )
@@ -1120,7 +1118,7 @@ def test_model_picker_failed_selection_preserves_runtime(config, monkeypatch):
         async def run_async(self):
             return ["OpenAI / gpt-4o"]
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._model_picker", lambda *args, **kwargs: Picker())
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._model_picker", lambda *args, **kwargs: Picker())
     response = asyncio.run(_interactive_model_command("/model", sessions, "cli:alice"))
     assert "not supported" in response
     assert sessions.get("cli:alice") is startup
@@ -1128,11 +1126,11 @@ def test_model_picker_failed_selection_preserves_runtime(config, monkeypatch):
 
 @pytest.mark.parametrize("command,tty", [("/model list", True), ("/model gpt-4o", True), ("/model", False)])
 def test_explicit_model_commands_and_non_tty_keep_text_flow(config, monkeypatch, command, tty):
-    from PhyAgentOS.cli.providers import _interactive_model_command
+    from PhyAgentOS.cli.interaction.model_picker import _interactive_model_command
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: tty)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: tty)
     monkeypatch.setattr(
-        "PhyAgentOS.cli.providers._model_picker", lambda *args, **kwargs: pytest.fail("picker opened"),
+        "PhyAgentOS.cli.interaction.model_picker._model_picker", lambda *args, **kwargs: pytest.fail("picker opened"),
     )
     service = ProviderService(config)
     sessions = SessionRuntimes(service, service.resolve())
@@ -1142,9 +1140,9 @@ def test_explicit_model_commands_and_non_tty_keep_text_flow(config, monkeypatch,
 def test_chat_after_model_picker_uses_selected_provider(config, tmp_path, monkeypatch):
     from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.queue import MessageBus
-    from PhyAgentOS.cli.providers import _interactive_model_command
+    from PhyAgentOS.cli.interaction.model_picker import _interactive_model_command
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._interactive", lambda: True)
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
     monkeypatch.setattr(
         ProviderService, "create_provider", staticmethod(lambda _s, _c, model, _e: RecordingProvider(model)),
     )
@@ -1153,7 +1151,7 @@ def test_chat_after_model_picker_uses_selected_provider(config, tmp_path, monkey
         async def run_async(self):
             return ["Custom / gpt-5.2"]
 
-    monkeypatch.setattr("PhyAgentOS.cli.providers._model_picker", lambda *args, **kwargs: Picker())
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._model_picker", lambda *args, **kwargs: Picker())
 
     async def scenario():
         original = RecordingProvider()
@@ -1179,7 +1177,7 @@ def test_chat_after_model_picker_uses_selected_provider(config, tmp_path, monkey
 def test_remove_ollama_persists_empty_settings_and_clears_default(
     config, config_path, monkeypatch, default_provider,
 ):
-    from PhyAgentOS.cli.providers import _select_provider
+    from PhyAgentOS.cli.interaction.model_picker import _select_provider
     from PhyAgentOS.config.schema import ProviderConfig
 
     config.agents.defaults.provider = default_provider
@@ -1403,7 +1401,7 @@ async def test_verifier_child_keeps_its_own_credentials_and_options(config, name
     config.agents.verification.provider = name
     config.agents.verification.model = "gpt-5.2"
     config.agents.verification.service_enabled = True
-    verifier = _make_forge_verifier(config, RecordingProvider())
+    verifier = build_forge_verifier(config, RecordingProvider())
     spec = verifier.service.provider_spec
     with monkeypatch.context() as patch:
         patch.setattr(
@@ -1432,7 +1430,7 @@ def test_verifier_rejects_removed_provider_before_starting_child(config):
     config.agents.verification.model = "gpt-5.2"
     config.providers.custom.enabled = False
     with pytest.raises(ProviderError, match="not configured"):
-        _make_forge_verifier(config, RecordingProvider())
+        build_forge_verifier(config, RecordingProvider())
 
 
 async def test_switch_during_transient_failure_keeps_retry_on_original_provider(
@@ -1495,3 +1493,25 @@ def test_failed_provider_initialization_keeps_session_and_hides_error(config, mo
     assert "private" not in str(caught.value)
     assert sessions.get("alice") is startup
     assert sessions.get("bob") is startup
+
+
+def test_model_menu_cancel_keeps_the_current_session_selection(config, monkeypatch):
+    from PhyAgentOS.cli.interaction.model_picker import _interactive_model_command
+
+    monkeypatch.setattr("PhyAgentOS.cli.interaction.model_picker._interactive", lambda: True)
+
+    class Picker:
+        async def run_async(self):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(
+        "PhyAgentOS.cli.interaction.model_picker._model_picker", lambda *args, **kwargs: Picker()
+    )
+    service = ProviderService(config)
+    startup = service.resolve()
+    sessions = SessionRuntimes(service, startup)
+
+    response = asyncio.run(_interactive_model_command("/model", sessions, "cli:alice"))
+    assert "cancelled" in response and "unchanged" in response
+    assert sessions.get("cli:alice") is startup
+    assert sessions.get("cli:bob") is startup

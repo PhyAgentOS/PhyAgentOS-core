@@ -40,7 +40,7 @@ from PhyAgentOS.agent.core.types import (
     ToolRegistration,
     ToolStatus,
 )
-from PhyAgentOS.forge.task import AgentTaskCoordinator, AgentTaskRecord
+from PhyAgentOS.forge.task import AgentTaskBusyError, AgentTaskCoordinator, AgentTaskRecord
 from PhyAgentOS.forge.tool_client import ForgeToolClient
 
 from .forge_task_tools import TASK_TOOL_DEFINITIONS, execute_task_tool
@@ -141,7 +141,9 @@ def _domain_refs(
         return None
 
     return DomainRefs(
-        task_id=value(data, "task_id") or value(arguments, "task_id"),
+        task_id=value(data, "task_id")
+        or value(arguments, "task_id")
+        or value(error, "task_id"),
         revision_id=value(data, "revision_id", "active_revision_id"),
         invocation_id=value(data, "invocation_id")
         or value(arguments, "invocation_id")
@@ -209,13 +211,17 @@ def _failed_outcome(
     data: Mapping[str, Any] | None = None,
     arguments: Mapping[str, Any] | None = None,
     error_payload: Mapping[str, Any] | None = None,
+    content: Mapping[str, Any] | None = None,
 ) -> ToolOutcome:
+    body: dict[str, Any] = {"data": dict(data) if data is not None else None}
+    if content:
+        body.update(content)
     return ToolOutcome(
         tool_call_id=call.tool_call_id,
         tool_name=call.name,
         status=status,
         text=message,
-        content={"data": dict(data) if data is not None else None},
+        content=body,
         error=ToolError(code, message),
         domain_refs=_domain_refs(data, arguments or {}, error_payload),
     )
@@ -271,12 +277,23 @@ def _error_outcome(
             error_payload=error,
         )
     if error_type == "agent_task":
+        content: dict[str, Any] = {}
+        blocking = error.get("blocking")
+        if isinstance(blocking, list) and blocking:
+            content["blocking"] = blocking
+        if isinstance(error.get("task_id"), str):
+            content["blocked_task_id"] = error["task_id"]
+        if "invocation_id" in error:
+            content["blocked_invocation_id"] = error["invocation_id"]
+        if isinstance(error.get("status"), str):
+            content["blocked_status"] = error["status"]
         return _failed_outcome(
             call,
             "forge_agent_task",
             message,
             arguments=arguments,
             error_payload=error,
+            content=content or None,
         )
     if error_type == "runtime":
         return _failed_outcome(
@@ -485,12 +502,26 @@ class ForgeCapability:
             arguments = call.arguments_dict()
             # Session identity is explicit on this path and cannot come from
             # the model's arguments.
-            payload = await execute_task_tool(
-                name,
-                self._coordinator,
-                arguments,
-                session_id=context.session_id,
-            )
+            try:
+                payload = await execute_task_tool(
+                    name,
+                    self._coordinator,
+                    arguments,
+                    session_id=context.session_id,
+                )
+            except AgentTaskBusyError as exc:
+                payload = {
+                    "ok": False,
+                    "error": {
+                        "type": "agent_task",
+                        "code": "forge_agent_task",
+                        "message": str(exc),
+                        "task_id": exc.task_id,
+                        "invocation_id": exc.invocation_id,
+                        "status": exc.status,
+                        "blocking": list(exc.blocking),
+                    },
+                }
             return _outcome(call, payload, arguments)
 
         return handle

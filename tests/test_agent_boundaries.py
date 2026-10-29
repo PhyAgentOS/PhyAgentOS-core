@@ -74,21 +74,37 @@ def test_legacy_modules_import_from_agent_legacy_and_old_paths_have_no_shims() -
     assert importlib.util.find_spec("PhyAgentOS.agent.tools") is None
 
 
-def test_all_non_generated_source_imports_use_agent_legacy_not_old_agent_paths() -> None:
-    allowed = (
-        "PhyAgentOS.agent.core",
+# The new agent package is the only place allowed to use ``PhyAgentOS.agent``.
+# Each module is listed explicitly so a new top-level agent module cannot be
+# mistaken for the old loop/tools/experience paths that moved to agent_legacy.
+_NEW_AGENT_MODULES = frozenset(
+    {
+        "PhyAgentOS.agent",
         "PhyAgentOS.agent.capabilities",
+        "PhyAgentOS.agent.composition",
+        "PhyAgentOS.agent.core",
+        "PhyAgentOS.agent.bootstrap",
+        "PhyAgentOS.agent.services",
+    }
+)
+
+
+def _is_new_agent_module(name: str) -> bool:
+    return any(
+        name == module or name.startswith(f"{module}.")
+        for module in _NEW_AGENT_MODULES
     )
+
+
+def test_all_non_generated_source_imports_use_agent_legacy_not_old_agent_paths() -> None:
     offenders: dict[str, list[str]] = {}
     for path in PACKAGE_DIR.rglob("*.py"):
         imports = _imported_modules(path.read_text(encoding="utf-8"))
         bad = sorted(
             name
             for name in imports
-            if name == "PhyAgentOS.agent" or (
-                name.startswith("PhyAgentOS.agent.")
-                and not name.startswith(allowed)
-            )
+            if (name == "PhyAgentOS.agent" or name.startswith("PhyAgentOS.agent."))
+            and not _is_new_agent_module(name)
         )
         if bad:
             offenders[str(path.relative_to(REPO_ROOT))] = bad
@@ -144,6 +160,39 @@ def test_importing_new_composition_does_not_load_agent_legacy() -> None:
             "import PhyAgentOS.agent.capabilities.forge_capability",
             "import PhyAgentOS.agent.capabilities.forge_task_tools",
             "import PhyAgentOS.agent.capabilities.forge_tool_api",
+            "loaded = [",
+            "    name for name in sys.modules",
+            "    if name == 'PhyAgentOS.agent_legacy'",
+            "    or name.startswith('PhyAgentOS.agent_legacy.')",
+            "]",
+            "assert loaded == [], loaded",
+        ]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_core_cli_modules_import_without_agent_legacy() -> None:
+    """The Core entry modules must not pull the default legacy runtime in.
+
+    ``PhyAgentOS.cli.commands`` still imports the legacy module explicitly
+    because legacy remains the default runtime; that transitional dependency is
+    deliberately not covered by this check.
+    """
+    code = "\n".join(
+        [
+            "import sys",
+            "import PhyAgentOS.cli.command_groups.agent_commands",
+            "import PhyAgentOS.cli.configuration",
+            "import PhyAgentOS.cli.interaction.agent_output",
+            "import PhyAgentOS.cli.interaction.interactive_session",
+            "import PhyAgentOS.cli.interaction.terminal_input",
             "loaded = [",
             "    name for name in sys.modules",
             "    if name == 'PhyAgentOS.agent_legacy'",

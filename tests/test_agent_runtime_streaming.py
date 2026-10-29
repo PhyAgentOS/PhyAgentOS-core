@@ -85,17 +85,19 @@ class _StubAgentBase:
 
 def _invoke_cli_agent(tmp_path, monkeypatch, agent_cls):
     from PhyAgentOS.cli import commands
+    from PhyAgentOS.cli.legacy import legacy_agent
+    from PhyAgentOS.config.schema import Config
 
-    config = commands.Config()
+    config = Config()
     config.agents.defaults.workspace = str(tmp_path)
 
-    monkeypatch.setattr(commands, "_load_command_config", lambda *a, **k: config)
-    monkeypatch.setattr(commands, "_apply_startup_overrides", lambda cfg, *a, **k: cfg)
-    monkeypatch.setattr(commands, "_print_deprecated_memory_window_notice", lambda c: None)
-    monkeypatch.setattr(commands, "_make_provider", lambda c: object())
-    monkeypatch.setattr(commands, "_make_evolution_provider", lambda c, p: (None, None))
+    monkeypatch.setattr(legacy_agent, "load_command_config", lambda *a, **k: config)
+    monkeypatch.setattr(legacy_agent, "apply_startup_overrides", lambda cfg, *a, **k: cfg)
+    monkeypatch.setattr(legacy_agent, "print_deprecated_memory_window_notice", lambda c: None)
+    monkeypatch.setattr(legacy_agent, "make_provider", lambda c: object())
+    monkeypatch.setattr(legacy_agent, "make_evolution_provider", lambda c, p: (None, None))
     monkeypatch.setattr(
-        commands, "_make_forge_components", lambda c, p: (None, None, None, None)
+        legacy_agent, "build_forge_components", lambda c, p: (None, None, None, None)
     )
     monkeypatch.setattr("PhyAgentOS.cron.service.CronService", lambda *a, **k: object())
     monkeypatch.setattr("PhyAgentOS.agent_legacy.loop.AgentLoop", agent_cls)
@@ -520,7 +522,7 @@ async def test_stream_done_reasoning_reaches_both_assistant_messages(
 
 
 def test_think_filter_hides_closed_and_unclosed_blocks() -> None:
-    from PhyAgentOS.cli.commands import _ThinkFilter
+    from PhyAgentOS.cli.legacy.legacy_agent import _ThinkFilter
 
     split = _ThinkFilter()
     assert split.feed("<thi") == ""
@@ -688,7 +690,7 @@ async def test_cancel_chain_cancels_subagents_and_forge_task(tmp_path) -> None:
 async def test_cron_delivery_skips_empty_and_message_tool_output(
     tmp_path,
 ) -> None:
-    from PhyAgentOS.cli.commands import _deliver_cron_response
+    from PhyAgentOS.cli.command_groups.gateway_commands import _deliver_cron_response
 
     job = SimpleNamespace(payload=SimpleNamespace(
         deliver=True, to="chat", channel="telegram", message="run",

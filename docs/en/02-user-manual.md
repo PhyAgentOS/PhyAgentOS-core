@@ -250,6 +250,8 @@ In terminal chat, bare `/model` opens a picker of saved models across all config
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
 session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.
 `/model list` only displays the list. Non-terminal channels retain text lists and numbered selection.
+The picker belongs to terminal chat; `--runtime core` opens the same selector for a bare `/model`
+or `/effort` and keeps text lists for the argument forms and non-terminal input.
 
 Precedence is **session override → process startup override → config default**. Each running turn
 keeps its provider/model/effort through all retries and tool calls. Changes affect subsequent turns
@@ -392,6 +394,30 @@ paos agent -m "Inspect the motion Tool context, move the gripper forward 5 cm, a
 # long-running channels, Cron, Heartbeat, and Agent
 paos gateway
 ```
+
+`paos agent` uses the legacy runtime by default. The new Core runtime is opt-in:
+
+```bash
+paos agent --runtime core
+paos agent --runtime core -m "Inspect the motion Tool context."
+```
+
+The Core runtime is experimental: replies are not streamed and `/correct` is unavailable. On a
+terminal, `/model` and `/effort` without an argument open the same inline selector as the default
+runtime; text commands (`/model 2`, `/effort high`) and non-terminal input keep the text list.
+Interrupting a selector with Esc or Ctrl+C leaves the session and its selection unchanged. Locally,
+`/help` lists the commands and `/tools [on|off]` shows or hides this turn's full tool-call record.
+To stop a running turn, press Esc twice within two seconds: the first Esc shows a yellow hint and
+the second requests local cancellation; it never proves that remote actions stopped. Non-terminal
+input cannot capture Esc, so use Ctrl+C to interrupt the local turn. `/stop` is not a command and
+never submits a model turn. Unknown slash commands are rejected without a model turn. The
+session/model line sits above the input; while a turn runs the `You:` marker and cursor are hidden
+and ordinary keys are ignored (an existing draft is kept), so nothing is silently queued. The
+running turn shows a spinner with elapsed time, switching between preparing, thinking, calling a
+tool, and stopping locally; the bottom toolbar lists the last four tool calls plus hidden and total
+counts. Its history lives in `<workspace>/sessions/core.db`; the default runtime keeps JSONL
+history under `<workspace>/sessions/`. The two stores are not imported or merged. A Core failure
+exits; it does not fall back to the legacy runtime. Fleet mode still requires the default runtime.
 
 ## 5. Inspect Tool context
 

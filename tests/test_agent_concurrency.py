@@ -219,13 +219,13 @@ async def test_chat_turns_get_a_friendly_queue_full_reply(tmp_path):
 
 
 async def test_scheduler_skips_a_queue_full_turn(tmp_path):
-    from PhyAgentOS.cli import commands
+    from PhyAgentOS.cli.command_groups import gateway_commands
 
     class _FullAgent:
         async def process_direct(self, **kwargs):
             raise SessionQueueFullError("Session cron:1 already has 8 queued task(s)")
 
-    assert await commands._process_direct_for_scheduler(
+    assert await gateway_commands._process_direct_for_scheduler(
         _FullAgent(), source="cron:1", content="run",
     ) is None
 
@@ -238,7 +238,7 @@ async def test_scheduler_skips_a_queue_full_turn(tmp_path):
         async def publish_outbound(self, message):
             delivered.append(message)
 
-    await commands._deliver_cron_response(job, None, _Bus())
+    await gateway_commands._deliver_cron_response(job, None, _Bus())
     assert delivered == []
 
 

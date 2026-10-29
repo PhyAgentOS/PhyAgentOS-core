@@ -641,6 +641,17 @@ async def test_bare_cancelled_dispatch_leaves_unknown_without_identity(tmp_path)
     with pytest.raises(AgentTaskError, match="unknown remote state"):
         await coordinator.start_action(task.task_id, "motion.move_pose", {})
     assert client.action_calls == 1
+    with pytest.raises(AgentTaskBusyError) as caught:
+        coordinator.create_task(task_description="again", verification=_contract())
+    assert caught.value.task_id == task.task_id
+    assert caught.value.invocation_id is None
+    message = str(caught.value)
+    assert "Gateway identity was never confirmed" in message
+    assert "forge_tool_action_status" not in message
+    assert "forge_tool_session_status" not in message
+    assert "cannot locate it" in message
+    assert "do not invent an invocation_id" in message
+    assert "Do not call forge_task_create again" in message
 
 
 async def test_cancelled_dispatch_uses_grace_identity_and_requests_stop(tmp_path) -> None:
@@ -897,6 +908,107 @@ async def test_reconcile_confirms_terminal_state_for_unknown_record_without_rese
     assert reconciled.execution_records[0].status == "cancelled"
     assert client.action_calls == 1
     assert client.cancel_calls == []
+
+
+async def test_busy_unknown_reports_authoritative_cross_session_identity(tmp_path) -> None:
+    client = ScriptedCancelClient(["cancelled"])
+    coordinator = _coordinator(tmp_path, client=client)
+    task = coordinator.create_task(
+        task_description="move",
+        verification=_contract(),
+        origin_session_key="cli:other",
+    )
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+    coordinator.observe_action(
+        task.task_id,
+        invocation_id,
+        {"ok": True, "data": {"phase": "unknown"}},
+    )
+    # A task can already be terminal while its last invocation is still unknown.
+    coordinator.store.update(
+        task.task_id,
+        lambda current: setattr(current, "status", AgentTaskStatus.CANCELLED),
+        event_type="test_mark_terminal",
+    )
+
+    with pytest.raises(AgentTaskBusyError) as caught:
+        coordinator.create_task(
+            task_description="again",
+            verification=_contract(),
+            origin_session_key="cli:mine",
+        )
+
+    error = caught.value
+    assert error.task_id == task.task_id
+    assert error.invocation_id == invocation_id
+    assert error.status == "unknown"
+    assert error.blocking[0]["task_id"] == task.task_id
+    assert error.blocking[0]["invocation_id"] == invocation_id
+    assert error.blocking[0]["origin_session_key"] == "cli:other"
+    message = str(error)
+    assert "unknown remote state" in message
+    assert task.task_id in message and invocation_id in message
+    assert (
+        f'forge_tool_action_status(task_id="{task.task_id}", '
+        f'invocation_id="{invocation_id}")'
+    ) in message
+    assert "Do not call forge_task_create again" in message
+    assert "do not resend" in message
+
+
+async def test_terminal_unknown_cleared_by_gateway_get_allows_a_new_task(tmp_path) -> None:
+    client = ScriptedCancelClient(["cancelled"])
+    coordinator = _coordinator(tmp_path, client=client)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+    coordinator.observe_action(
+        task.task_id,
+        invocation_id,
+        {"ok": True, "data": {"phase": "unknown"}},
+    )
+    coordinator.store.update(
+        task.task_id,
+        lambda current: setattr(current, "status", AgentTaskStatus.CANCELLED),
+        event_type="test_mark_terminal",
+    )
+    with pytest.raises(AgentTaskBusyError):
+        coordinator.create_task(task_description="again", verification=_contract())
+
+    assert await coordinator.reconcile_nonterminal() is None
+    assert coordinator.get_task(task.task_id).execution_records[0].status == "cancelled"
+    assert client.action_calls == 1
+    assert client.status_calls == [invocation_id]
+
+    created = coordinator.create_task(task_description="again", verification=_contract())
+    assert created.task_id != task.task_id
+
+
+async def test_unrecoverable_unknown_keeps_blocking_with_the_same_identity(tmp_path) -> None:
+    client = UnreachableCancelClient()
+    coordinator = _coordinator(tmp_path, client=client)
+    task = coordinator.create_task(task_description="move", verification=_contract())
+    accepted = await coordinator.start_action(task.task_id, "motion.move_pose", {})
+    invocation_id = accepted["data"]["invocation_id"]
+    coordinator.observe_action(
+        task.task_id,
+        invocation_id,
+        {"ok": True, "data": {"phase": "unknown"}},
+    )
+    coordinator.store.update(
+        task.task_id,
+        lambda current: setattr(current, "status", AgentTaskStatus.CANCELLED),
+        event_type="test_mark_terminal",
+    )
+
+    assert await coordinator.reconcile_nonterminal() is None
+    assert coordinator.get_task(task.task_id).execution_records[0].status == "unknown"
+    with pytest.raises(AgentTaskBusyError) as caught:
+        coordinator.create_task(task_description="again", verification=_contract())
+    assert caught.value.task_id == task.task_id
+    assert caught.value.invocation_id == invocation_id
+    assert client.action_calls == 1
 
 
 async def test_cancel_task_reaches_cancelled_when_owned_records_are_terminal(

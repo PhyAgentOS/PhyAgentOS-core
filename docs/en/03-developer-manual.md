@@ -20,8 +20,18 @@ This manual covers Core implementation: AgentTask coordination, persistence, bin
 
 | Module | Responsibility |
 |:-------|:---------------|
+| `agent/core/` | Seven Core components (host, runtime, loop driver, model adapter, prompt assembler, tool executor, SQLite session store); contracts in `types.py`, `events.py`, and `protocols.py` |
+| `agent/composition.py` | `compose_agent`: builds the Core assembly from injected collaborators and fixes capability order |
+| `agent/capabilities/` | Native Forge tool definitions and operations, Core `ToolOutcome` mapping, and `activate_skill` |
+| `agent/services/skill_documents.py`, `agent/services/turn_activation.py` | Skill document discovery and per-turn activation identity |
+| `agent/bootstrap.py`, `agent/services/forge_verifier.py` | Shared Forge factories and the semantic verifier; `agent_legacy/session_verifier.py` remains an alias |
+| `cli/commands.py` | Single Typer app, global callback, and registration of the command groups, including the one `agent` command |
+| `cli/command_groups/agent_commands.py` | Core `paos agent --runtime core`: dependency construction, per-turn assembly, `CoreAgentSession`, and process lifecycle |
+| `cli/command_groups/` (other modules) | Provider, gateway, Skill, Forge Node, channel, and onboard/status command groups registered by `commands.py` |
+| `cli/configuration.py` | Config loading and startup provider/evolution selection shared by the gateway and legacy paths |
+| `cli/legacy/legacy_agent.py`, `cli/legacy/legacy_support.py` | Default legacy `paos agent`, its terminal interaction, and the legacy prompt-session helpers |
+| `cli/interaction/interactive_session.py`, `cli/interaction/agent_output.py`, `cli/interaction/terminal_input.py`, `cli/interaction/terminal_display.py`, `cli/interaction/model_picker.py` | Core input scheduling and cancel, message rendering, terminal input, the live status/tool region, and provider/model/effort selectors |
 | `agent_legacy/loop.py` | Existing Agent loop, general tools, dynamic MCP, Forge tool registration, context, and lifecycle |
-| `agent/capabilities/` | Native Forge tool definitions and operations, plus Core `ToolOutcome` mapping |
 | `agent_legacy/tools/forge_tool_api.py` | Compatibility wrappers for the ten Gateway Tool API tools |
 | `agent_legacy/tools/forge_task.py` | Compatibility wrappers for the five AgentTask lifecycle tools |
 | `forge/tool_client.py` | Strict asynchronous HTTP client and response validation |
@@ -45,6 +55,8 @@ requires `attempt_id`. A timeout leaves an unknown record and recovery never rep
 ## 4. Agent-facing tools
 
 The public Agent-facing tool catalog is maintained in the [API contract](../forge/README.md#6-agent-tools). Tool names, descriptions, JSON Schemas, and operations live in `agent/capabilities/forge_tool_api.py` and `agent/capabilities/forge_task_tools.py`; `agent_legacy/tools/` only keeps compatibility wrappers over them. Keep transport handling in `forge/tool_client.py` and coordination in `forge/task.py`.
+
+The Core path also registers `activate_skill` from `agent/capabilities/skill_access_capability.py`. It reads a registered Skill document and returns a turn-scoped `activation_id`; it does not start a Skill runtime and is not a Forge tool.
 
 Diagnostic Query and bound calls invoke the same HTTP methods. Every mutating or task-attributed
 wrapper validates ownership and the frozen Tool binding before network access. Tool wrappers must
@@ -160,7 +172,146 @@ Core changes should extend the existing generic client, binding, coordinator or 
 
 The opt-in [interaction foundation](../interaction/README.md) is a separate restricted extension; its deployment limits also apply to Core changes.
 
-## 13. Test gates
+## 13. CLI entry ownership and lifecycle
+
+`paos agent` is registered once in `cli/commands.py`. The command takes an explicit runtime
+selection and never switches to the other one after a failure:
+
+| Selection | Owner | Status |
+|:----------|:------|:-------|
+| `--runtime legacy` (default) | `cli/legacy/legacy_agent.py` | Existing path; still the default |
+| `--runtime core` | `cli/command_groups/agent_commands.py` | New Core path; opt-in, with the gaps listed below |
+
+`commands.py` keeps the Typer app, the global callback, and the one registration point; each
+command group owns its own Typer app or `register_*` function. `configuration.py` holds config
+loading and startup provider/evolution selection shared by the gateway and legacy paths.
+`agent_commands.py` owns only the Core path: it reads configuration, builds dependencies, builds
+one assembly per turn, and closes the session; it also still holds `CoreAgentSession` and the
+Core dependency assembly. `interaction/interactive_session.py` schedules Core input,
+`interaction/agent_output.py` renders messages, `interaction/terminal_input.py` owns prompt_toolkit
+input and terminal state, `interaction/terminal_display.py` owns the live status and tool region,
+and `interaction/model_picker.py` holds the shared terminal selectors.
+The Core prompt proxy runs with raw ANSI passthrough so Rich styling reaches the terminal instead
+of appearing as literal `?[36m` text; untrusted model, tool and exception text is stripped of
+control characters before rendering, so only Rich introduces escape sequences.
+
+The prompt is the only writer of the live region: its bottom toolbar renders the turn phase
+(preparing, thinking, calling a tool, stopping locally) with a spinner and elapsed time, plus the
+last four tool calls of the current turn, the hidden count and the total. There is no separate
+`Live`/`status` renderer, so the input line, animation and tool area cannot move the cursor against
+each other. `prompt_toolkit`'s refresh timer animates the toolbar; state changes only come from
+persisted runtime events and the session's submit/cancel callbacks. A tool call is keyed by
+`(session_id, turn_id, tool_call_id)` and updated in place from `tool.intent` to
+`tool.dispatched` to `tool.settled`, so repeated events do not increase the total. Turning the turn
+over resets the rows, which keeps a new turn from inheriting an older turn's state. When no prompt
+is attached (a one-shot `-m` run, startup, or redirected streams) the same state prints one plain
+line per transition with no animation and no escape sequences. `/tools` prints a redacted record
+on request; it shows the tool name, local status and a length-limited error summary, never tool
+arguments, outcomes or credentials.
+
+The session/provider/model/effort line is part of the prompt message, above the input; the bottom
+toolbar is only attached while a turn is busy. While busy the `You:` marker and the renderer cursor
+are hidden through the layout's `always_hide_cursor` filter, the buffer is read-only, and Enter is
+blocked. Ordinary keys therefore never enter the buffer or a hidden model queue; a draft typed
+before the turn is preserved, and the marker plus cursor return when the turn ends. Non-terminal
+input keeps its plain line behaviour.
+
+On a terminal, bare `/model` and `/effort` reuse the inline picker. The reader is paused (its
+prompt ends and no new prompt starts) before the second prompt_toolkit application opens and is
+resumed only after the menu returns; Esc or Ctrl+C closes only the menu and leaves the session and
+selection unchanged. A partially typed line is carried into the next prompt instead of being
+discarded. Every model command (text, menu, reset, cancelled or failed) republishes the toolbar
+label from the session's actual selection. Text commands and non-terminal input skip the picker.
+
+The legacy path keeps its existing lifecycle inside `legacy/legacy_agent.py` (build `AgentLoop`,
+run one-shot or terminal flow, then stop the loop and close MCP), with prompt-session helpers in
+`legacy/legacy_support.py`; the steps below describe the new Core path.
+
+### Core process lifecycle
+
+1. Load and validate configuration, apply `--workspace`, and reject fleet mode.
+2. Resolve the provider/model/effort selection. The selection is read when a turn actually
+   starts, so a queued submit picks up changes made before it runs; a running turn keeps the
+   selection it started with.
+3. Build Forge components: Skill catalog and runtime availability, `ForgeToolClient`,
+   `AgentTaskCoordinator`, and the optional verifier.
+4. Reconcile Forge unknown Action/Session records once for this coordinator, before any turn
+   can be submitted. `reconcile_nonterminal()` only issues Gateway GET requests; it never
+   replays an Action or Session POST and never turns an unresolved unknown into a terminal
+   state. Core has no interaction supervisor, so this path does not request a robot stop. If
+   recovery itself fails, the failure is reported and the session still opens; the unresolved
+   unknown state continues to block new tasks.
+5. Create `SkillDocumentLoader` and `TurnSkillActivationManager`, then register the activation
+   manager with the coordinator so `forge_task_create` can validate `activation_id`.
+6. Open the session store at `<workspace>/sessions/core.db`.
+7. Build a seed assembly with `compose_agent`; `SkillAccessCapability` is first and
+   `ForgeCapability` is last.
+8. Run one message or the interactive loop. Each turn reads its session's selection when it
+   actually starts and builds a model-facing assembly that serves that one turn; the runtime is
+   stopped as soon as the turn ends (its host stays open), rather than waiting for the next
+   submit. The store, Forge coordinator/client, and activation manager stay shared. Submits in
+   the same session run serially in registration order; different sessions still run
+   concurrently. `cancel` targets only the current assembly, so a queued turn never inherits an
+   earlier cancellation.
+9. Shut down once: reject new submits and let queued submits leave before they start a turn,
+   stop the runtimes that may still own a turn, wait for submits already inside the session,
+   notify each accepted session's capabilities, close the canonical capabilities once, then
+   close the store. The Forge client and verifier are closed by the resource stack after the
+   session.
+
+`forge_task_create` refuses to create a task while any earlier Action/Session invocation still
+has unknown remote state, including tasks from another session. The refusal names the blocking
+`task_id`, the confirmed `invocation_id` (or explicitly `None` when the Gateway identity was
+never confirmed), the record status and semantics, and the matching status tool to inspect. It
+does not suggest listing tools, does not resend the old request, and does not tell the operator
+to delete the store or restart to clear the blockage.
+
+While a turn runs, Esc is the only stop entry point: the first Esc arms a two-second window and
+shows a yellow hint, the second Esc requests local cancellation through the same session cancel
+path used before. A timeout, any other key, an arrow key, or a new turn clears the armed state, so
+a single Esc and cursor/meta keys never stop a turn. Esc in a model menu only closes that menu.
+Cancellation asks Forge to cancel the session's latest task but does not prove a remote action
+stopped; the status says "local" and "remote unconfirmed". Local commands (`/help`, `/tools`,
+`/correct`, and rejected unknown slash commands) are answered by the reader immediately; `/stop`
+only returns a hint and never cancels or submits a model turn. Non-terminal input cannot capture
+Esc, so it relies on Ctrl+C. Ordinary text and model commands keep their FIFO order, model
+commands still run only between turns, and programmatic/injected queued input gets a position-only
+receipt and a "processing" notice. The receipt never repeats the message text.
+
+`agent/services/forge_verifier.py` is the single verifier implementation used by both paths;
+`agent_legacy/session_verifier.py` re-exports it, so existing imports and module patches still
+apply.
+
+### Skill activation scope
+
+`activate_skill` is a Core tool from `agent/capabilities/skill_access_capability.py`. An activation
+belongs to one `session_id` and one `turn_id`; ids from an earlier turn, another session, or a
+previous process are rejected. Activation records are held in memory, so a restart requires
+activating again. One primary Skill and any number of supporting Skills are allowed in a turn.
+Activation reads the Skill document and does not start a Skill runtime.
+
+### What the Core path does not cover
+
+General-purpose tools, streaming replies, `/correct`, memory and evolution, managed interaction
+Sessions, fleet mode, and the cron, heartbeat, and channel entry points are not migrated. The Forge
+interaction supervisor is not wired into the Core CLI, so this is not a completed interaction
+migration. Existing legacy JSONL sessions are not imported; the Core store is a separate SQLite
+file. Provider failures are reported with a short redacted diagnostic: the exception type and HTTP
+status are kept, while response bodies and credentials are not.
+
+### Tests
+
+Focused suites cover document discovery, activation scope, verifier aliasing, Core CLI single-turn
+and per-turn assembly wiring, interactive FIFO, cancel, rendering, queue receipts, local command
+handling, and tool-row tracking. The terminal behaviour is exercised with a real prompt_toolkit
+pipe input and Vt100 output: the session line above the prompt, the hidden marker and cursor plus
+blocked keys while busy, draft preservation, the first-Esc hint, a second Esc cancelling exactly
+once, timeout/other-key/arrow disarm, menu Esc containment, resize, and a paused reader around a
+menu. This is not only a mocked TTY flag. They use local fake providers, fake Forge clients, and temporary
+stores; no real provider or Gateway request is part of the suite. The full gate remains `pytest`,
+`ruff check PhyAgentOS tests`, and `compileall`.
+
+## 14. Test gates
 
 ```bash
 ruff check PhyAgentOS tests
@@ -171,8 +322,10 @@ pytest -q
 Tests should cover response contracts, Session ownership, pending/cancel/stop/timeout/unknown
 semantics, one active task, diagnostic Query, immutable bindings, no-POST recovery, revision
 recovery, evidence, version-scoped episodes, archive attacks, transactional rollback, Registry
-verification, Runtime health/switching, and mocked workflows. Concrete hardware/simulator tests are
-conditional on independently installed matching artifacts and Dora availability.
+verification, Runtime health/switching, mocked workflows, CLI runtime selection, Core per-turn
+assembly, interactive FIFO/cancel, Skill document precedence, and activation scope. Concrete
+hardware/simulator tests are conditional on independently installed matching artifacts and Dora
+availability.
 
 ## Next reading
 
