@@ -232,6 +232,19 @@ paos provider use opper --model claude-sonnet-4-6 --reasoning-effort none
 在已有会话中，依次执行 `/effort none`、`/provider opper`，然后执行 `/model <model-id>`。
 未设置 `providers.opper.defaultModel` 时，切换 Provider 会沿用原模型 ID。
 
+**[Runcrate](https://www.runcrate.ai)**（`runcrate`）使用相同的网关配置方式。在
+https://www.runcrate.ai/dashboard/api-keys 创建密钥，填入 `providers.runcrate.apiKey`，或在启动时提供
+`RUNCRATE_API_KEY` / `PAOS_RUNCRATE_API_KEY`。默认地址为 `https://api.runcrate.ai/v1`。模型 ID
+保留厂商前缀，例如 `deepseek-ai/DeepSeek-V4.1-Flash`、`zai-org/GLM-5.3`；完整列表见
+https://www.runcrate.ai/inference/pricing 。本接入同样沿用 PAOS 对网关推理强度的保守校验，选择时请清除显式推理强度：
+
+```bash
+paos provider use runcrate --model deepseek-ai/DeepSeek-V4.1-Flash --reasoning-effort none
+```
+
+在已有会话中，依次执行 `/effort none`、`/provider runcrate`，然后执行 `/model <model-id>`。
+未设置 `providers.runcrate.defaultModel` 时，切换 Provider 会沿用原模型 ID。
+
 优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
 开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
 子 Agent、Forge 任务、verification、evolution、记忆整理、Cron 和 Heartbeat 继续使用启动配置。
