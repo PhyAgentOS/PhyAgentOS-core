@@ -17,20 +17,25 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
-from PhyAgentOS.agent.context import ContextBuilder
-from PhyAgentOS.agent.memory import MemoryConsolidator
-from PhyAgentOS.agent.subagent import SubagentManager
-from PhyAgentOS.agent.tool_results import ToolResultLimiter
-from PhyAgentOS.agent.tools.agent import AgentModeTool
-from PhyAgentOS.agent.tools.cron import CronTool
-from PhyAgentOS.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
-from PhyAgentOS.agent.tools.image import ImageTool
-from PhyAgentOS.agent.tools.message import MessageTool
-from PhyAgentOS.agent.tools.registry import ToolRegistry
-from PhyAgentOS.agent.tools.scene_graph import SceneGraphQueryTool
-from PhyAgentOS.agent.tools.shell import ExecTool
-from PhyAgentOS.agent.tools.spawn import SpawnTool
-from PhyAgentOS.agent.tools.web import WebFetchTool, WebSearchTool
+from PhyAgentOS.agent_legacy.context import ContextBuilder
+from PhyAgentOS.agent_legacy.memory import MemoryConsolidator
+from PhyAgentOS.agent_legacy.subagent import SubagentManager
+from PhyAgentOS.agent_legacy.tool_results import ToolResultLimiter
+from PhyAgentOS.agent_legacy.tools.agent import AgentModeTool
+from PhyAgentOS.agent_legacy.tools.cron import CronTool
+from PhyAgentOS.agent_legacy.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
+from PhyAgentOS.agent_legacy.tools.image import ImageTool
+from PhyAgentOS.agent_legacy.tools.message import MessageTool
+from PhyAgentOS.agent_legacy.tools.registry import ToolRegistry
+from PhyAgentOS.agent_legacy.tools.scene_graph import SceneGraphQueryTool
+from PhyAgentOS.agent_legacy.tools.shell import ExecTool
+from PhyAgentOS.agent_legacy.tools.spawn import SpawnTool
+from PhyAgentOS.agent_legacy.tools.web import WebFetchTool, WebSearchTool
 from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus
@@ -202,8 +207,8 @@ class AgentLoop:
         self.experience = None
         if evolution_config is not None and evolution_config.enabled:
             try:
-                from PhyAgentOS.agent.experience.analyzer import ModelExperienceAnalyzer
-                from PhyAgentOS.agent.experience.coordinator import ExperienceCoordinator
+                from PhyAgentOS.agent_legacy.experience.analyzer import ModelExperienceAnalyzer
+                from PhyAgentOS.agent_legacy.experience.coordinator import ExperienceCoordinator
 
                 self.experience = ExperienceCoordinator(
                     workspace=workspace,
@@ -228,8 +233,8 @@ class AgentLoop:
         if self.experience is not None:
             self.skill_activation = self.experience.activation
         else:
-            from PhyAgentOS.agent.experience.activation import SkillActivationManager
-            from PhyAgentOS.agent.experience.store import ExperienceStore
+            from PhyAgentOS.agent_legacy.experience.activation import SkillActivationManager
+            from PhyAgentOS.agent_legacy.experience.store import ExperienceStore
 
             self.skill_activation = SkillActivationManager(
                 workspace=workspace,
@@ -331,16 +336,16 @@ class AgentLoop:
         self.tools.register(ImageTool(self.provider, send_callback=self.bus.publish_outbound))
 
         self.tools.register(SceneGraphQueryTool(workspace=self.workspace))
-        from PhyAgentOS.agent.tools.skill_activation import ActivateSkillTool
+        from PhyAgentOS.agent_legacy.tools.skill_activation import ActivateSkillTool
 
         self.tools.register(ActivateSkillTool(self.skill_activation))
         if self.forge_task_coordinator is not None:
-            from PhyAgentOS.agent.tools.forge_task import build_forge_task_tools
+            from PhyAgentOS.agent_legacy.tools.forge_task import build_forge_task_tools
 
             for tool in build_forge_task_tools(self.forge_task_coordinator):
                 self.tools.register(tool)
         if self.forge_tool_client is not None:
-            from PhyAgentOS.agent.tools.forge_tool_api import build_forge_tool_api_tools
+            from PhyAgentOS.agent_legacy.tools.forge_tool_api import build_forge_tool_api_tools
 
             for tool in build_forge_tool_api_tools(
                 self.forge_tool_client,
@@ -370,7 +375,7 @@ class AgentLoop:
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
         self._mcp_connecting = True
-        from PhyAgentOS.agent.tools.mcp import connect_mcp_servers
+        from PhyAgentOS.agent_legacy.tools.mcp import connect_mcp_servers
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()

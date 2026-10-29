@@ -156,13 +156,13 @@ AgentTask and evolution persistence. Existing evolution data is never removed by
 
 | Area | Path |
 |:-----|:-----|
-| Agent loop and general tools | `PhyAgentOS/agent/` |
+| Agent loop and general tools | `PhyAgentOS/agent_legacy/` |
 | Tool API client, binding, and AgentTask | `PhyAgentOS/forge/tool_client.py`, `PhyAgentOS/forge/binding.py`, `PhyAgentOS/forge/task.py` |
-| Agent-facing Forge tools | `PhyAgentOS/agent/tools/forge_tool_api.py`, `forge_task.py` |
+| Agent-facing Forge tools | `PhyAgentOS/agent_legacy/tools/forge_tool_api.py`, `forge_task.py` |
 | Skill Runtime | `PhyAgentOS/skill_runtime/` |
 | Built-in Agent workflow Skills | `PhyAgentOS/skills/` |
-| Verification | `PhyAgentOS/verification/`, `PhyAgentOS/agent/session_verifier.py` |
-| Experience and evolution | `PhyAgentOS/agent/experience/` |
+| Verification | `PhyAgentOS/verification/`, `PhyAgentOS/agent_legacy/session_verifier.py` |
+| Experience and evolution | `PhyAgentOS/agent_legacy/experience/` |
 
 ## 12. Implemented scope
 

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from PhyAgentOS.agent.experience.contracts import LineageOutcome, TaskOutcomeEnvelope
-from PhyAgentOS.agent.experience.redaction import opaque_ref, redact_text
+from PhyAgentOS.agent_legacy.experience.contracts import LineageOutcome, TaskOutcomeEnvelope
+from PhyAgentOS.agent_legacy.experience.redaction import opaque_ref, redact_text
 
 
 class TaskOutcomeSource(Protocol):

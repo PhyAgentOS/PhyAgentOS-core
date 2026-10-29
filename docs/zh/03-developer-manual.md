@@ -20,14 +20,14 @@
 
 | 模块 | 职责 |
 |:-----|:-----|
-| `agent/loop.py` | 现有 Agent Loop、通用工具、动态 MCP、Forge tools 注册、上下文与生命周期 |
-| `agent/tools/forge_tool_api.py` | 受治理的 Query/Action/Session Tool API Agent wrapper |
-| `agent/tools/forge_task.py` | 五个 AgentTask 生命周期工具 |
+| `agent_legacy/loop.py` | 现有 Agent Loop、通用工具、动态 MCP、Forge tools 注册、上下文与生命周期 |
+| `agent_legacy/tools/forge_tool_api.py` | 受治理的 Query/Action/Session Tool API Agent wrapper |
+| `agent_legacy/tools/forge_task.py` | 五个 AgentTask 生命周期工具 |
 | `forge/tool_client.py` | 严格异步 HTTP client 与响应校验 |
 | `forge/binding.py`、`forge/task.py` | 不可变 Runtime/ToolSpec binding、AgentTask model/store、证据、验证与恢复 |
 | `forge/observation.py`、`forge/evidence.py` | best-effort 图像/state 采集与 artifact 写入 |
 | `skill_runtime/` | manifest、catalog、安全归档、installer、Registry、state、Runtime manager 与 availability |
-| `agent/experience/` | activation、episode、assessment、Lesson、Skill candidate 与 evolution |
+| `agent_legacy/experience/` | activation、episode、assessment、Lesson、Skill candidate 与 evolution |
 | `verification/` | 公共任务、证据、请求、verdict 契约与 Verification Service |
 
 ## 3. Forge Tool API client
@@ -43,7 +43,7 @@ Timeout 形成 unknown record，恢复不会重复 POST。
 
 ## 4. Agent tools
 
-公开的 Agent 工具清单统一维护在 [API 契约](../forge/README_zh.md#6-agent-tools)。Wrapper 位于 `agent/tools/forge_tool_api.py` 和 `agent/tools/forge_task.py`；传输处理放在 `forge/tool_client.py`，任务协调放在 `forge/task.py`。
+公开的 Agent 工具清单统一维护在 [API 契约](../forge/README_zh.md#6-agent-tools)。Wrapper 位于 `agent_legacy/tools/forge_tool_api.py` 和 `agent_legacy/tools/forge_task.py`；传输处理放在 `forge/tool_client.py`，任务协调放在 `forge/task.py`。
 
 诊断 Query 与绑定调用使用相同 HTTP 方法；每个变更或任务归因 wrapper 都在网络访问前校验
 ownership 与冻结 binding。Tool wrapper 不能自行生成 Gateway identity 或 result。

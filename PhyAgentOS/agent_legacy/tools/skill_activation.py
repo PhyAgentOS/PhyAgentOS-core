@@ -6,8 +6,8 @@ import inspect
 from contextvars import ContextVar
 from typing import Any
 
-from PhyAgentOS.agent.experience.activation import SkillActivationManager
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.experience.activation import SkillActivationManager
+from PhyAgentOS.agent_legacy.tools.base import Tool
 
 
 class ActivateSkillTool(Tool):

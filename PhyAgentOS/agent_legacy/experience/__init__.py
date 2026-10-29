@@ -1,6 +1,6 @@
 """Task-level experience capture and guarded Skill evolution."""
 
-from PhyAgentOS.agent.experience.contracts import (
+from PhyAgentOS.agent_legacy.experience.contracts import (
     ExperienceAssessment,
     FailureObservation,
     FailureObservationProposal,
@@ -17,7 +17,7 @@ from PhyAgentOS.agent.experience.contracts import (
     TaskOutcomeEnvelope,
     WorkflowTraceItem,
 )
-from PhyAgentOS.agent.experience.source import ForgeTaskOutcomeSource, TaskOutcomeSource
+from PhyAgentOS.agent_legacy.experience.source import ForgeTaskOutcomeSource, TaskOutcomeSource
 
 __all__ = [
     "ExperienceAssessment",

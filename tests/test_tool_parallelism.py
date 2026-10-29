@@ -7,22 +7,22 @@ from typing import Any
 
 import pytest
 
-from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.agent.tools.base import Tool
-from PhyAgentOS.agent.tools.cron import CronTool
-from PhyAgentOS.agent.tools.filesystem import (
+from PhyAgentOS.agent_legacy.loop import AgentLoop
+from PhyAgentOS.agent_legacy.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.cron import CronTool
+from PhyAgentOS.agent_legacy.tools.filesystem import (
     ListDirTool,
     ReadFileTool,
     WriteFileTool,
 )
-from PhyAgentOS.agent.tools.forge_task import ForgeTaskCreateTool
-from PhyAgentOS.agent.tools.forge_tool_api import ForgeToolStartActionTool
-from PhyAgentOS.agent.tools.image import ImageTool
-from PhyAgentOS.agent.tools.message import MessageTool
-from PhyAgentOS.agent.tools.scene_graph import SceneGraphQueryTool
-from PhyAgentOS.agent.tools.shell import ExecTool
-from PhyAgentOS.agent.tools.spawn import SpawnTool
-from PhyAgentOS.agent.tools.web import WebFetchTool, WebSearchTool
+from PhyAgentOS.agent_legacy.tools.forge_task import ForgeTaskCreateTool
+from PhyAgentOS.agent_legacy.tools.forge_tool_api import ForgeToolStartActionTool
+from PhyAgentOS.agent_legacy.tools.image import ImageTool
+from PhyAgentOS.agent_legacy.tools.message import MessageTool
+from PhyAgentOS.agent_legacy.tools.scene_graph import SceneGraphQueryTool
+from PhyAgentOS.agent_legacy.tools.shell import ExecTool
+from PhyAgentOS.agent_legacy.tools.spawn import SpawnTool
+from PhyAgentOS.agent_legacy.tools.web import WebFetchTool, WebSearchTool
 from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.providers.base import LLMProvider, StreamEvent, ToolCallRequest
 

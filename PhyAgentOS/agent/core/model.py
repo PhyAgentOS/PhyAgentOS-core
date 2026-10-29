@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 from .types import ModelCallError, ModelRequest, ModelResponse, ToolCall
 
-__all__ = ["ModelAdapter"]
+__all__ = ["ChatProvider", "ModelAdapter"]
 
 _CREDENTIAL_PATTERNS = (
     re.compile(r"\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}", re.IGNORECASE),
@@ -48,8 +48,12 @@ def _safe_detail(value: object) -> str:
     return text[:_MAX_DETAIL_LENGTH]
 
 
-class _ChatProvider(Protocol):
-    """The slice of the provider interface this adapter needs."""
+class ChatProvider(Protocol):
+    """The slice of the provider interface this adapter needs.
+
+    Public so a composition root can type the object it injects without
+    importing a provider SDK or a concrete provider class.
+    """
 
     async def chat_with_retry(
         self,
@@ -73,7 +77,7 @@ class ModelAdapter:
     defaults; the adapter never invents or overrides them.
     """
 
-    def __init__(self, provider: _ChatProvider) -> None:
+    def __init__(self, provider: ChatProvider) -> None:
         self._provider = provider
 
     async def complete(self, request: ModelRequest) -> ModelResponse:

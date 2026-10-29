@@ -291,7 +291,7 @@ Core 的 AgentTask 还会在执行后完成独立验证并保存 verdict；执�
 | 仿真 descriptor / reset 编排 | [sim-control runner](https://github.com/PhyAgentOS/operator-sim-control-policy/blob/85679a4be8953e9071de426c7c0973155121d96f/src/sim_control_policy_node/runner.py) |
 | gripper Tool provider | [gripper_action_policy runner](https://github.com/PhyAgentOS/operator-gripper-action-policy/blob/bb69223497b944dd1a0f6fe9ecb36486168a8cc4/src/gripper_action_policy_node/runner.py) |
 | controller、模拟器和 Viewer | [Node 源码映射](REPOSITORIES_zh.md#3-robot-control-sim-的-node-与源码映射) |
-| Core 的 HTTP client 与 Agent wrapper | [ForgeToolClient](../../../PhyAgentOS/forge/tool_client.py)、[Agent tools](../../../PhyAgentOS/agent/tools/forge_tool_api.py) |
+| Core 的 HTTP client 与 Agent wrapper | [ForgeToolClient](../../../PhyAgentOS/forge/tool_client.py)、[Agent tools](../../../PhyAgentOS/agent_legacy/tools/forge_tool_api.py) |
 
 上表用于定位实现职责；固定源码快照与历史二进制的构建对应关系仍须由 Release/构建溯源证明。
 修改 Node 后重新发布和更新 Skill locks 的流程见 [Skill 开发手册](SKILL_DEVELOPMENT_zh.md)。

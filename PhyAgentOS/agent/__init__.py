@@ -1,21 +1,9 @@
-"""Agent core module with lazy exports for isolated Agent services."""
+"""Agent package for the decoupled runtime core.
 
-from importlib import import_module
-
-__all__ = ["AgentLoop", "ContextBuilder", "MemoryStore", "SkillsLoader"]
-
-_EXPORTS = {
-    "AgentLoop": ("PhyAgentOS.agent.loop", "AgentLoop"),
-    "ContextBuilder": ("PhyAgentOS.agent.context", "ContextBuilder"),
-    "MemoryStore": ("PhyAgentOS.agent.memory", "MemoryStore"),
-    "SkillsLoader": ("PhyAgentOS.agent.skills", "SkillsLoader"),
-}
-
-
-def __getattr__(name: str):
-    if name not in _EXPORTS:
-        raise AttributeError(name)
-    module_name, attribute = _EXPORTS[name]
-    value = getattr(import_module(module_name), attribute)
-    globals()[name] = value
-    return value
+The new core lives in :mod:`PhyAgentOS.agent.core`, domain adapters such as
+:mod:`PhyAgentOS.agent.capabilities.forge` live in ``capabilities``, and
+:mod:`PhyAgentOS.agent.composition` is the production composition root. The
+legacy loop and its services live in :mod:`PhyAgentOS.agent_legacy`; this
+package's ``__init__`` does not import them, so importing ``PhyAgentOS.agent``
+stays cheap.
+"""

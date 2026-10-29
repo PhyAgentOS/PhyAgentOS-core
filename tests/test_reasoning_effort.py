@@ -311,7 +311,7 @@ async def test_codex_effort_payload(monkeypatch, effort):
 
 
 async def test_memory_consolidation_does_not_combine_thinking_and_forced_tools(tmp_path, monkeypatch):
-    from PhyAgentOS.agent.memory import MemoryStore
+    from PhyAgentOS.agent_legacy.memory import MemoryStore
 
     provider = LiteLLMProvider(api_key="test", default_model="claude-sonnet-4-5", provider_name="anthropic")
     provider.generation = GenerationSettings(reasoning_effort="high")

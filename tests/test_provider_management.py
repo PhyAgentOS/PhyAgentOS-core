@@ -633,7 +633,7 @@ def test_session_switch_is_atomic_and_infers_provider(config, monkeypatch):
 def test_switch_during_tool_turn_keeps_running_requests_and_background_jobs(
     config, tmp_path, monkeypatch
 ):
-    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.events import InboundMessage
     from PhyAgentOS.bus.queue import MessageBus
 
@@ -1140,7 +1140,7 @@ def test_explicit_model_commands_and_non_tty_keep_text_flow(config, monkeypatch,
 
 
 def test_chat_after_model_picker_uses_selected_provider(config, tmp_path, monkeypatch):
-    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.queue import MessageBus
     from PhyAgentOS.cli.providers import _interactive_model_command
 
@@ -1311,7 +1311,7 @@ def test_remove_save_failure_preserves_provider_and_default(config, config_path,
 async def test_selected_session_provider_failure_keeps_dev_abort_semantics(
     config, tmp_path, monkeypatch,
 ):
-    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.events import InboundMessage
     from PhyAgentOS.bus.queue import MessageBus
 
@@ -1375,7 +1375,7 @@ def test_responses_provider_requires_explicit_endpoint(config):
 
 @pytest.mark.parametrize("command", ["/status", "/provider unknown-provider"])
 async def test_runtime_command_preserves_reply_routing(config, tmp_path, command):
-    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.events import InboundMessage
     from PhyAgentOS.bus.queue import MessageBus
 
@@ -1438,7 +1438,7 @@ def test_verifier_rejects_removed_provider_before_starting_child(config):
 async def test_switch_during_transient_failure_keeps_retry_on_original_provider(
     config, tmp_path, monkeypatch,
 ):
-    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.events import InboundMessage
     from PhyAgentOS.bus.queue import MessageBus
 

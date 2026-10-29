@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PhyAgentOS.agent.memory import MemoryStore
-from PhyAgentOS.agent.skills import SkillsLoader
+from PhyAgentOS.agent_legacy.memory import MemoryStore
+from PhyAgentOS.agent_legacy.skills import SkillsLoader
 from PhyAgentOS.utils.helpers import build_assistant_message, detect_image_mime
 
 

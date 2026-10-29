@@ -3,7 +3,7 @@
 from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 from PhyAgentOS.bus.events import OutboundMessage
 
 

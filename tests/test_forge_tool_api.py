@@ -4,7 +4,7 @@ import json
 
 import httpx
 
-from PhyAgentOS.agent.tools.forge_tool_api import build_forge_tool_api_tools
+from PhyAgentOS.agent_legacy.tools.forge_tool_api import build_forge_tool_api_tools
 from PhyAgentOS.config.schema import ForgeConfig
 from PhyAgentOS.forge.task import AgentTaskCoordinator
 from PhyAgentOS.forge.tool_client import ForgeToolClient

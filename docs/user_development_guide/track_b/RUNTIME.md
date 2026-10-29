@@ -290,7 +290,7 @@ Query `sim.get_robot_info` and Tool context first; do not substitute Piper X `pi
 | Simulation descriptor/reset orchestration | [sim-control runner](https://github.com/PhyAgentOS/operator-sim-control-policy/blob/85679a4be8953e9071de426c7c0973155121d96f/src/sim_control_policy_node/runner.py) |
 | Gripper Tool provider | [gripper_action_policy runner](https://github.com/PhyAgentOS/operator-gripper-action-policy/blob/bb69223497b944dd1a0f6fe9ecb36486168a8cc4/src/gripper_action_policy_node/runner.py) |
 | Controllers, simulator, viewer | [Node source mapping](REPOSITORIES.md#3-robot-control-sim-node-to-source-mapping) |
-| Core HTTP client and Agent wrappers | [ForgeToolClient](../../../PhyAgentOS/forge/tool_client.py), [Agent tools](../../../PhyAgentOS/agent/tools/forge_tool_api.py) |
+| Core HTTP client and Agent wrappers | [ForgeToolClient](../../../PhyAgentOS/forge/tool_client.py), [Agent tools](../../../PhyAgentOS/agent_legacy/tools/forge_tool_api.py) |
 
 This table locates responsibilities; Release/build provenance must establish any source-to-historical-binary mapping.
 For Node publication and Skill lock updates, see the [development manual](SKILL_DEVELOPMENT.md).

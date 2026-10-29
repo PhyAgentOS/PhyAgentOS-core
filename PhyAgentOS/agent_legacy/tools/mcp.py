@@ -7,8 +7,8 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from PhyAgentOS.agent.tools.base import Tool
-from PhyAgentOS.agent.tools.registry import ToolRegistry
+from PhyAgentOS.agent_legacy.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.registry import ToolRegistry
 
 
 class MCPToolWrapper(Tool):

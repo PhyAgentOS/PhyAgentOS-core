@@ -8,10 +8,15 @@ from typing import Any
 
 from loguru import logger
 
-from PhyAgentOS.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
-from PhyAgentOS.agent.tools.registry import ToolRegistry
-from PhyAgentOS.agent.tools.shell import ExecTool
-from PhyAgentOS.agent.tools.web import WebFetchTool, WebSearchTool
+from PhyAgentOS.agent_legacy.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
+from PhyAgentOS.agent_legacy.tools.registry import ToolRegistry
+from PhyAgentOS.agent_legacy.tools.shell import ExecTool
+from PhyAgentOS.agent_legacy.tools.web import WebFetchTool, WebSearchTool
 from PhyAgentOS.bus.events import InboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.config.schema import ExecToolConfig
@@ -261,8 +266,8 @@ Result:
 
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
-        from PhyAgentOS.agent.context import ContextBuilder
-        from PhyAgentOS.agent.skills import SkillsLoader
+        from PhyAgentOS.agent_legacy.context import ContextBuilder
+        from PhyAgentOS.agent_legacy.skills import SkillsLoader
 
         time_ctx = ContextBuilder._build_message_context(None, None)
         parts = [f"""# Subagent

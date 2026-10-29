@@ -3,7 +3,7 @@
 from contextvars import ContextVar
 from typing import Any
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 from PhyAgentOS.cron.service import CronService
 from PhyAgentOS.cron.types import CronSchedule
 

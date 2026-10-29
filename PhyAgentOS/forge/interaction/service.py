@@ -271,7 +271,7 @@ class InteractionService:
         ]
 
     def enable_in_process(self, deployment, *, long_lived=True, notify=None):
-        from PhyAgentOS.agent.interaction.supervisor import InteractionSupervisor
+        from PhyAgentOS.agent_legacy.interaction.supervisor import InteractionSupervisor
 
         if type(deployment) is not InProcessInteractionDeployment:
             raise RuntimeError("production isolation adapters are not enabled in this release")

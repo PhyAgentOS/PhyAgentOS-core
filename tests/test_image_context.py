@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PhyAgentOS.agent.tools.image import ImageTool
+from PhyAgentOS.agent_legacy.tools.image import ImageTool
 
 
 async def test_display_uses_the_turn_context(tmp_path: Path) -> None:

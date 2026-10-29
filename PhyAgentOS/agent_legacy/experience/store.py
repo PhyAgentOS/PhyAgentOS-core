@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from PhyAgentOS.agent.experience.contracts import (
+from PhyAgentOS.agent_legacy.experience.contracts import (
     FailureObservation,
     LessonCluster,
     ScopedLesson,

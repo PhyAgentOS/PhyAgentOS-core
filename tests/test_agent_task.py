@@ -6,9 +6,9 @@ from typing import Any
 
 import pytest
 
-from PhyAgentOS.agent.experience.source import AgentTaskOutcomeSource
-from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.agent.tools.forge_tool_api import build_forge_tool_api_tools
+from PhyAgentOS.agent_legacy.experience.source import AgentTaskOutcomeSource
+from PhyAgentOS.agent_legacy.loop import AgentLoop
+from PhyAgentOS.agent_legacy.tools.forge_tool_api import build_forge_tool_api_tools
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.config.schema import AgentEvolutionConfig, Config, ForgeConfig
 from PhyAgentOS.forge.task import (

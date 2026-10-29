@@ -5,8 +5,8 @@ from __future__ import annotations
 import copy
 import json
 
-from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.agent.tools.forge_tool_api import ForgeToolContextTool
+from PhyAgentOS.agent_legacy.loop import AgentLoop
+from PhyAgentOS.agent_legacy.tools.forge_tool_api import ForgeToolContextTool
 from PhyAgentOS.providers.base import LLMProvider, StreamEvent, ToolCallRequest
 
 

@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from PhyAgentOS.agent.tools.forge_task import ForgeTaskCreateTool
+from PhyAgentOS.agent_legacy.tools.forge_task import ForgeTaskCreateTool
 from PhyAgentOS.config.schema import ForgeConfig
 from PhyAgentOS.forge.task import AgentTaskRecord, PlanRevision
 from PhyAgentOS.verification.contracts import TaskVerificationContract

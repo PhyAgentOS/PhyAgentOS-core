@@ -11,7 +11,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - base runtime installs this dependency
     json_repair = None
 
-from PhyAgentOS.agent.experience.contracts import (
+from PhyAgentOS.agent_legacy.experience.contracts import (
     ExperienceAssessment,
     FailureObservation,
     LessonAbstractionValidation,

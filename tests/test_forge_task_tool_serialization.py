@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from PhyAgentOS.agent.tools.forge_task import (
+from PhyAgentOS.agent_legacy.tools.forge_task import (
     ForgeTaskBeginRevisionTool,
     ForgeTaskCancelTool,
     ForgeTaskCreateTool,
@@ -11,7 +11,7 @@ from PhyAgentOS.agent.tools.forge_task import (
     ForgeTaskGetTool,
     build_forge_task_tools,
 )
-from PhyAgentOS.agent.tools.registry import ToolRegistry
+from PhyAgentOS.agent_legacy.tools.registry import ToolRegistry
 from PhyAgentOS.config.schema import ForgeConfig
 from PhyAgentOS.forge.task import AgentTaskCoordinator, AgentTaskRecord, PlanRevision
 from PhyAgentOS.verification.contracts import TaskVerificationContract

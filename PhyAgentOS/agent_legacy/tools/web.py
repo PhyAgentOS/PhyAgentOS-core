@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import httpx
 from loguru import logger
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"

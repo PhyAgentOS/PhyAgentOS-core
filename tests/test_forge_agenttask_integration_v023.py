@@ -11,9 +11,9 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
-from PhyAgentOS.agent.experience.activation import SkillActivationManager
-from PhyAgentOS.agent.experience.store import ExperienceStore
-from PhyAgentOS.agent.tools.forge_tool_api import (
+from PhyAgentOS.agent_legacy.experience.activation import SkillActivationManager
+from PhyAgentOS.agent_legacy.experience.store import ExperienceStore
+from PhyAgentOS.agent_legacy.tools.forge_tool_api import (
     ForgeToolActionStatusTool,
     ForgeToolSessionStatusTool,
 )
@@ -187,7 +187,7 @@ async def _bound_system(
     installed = tmp_path / "skills"
     _write_skill(installed, profile_tools=profile_tools)
     monkeypatch.setattr(
-        "PhyAgentOS.agent.skills.get_config_path", lambda: tmp_path / "config.json"
+        "PhyAgentOS.agent_legacy.skills.get_config_path", lambda: tmp_path / "config.json"
     )
     client = FakeGatewayClient()
     invocations: set[str] = set()

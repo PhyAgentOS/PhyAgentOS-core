@@ -6,8 +6,8 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
-from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.agent.tool_results import DEFAULT_MAX_CHARS, ToolResultLimiter
+from PhyAgentOS.agent_legacy.loop import AgentLoop
+from PhyAgentOS.agent_legacy.tool_results import DEFAULT_MAX_CHARS, ToolResultLimiter
 from PhyAgentOS.providers.base import LLMProvider, StreamEvent, ToolCallRequest
 from PhyAgentOS.utils.helpers import estimate_prompt_tokens_chain
 

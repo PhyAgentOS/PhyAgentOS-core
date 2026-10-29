@@ -4,7 +4,7 @@ import difflib
 from pathlib import Path
 from typing import Any
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 
 
 def _resolve_path(

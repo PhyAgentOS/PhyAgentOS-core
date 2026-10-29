@@ -6,7 +6,7 @@ from xml.etree import ElementTree
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from PhyAgentOS.agent.skills import SkillsLoader  # noqa: E402
+from PhyAgentOS.agent_legacy.skills import SkillsLoader  # noqa: E402
 
 BUILTIN_SKILLS = Path(__file__).parents[1] / "PhyAgentOS" / "skills"
 

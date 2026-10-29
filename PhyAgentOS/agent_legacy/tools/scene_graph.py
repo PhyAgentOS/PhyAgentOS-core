@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 from PhyAgentOS.utils.helpers import load_environment_doc
 
 

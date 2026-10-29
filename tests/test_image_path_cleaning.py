@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from PhyAgentOS.agent.tools.image import ImageTool
+from PhyAgentOS.agent_legacy.tools.image import ImageTool
 
 
 @pytest.mark.parametrize("image_path", ["", "   ", "\t\n"])

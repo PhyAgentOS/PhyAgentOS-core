@@ -11,14 +11,14 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from PhyAgentOS.agent.experience.contracts import (
+from PhyAgentOS.agent_legacy.experience.contracts import (
     ScopedLesson,
     SkillActivation,
     WorkflowTraceItem,
 )
-from PhyAgentOS.agent.experience.redaction import redact_text
-from PhyAgentOS.agent.experience.store import ExperienceStore
-from PhyAgentOS.agent.skills import SkillsLoader
+from PhyAgentOS.agent_legacy.experience.redaction import redact_text
+from PhyAgentOS.agent_legacy.experience.store import ExperienceStore
+from PhyAgentOS.agent_legacy.skills import SkillsLoader
 from PhyAgentOS.forge.binding import ForgeSkillBindingResolver
 from PhyAgentOS.skill_runtime.manifest import load_manifest
 

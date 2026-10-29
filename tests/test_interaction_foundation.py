@@ -5,9 +5,9 @@ from dataclasses import replace
 import pytest
 from interaction_support import source_bundle, system
 
-from PhyAgentOS.agent.tools.base import Tool
-from PhyAgentOS.agent.tools.forge_tool_api import ForgeToolQueryTool
-from PhyAgentOS.agent.tools.registry import ToolRegistry
+from PhyAgentOS.agent_legacy.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.forge_tool_api import ForgeToolQueryTool
+from PhyAgentOS.agent_legacy.tools.registry import ToolRegistry
 from PhyAgentOS.forge.interaction.binding import RECEIPT
 from PhyAgentOS.skill_runtime.installer import InstallerError, SkillInstaller
 from PhyAgentOS.skill_runtime.state import RuntimeStateStore
@@ -185,7 +185,7 @@ async def test_root_goal_is_not_implied_by_finish_candidate(tmp_path, monkeypatc
 
 
 async def test_one_root_episode_contains_trace_and_is_deduplicated(tmp_path, monkeypatch):
-    from PhyAgentOS.agent.experience.coordinator import ExperienceCoordinator
+    from PhyAgentOS.agent_legacy.experience.coordinator import ExperienceCoordinator
 
     c, t, grid, sup, _ = await system(tmp_path, monkeypatch)
     experience = ExperienceCoordinator(
@@ -226,7 +226,7 @@ async def test_schema_change_between_validation_and_post_never_uses_new_runtime(
 async def test_agent_reply_returns_while_supervisor_runs_and_stop_ignores_chat_lock(
     tmp_path, monkeypatch
 ):
-    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.events import InboundMessage
     from PhyAgentOS.bus.queue import MessageBus
     from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest
@@ -298,7 +298,7 @@ async def test_agent_reply_returns_while_supervisor_runs_and_stop_ignores_chat_l
 
 
 async def test_active_unsafe_tool_and_existing_subagent_share_dynamic_gate(tmp_path, monkeypatch):
-    from PhyAgentOS.agent.subagent import SubagentManager
+    from PhyAgentOS.agent_legacy.subagent import SubagentManager
     from PhyAgentOS.bus.queue import MessageBus
 
     c, t, grid, sup, _ = await system(tmp_path, monkeypatch)

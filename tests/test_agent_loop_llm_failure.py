@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from PhyAgentOS.agent.loop import AgentLoop
+from PhyAgentOS.agent_legacy.loop import AgentLoop
 from PhyAgentOS.bus.events import InboundMessage
 from PhyAgentOS.providers.base import LLMCallError, LLMResponse, ToolCallRequest
 

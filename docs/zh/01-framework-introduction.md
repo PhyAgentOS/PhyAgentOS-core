@@ -149,13 +149,13 @@ Runtime 清理不会删除现有 evolution 数据。
 
 | 领域 | 路径 |
 |:-----|:-----|
-| Agent Loop 与通用工具 | `PhyAgentOS/agent/` |
+| Agent Loop 与通用工具 | `PhyAgentOS/agent_legacy/` |
 | Tool API client、binding 与 AgentTask | `PhyAgentOS/forge/tool_client.py`、`PhyAgentOS/forge/binding.py`、`PhyAgentOS/forge/task.py` |
-| Agent Forge tools | `PhyAgentOS/agent/tools/forge_tool_api.py`、`forge_task.py` |
+| Agent Forge tools | `PhyAgentOS/agent_legacy/tools/forge_tool_api.py`、`forge_task.py` |
 | Skill Runtime | `PhyAgentOS/skill_runtime/` |
 | 内置 Agent 工作流 Skills | `PhyAgentOS/skills/` |
-| Verification | `PhyAgentOS/verification/`、`PhyAgentOS/agent/session_verifier.py` |
-| Experience 与 evolution | `PhyAgentOS/agent/experience/` |
+| Verification | `PhyAgentOS/verification/`、`PhyAgentOS/agent_legacy/session_verifier.py` |
+| Experience 与 evolution | `PhyAgentOS/agent_legacy/experience/` |
 
 ## 12. 当前实现范围
 

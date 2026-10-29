@@ -7,7 +7,7 @@ import json
 from contextvars import ContextVar
 from typing import Any
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 from PhyAgentOS.forge.task import AgentTaskCoordinator, AgentTaskRecord
 from PhyAgentOS.verification.contracts import TaskVerificationContract
 
@@ -116,8 +116,20 @@ class ForgeTaskCreateTool(Tool):
         }
 
     async def execute(
-        self, task_description: str, activation_id: str, verification: dict[str, Any]
+        self,
+        task_description: str,
+        activation_id: str,
+        verification: dict[str, Any],
+        *,
+        origin_session_key: str | None = None,
     ) -> str:
+        """Create one AgentTask.
+
+        ``origin_session_key`` lets a caller pass the session explicitly
+        instead of using the legacy ``set_context`` ContextVar. The legacy
+        loop keeps using the ContextVar; the new capability passes the value
+        from its ``ExecutionContext``.
+        """
         image_sources: list[str] = []
         coordinator_config = getattr(self.coordinator, "config", None)
         evidence_config = getattr(coordinator_config, "evidence", None)
@@ -131,7 +143,7 @@ class ForgeTaskCreateTool(Tool):
             task_description=task_description,
             activation_id=activation_id,
             verification=TaskVerificationContract.model_validate(verification),
-            origin_session_key=self.session_key.get(),
+            origin_session_key=origin_session_key or self.session_key.get(),
         )
         if inspect.isawaitable(task):
             task = await task

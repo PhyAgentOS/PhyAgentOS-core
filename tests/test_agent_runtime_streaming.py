@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 from typer.testing import CliRunner
 
-from PhyAgentOS.agent import loop as loop_module
-from PhyAgentOS.agent.loop import AgentLoop
+from PhyAgentOS.agent_legacy import loop as loop_module
+from PhyAgentOS.agent_legacy.loop import AgentLoop
 from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.bus.events import InboundMessage
 from PhyAgentOS.bus.queue import MessageBus
@@ -98,7 +98,7 @@ def _invoke_cli_agent(tmp_path, monkeypatch, agent_cls):
         commands, "_make_forge_components", lambda c, p: (None, None, None, None)
     )
     monkeypatch.setattr("PhyAgentOS.cron.service.CronService", lambda *a, **k: object())
-    monkeypatch.setattr("PhyAgentOS.agent.loop.AgentLoop", agent_cls)
+    monkeypatch.setattr("PhyAgentOS.agent_legacy.loop.AgentLoop", agent_cls)
 
     return CliRunner().invoke(
         commands.app,

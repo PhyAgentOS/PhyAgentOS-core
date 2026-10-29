@@ -9,9 +9,9 @@ from typing import Any
 
 import pytest
 
-from PhyAgentOS.agent.loop import AgentLoop, SessionQueueFullError
-from PhyAgentOS.agent.memory import MemoryConsolidator, MemoryStore
-from PhyAgentOS.agent.tools.forge_task import ForgeTaskCreateTool
+from PhyAgentOS.agent_legacy.loop import AgentLoop, SessionQueueFullError
+from PhyAgentOS.agent_legacy.memory import MemoryConsolidator, MemoryStore
+from PhyAgentOS.agent_legacy.tools.forge_task import ForgeTaskCreateTool
 from PhyAgentOS.bus.events import InboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.config.schema import ForgeConfig

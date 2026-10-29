@@ -7,9 +7,9 @@ import sqlite3
 import httpx
 import yaml
 
-from PhyAgentOS.agent.experience.activation import SkillActivationManager
-from PhyAgentOS.agent.experience.store import ExperienceStore
-from PhyAgentOS.agent.interaction.runner import RunnerLimits
+from PhyAgentOS.agent_legacy.experience.activation import SkillActivationManager
+from PhyAgentOS.agent_legacy.experience.store import ExperienceStore
+from PhyAgentOS.agent_legacy.interaction.runner import RunnerLimits
 from PhyAgentOS.config.schema import ForgeConfig
 from PhyAgentOS.forge.binding import ForgeSkillBindingResolver
 from PhyAgentOS.forge.interaction.contracts import digest
@@ -345,7 +345,7 @@ async def system(tmp_path, monkeypatch, *, decide=None, enabled=True, long_lived
     SkillInstaller(installed, state_store=RuntimeStateStore(tmp_path / "runtime-state")).install(
         package(source, tmp_path / "archives")
     )
-    monkeypatch.setattr("PhyAgentOS.agent.skills.get_config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr("PhyAgentOS.agent_legacy.skills.get_config_path", lambda: tmp_path / "config.json")
     grid = FakeGrid(tmp_path / "executor.sqlite3")
     client = ForgeToolClient("http://fake.invalid", transport=httpx.MockTransport(grid))
     runtime = ActiveSkillRuntime(

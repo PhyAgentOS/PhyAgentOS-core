@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PhyAgentOS.agent.context import ContextBuilder
-from PhyAgentOS.agent.experience.activation import SkillActivationManager
-from PhyAgentOS.agent.experience.contracts import (
+from PhyAgentOS.agent_legacy.context import ContextBuilder
+from PhyAgentOS.agent_legacy.experience.activation import SkillActivationManager
+from PhyAgentOS.agent_legacy.experience.contracts import (
     ExperienceAssessment,
     FailureObservationProposal,
     LessonAbstractionValidation,
@@ -22,14 +22,14 @@ from PhyAgentOS.agent.experience.contracts import (
     TaskEpisode,
     TaskOutcomeEnvelope,
 )
-from PhyAgentOS.agent.experience.coordinator import ExperienceCoordinator
-from PhyAgentOS.agent.experience.evolution import (
+from PhyAgentOS.agent_legacy.experience.coordinator import ExperienceCoordinator
+from PhyAgentOS.agent_legacy.experience.evolution import (
     SkillEvolutionError,
     SkillEvolutionManager,
 )
-from PhyAgentOS.agent.experience.source import ForgeTaskOutcomeSource
-from PhyAgentOS.agent.experience.store import ExperienceStore
-from PhyAgentOS.agent.skills import SkillsLoader
+from PhyAgentOS.agent_legacy.experience.source import ForgeTaskOutcomeSource
+from PhyAgentOS.agent_legacy.experience.store import ExperienceStore
+from PhyAgentOS.agent_legacy.skills import SkillsLoader
 from PhyAgentOS.config.schema import AgentEvolutionConfig
 from PhyAgentOS.verification.contracts import (
     CriterionVerdict,

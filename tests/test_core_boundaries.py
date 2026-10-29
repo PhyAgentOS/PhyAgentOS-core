@@ -63,7 +63,7 @@ SESSION = "telegram:42"
 FORBIDDEN_IMPORT_ROOTS = (
     "PhyAgentOS.agent.loop",
     "PhyAgentOS.agent.legacy",
-    "PhyAgentOS.agent.agent_legacy",
+    "PhyAgentOS.agent_legacy",
     "PhyAgentOS.forge",
     "PhyAgentOS.verification",
     "PhyAgentOS.skill_runtime",
@@ -543,7 +543,7 @@ def test_core_imports_and_a_plain_session_do_not_need_forge(tmp_path: Path) -> N
             "             'prompt', 'model', 'loop', 'runtime', 'host'):",
             "    importlib.import_module('PhyAgentOS.agent.core.' + name)",
             "roots = ('PhyAgentOS.forge', 'PhyAgentOS.agent.loop',",
-            "         'PhyAgentOS.agent.legacy', 'PhyAgentOS.verification',",
+            "         'PhyAgentOS.agent_legacy', 'PhyAgentOS.verification',",
             "         'PhyAgentOS.skill_runtime', 'PhyAgentOS.cli',",
             "         'PhyAgentOS.channels', 'PhyAgentOS.providers',",
             "         'litellm', 'openai', 'anthropic')",

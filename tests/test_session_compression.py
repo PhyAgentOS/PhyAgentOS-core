@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.agent.memory import MemoryConsolidator
+from PhyAgentOS.agent_legacy.loop import AgentLoop
+from PhyAgentOS.agent_legacy.memory import MemoryConsolidator
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest
 from PhyAgentOS.session.manager import Session, SessionManager

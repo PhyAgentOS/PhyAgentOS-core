@@ -3,10 +3,10 @@
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 
 if TYPE_CHECKING:
-    from PhyAgentOS.agent.subagent import SubagentManager
+    from PhyAgentOS.agent_legacy.subagent import SubagentManager
 
 
 class SpawnTool(Tool):

@@ -9,7 +9,7 @@ from typing import Iterable
 
 import yaml
 
-from PhyAgentOS.agent.experience.contracts import (
+from PhyAgentOS.agent_legacy.experience.contracts import (
     ExperienceAssessment,
     FailureObservation,
     FailureObservationProposal,
@@ -22,8 +22,8 @@ from PhyAgentOS.agent.experience.contracts import (
     TaskEpisode,
     utc_now,
 )
-from PhyAgentOS.agent.experience.store import ExperienceStore
-from PhyAgentOS.agent.skills import SkillsLoader
+from PhyAgentOS.agent_legacy.experience.store import ExperienceStore
+from PhyAgentOS.agent_legacy.skills import SkillsLoader
 from PhyAgentOS.utils.atomic_file import atomic_write_text
 
 _MANAGED_START = "<!-- paos:learned-workflow:start -->"

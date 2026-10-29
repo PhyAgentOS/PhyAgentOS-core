@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 from PhyAgentOS.bus.events import OutboundMessage
 from PhyAgentOS.providers.base import LLMProvider
 

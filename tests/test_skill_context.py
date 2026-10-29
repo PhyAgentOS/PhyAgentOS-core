@@ -5,8 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from PhyAgentOS.agent.context import ContextBuilder  # noqa: E402
-from PhyAgentOS.agent.skills import SkillsLoader  # noqa: E402
+from PhyAgentOS.agent_legacy.context import ContextBuilder  # noqa: E402
+from PhyAgentOS.agent_legacy.skills import SkillsLoader  # noqa: E402
 
 
 def test_active_runtime_skill_is_injected_in_full(tmp_path: Path) -> None:

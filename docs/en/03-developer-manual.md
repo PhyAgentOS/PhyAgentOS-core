@@ -20,14 +20,14 @@ This manual covers Core implementation: AgentTask coordination, persistence, bin
 
 | Module | Responsibility |
 |:-------|:---------------|
-| `agent/loop.py` | Existing Agent loop, general tools, dynamic MCP, Forge tool registration, context, and lifecycle |
-| `agent/tools/forge_tool_api.py` | Governed Query/Action/Session Tool API Agent wrappers |
-| `agent/tools/forge_task.py` | Five AgentTask lifecycle tools |
+| `agent_legacy/loop.py` | Existing Agent loop, general tools, dynamic MCP, Forge tool registration, context, and lifecycle |
+| `agent_legacy/tools/forge_tool_api.py` | Governed Query/Action/Session Tool API Agent wrappers |
+| `agent_legacy/tools/forge_task.py` | Five AgentTask lifecycle tools |
 | `forge/tool_client.py` | Strict asynchronous HTTP client and response validation |
 | `forge/binding.py`, `forge/task.py` | Immutable Runtime/ToolSpec binding, AgentTask models/store, evidence, verification, and recovery |
 | `forge/observation.py`, `forge/evidence.py` | Best-effort image/state collection and artifact writing |
 | `skill_runtime/` | Manifest, catalog, safe archive, installer, Registry, state, Runtime manager, and availability |
-| `agent/experience/` | Activation, episodes, assessment, Lessons, Skill candidates, and evolution |
+| `agent_legacy/experience/` | Activation, episodes, assessment, Lessons, Skill candidates, and evolution |
 | `verification/` | Public task, evidence, request, and verdict contracts plus verification service |
 
 ## 3. Forge Tool API client
@@ -43,7 +43,7 @@ requires `attempt_id`. A timeout leaves an unknown record and recovery never rep
 
 ## 4. Agent-facing tools
 
-The public Agent-facing tool catalog is maintained in the [API contract](../forge/README.md#6-agent-tools). Implement wrappers in `agent/tools/forge_tool_api.py` and `agent/tools/forge_task.py`; keep transport handling in `forge/tool_client.py` and coordination in `forge/task.py`.
+The public Agent-facing tool catalog is maintained in the [API contract](../forge/README.md#6-agent-tools). Implement wrappers in `agent_legacy/tools/forge_tool_api.py` and `agent_legacy/tools/forge_task.py`; keep transport handling in `forge/tool_client.py` and coordination in `forge/task.py`.
 
 Diagnostic Query and bound calls invoke the same HTTP methods. Every mutating or task-attributed
 wrapper validates ownership and the frozen Tool binding before network access. Tool wrappers must

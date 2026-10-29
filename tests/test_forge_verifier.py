@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from PhyAgentOS.agent.session_verifier import ForgeTaskVerifier
+from PhyAgentOS.agent_legacy.session_verifier import ForgeTaskVerifier
 from PhyAgentOS.verification.contracts import (
     EvidenceArtifact,
     EvidenceBundle,

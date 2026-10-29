@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import asyncio
 
-from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.agent.tools.message import MessageTool
+from PhyAgentOS.agent_legacy.loop import AgentLoop
+from PhyAgentOS.agent_legacy.tools.message import MessageTool
 from PhyAgentOS.bus.events import InboundMessage
 from PhyAgentOS.bus.queue import MessageBus
 from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest

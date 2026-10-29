@@ -21,9 +21,9 @@ from typing import Any, Callable
 
 import pytest
 
-from PhyAgentOS.agent.loop import AgentLoop
-from PhyAgentOS.agent.tool_results import DEFAULT_MAX_CHARS
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.loop import AgentLoop
+from PhyAgentOS.agent_legacy.tool_results import DEFAULT_MAX_CHARS
+from PhyAgentOS.agent_legacy.tools.base import Tool
 from PhyAgentOS.bus.agent_events import AgentEvent, AgentEventType
 from PhyAgentOS.bus.events import InboundMessage, OutboundMessage
 from PhyAgentOS.bus.queue import MessageBus

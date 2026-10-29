@@ -11,22 +11,22 @@ from typing import Any, Callable
 
 from loguru import logger
 
-from PhyAgentOS.agent.experience.activation import SkillActivationManager
-from PhyAgentOS.agent.experience.analyzer import ExperienceAnalyzer
-from PhyAgentOS.agent.experience.contracts import (
+from PhyAgentOS.agent_legacy.experience.activation import SkillActivationManager
+from PhyAgentOS.agent_legacy.experience.analyzer import ExperienceAnalyzer
+from PhyAgentOS.agent_legacy.experience.contracts import (
     ScopedLesson,
     SkillActivation,
     TaskEpisode,
     WorkflowTraceItem,
     utc_now,
 )
-from PhyAgentOS.agent.experience.evolution import SkillEvolutionError, SkillEvolutionManager
-from PhyAgentOS.agent.experience.redaction import redact_text
-from PhyAgentOS.agent.experience.source import (
+from PhyAgentOS.agent_legacy.experience.evolution import SkillEvolutionError, SkillEvolutionManager
+from PhyAgentOS.agent_legacy.experience.redaction import redact_text
+from PhyAgentOS.agent_legacy.experience.source import (
     AgentTaskOutcomeSource,
     ForgeTaskOutcomeSource,
 )
-from PhyAgentOS.agent.experience.store import ExperienceStore
+from PhyAgentOS.agent_legacy.experience.store import ExperienceStore
 
 
 class ExperienceCoordinator:

@@ -243,7 +243,7 @@ async def _process_direct_for_scheduler(agent, *, source: str, **kwargs) -> str 
     """Run a cron/heartbeat turn; a full session queue means skip, not deliver."""
     from loguru import logger
 
-    from PhyAgentOS.agent.loop import SessionQueueFullError
+    from PhyAgentOS.agent_legacy.loop import SessionQueueFullError
 
     try:
         return await agent.process_direct(**kwargs)
@@ -431,7 +431,7 @@ def _make_forge_verifier(config: Config, provider):
     """Create the Forge task verifier and its serializable child provider config."""
     if not config.agents.verification.service_enabled:
         return None
-    from PhyAgentOS.agent.session_verifier import ForgeTaskVerifier
+    from PhyAgentOS.agent_legacy.session_verifier import ForgeTaskVerifier
     from PhyAgentOS.providers.service import ProviderService
 
     settings = config.agents.verification
@@ -501,7 +501,7 @@ def _make_forge_components(config: Config, provider):
     invocation_ids = DynamicRuntimeSet(runtime_registry, "invocation_ids")
     session_ids = DynamicRuntimeSet(runtime_registry, "session_ids")
     task_binding_ids = DynamicRuntimeSet(runtime_registry, "task_binding_ids")
-    from PhyAgentOS.agent.skills import SkillsLoader
+    from PhyAgentOS.agent_legacy.skills import SkillsLoader
 
     binding_resolver = ForgeSkillBindingResolver(
         runtime_registry,
@@ -571,7 +571,7 @@ def gateway(
     reasoning_effort: str | None = typer.Option(None, "--reasoning-effort", help="Model-supported effort: minimal, low, medium, high, xhigh, max; none uses model default"),
 ):
     """Start the PhyAgentOS gateway."""
-    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.queue import MessageBus
     from PhyAgentOS.channels.manager import ChannelManager
     from PhyAgentOS.config.paths import get_cron_dir
@@ -645,7 +645,7 @@ def gateway(
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
-        from PhyAgentOS.agent.tools.cron import CronTool
+        from PhyAgentOS.agent_legacy.tools.cron import CronTool
         reminder_note = (
             "[Scheduled Task] Timer finished.\n\n"
             f"Task '{job.name}' has been triggered.\n"
@@ -1081,7 +1081,7 @@ def agent(
     """Interact with the agent directly."""
     from loguru import logger
 
-    from PhyAgentOS.agent.loop import AgentLoop
+    from PhyAgentOS.agent_legacy.loop import AgentLoop
     from PhyAgentOS.bus.queue import MessageBus
     from PhyAgentOS.config.paths import get_cron_dir
     from PhyAgentOS.cron.service import CronService

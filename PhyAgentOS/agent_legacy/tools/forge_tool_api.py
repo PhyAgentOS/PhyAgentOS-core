@@ -7,7 +7,7 @@ import json
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
-from PhyAgentOS.agent.tools.base import Tool
+from PhyAgentOS.agent_legacy.tools.base import Tool
 from PhyAgentOS.forge.task import AgentTaskCoordinator, AgentTaskError
 from PhyAgentOS.forge.tool_client import (
     ForgeToolAPIError,
