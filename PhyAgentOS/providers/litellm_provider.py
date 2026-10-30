@@ -36,6 +36,8 @@ class LiteLLMProvider(LLMProvider):
     (see providers/registry.py) — no if-elif chains needed here.
     """
 
+    supports_native_stream = True
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -400,11 +402,7 @@ class LiteLLMProvider(LLMProvider):
 
         usage = {}
         if hasattr(response, "usage") and response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
+            usage = self._usage_to_dict(response.usage)
 
         reasoning_content = getattr(message, "reasoning_content", None) or None
         thinking_blocks = getattr(message, "thinking_blocks", None) or None

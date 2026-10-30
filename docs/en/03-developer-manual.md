@@ -25,11 +25,15 @@ This manual covers Core implementation: AgentTask coordination, persistence, bin
 | `agent/capabilities/` | Native Forge tool definitions and operations, Core `ToolOutcome` mapping, and `activate_skill` |
 | `agent/services/skill_documents.py`, `agent/services/turn_activation.py` | Skill document discovery and per-turn activation identity |
 | `agent/bootstrap.py`, `agent/services/forge_verifier.py` | Shared Forge factories and the semantic verifier; `agent_legacy/session_verifier.py` remains an alias |
+| `agent/services/session_catalog.py` | Session ids, titles, per-day counters and per-session provider/model/effort selection in `core.db` |
+| `agent/services/context_compaction.py` | Manual compaction summary and the recent-complete-turn projection |
+| `agent/services/usage.py` | Usage ledger, next-request context estimate and turn/session footer formatting |
+| `agent/services/background_runtime.py` | One shared Core assembly for gateway cron, heartbeat and channel turns, with frozen routing and bounded admission |
 | `cli/commands.py` | Single Typer app, global callback, and registration of the command groups, including the one `agent` command |
-| `cli/command_groups/agent_commands.py` | Core `paos agent --runtime core`: dependency construction, per-turn assembly, `CoreAgentSession`, and process lifecycle |
+| `cli/command_groups/agent_commands.py` | Core `paos agent` (default): dependency construction, per-turn assembly, `CoreAgentSession`, and process lifecycle |
 | `cli/command_groups/` (other modules) | Provider, gateway, Skill, Forge Node, channel, and onboard/status command groups registered by `commands.py` |
 | `cli/configuration.py` | Config loading and startup provider/evolution selection shared by the gateway and legacy paths |
-| `cli/legacy/legacy_agent.py`, `cli/legacy/legacy_support.py` | Default legacy `paos agent`, its terminal interaction, and the legacy prompt-session helpers |
+| `cli/legacy/legacy_agent.py`, `cli/legacy/legacy_support.py`, `cli/legacy/legacy_gateway.py` | Legacy `paos agent --runtime legacy`, its terminal interaction, the legacy prompt-session helpers, and the legacy gateway selected by `paos gateway --runtime legacy` |
 | `cli/interaction/interactive_session.py`, `cli/interaction/agent_output.py`, `cli/interaction/terminal_input.py`, `cli/interaction/terminal_display.py`, `cli/interaction/model_picker.py` | Core input scheduling and cancel, message rendering, terminal input, the live status/tool region, and provider/model/effort selectors |
 | `agent_legacy/loop.py` | Existing Agent loop, general tools, dynamic MCP, Forge tool registration, context, and lifecycle |
 | `agent_legacy/tools/forge_tool_api.py` | Compatibility wrappers for the ten Gateway Tool API tools |
@@ -62,6 +66,14 @@ Diagnostic Query and bound calls invoke the same HTTP methods. Every mutating or
 wrapper validates ownership and the frozen Tool binding before network access. Tool wrappers must
 never invent a Gateway identity or result.
 
+Optional `timeout_ms` is not defaulted by the Agent: when the Gateway's limit is unknown the model
+omits it and the Gateway applies its own default. An HTTP client timeout is a different setting and
+must not stand in for it. The Core prompt fragment reads unresolved Action/Session blockers from
+the coordinator on every step, across the whole workspace, and reports task/invocation identity,
+status and semantics only; a local `succeeded` never hides an older unknown, and `None` means the
+Gateway identity was never confirmed. The fragment is current blocking state, not proof of
+resolution.
+
 ## 5. AgentTask contracts and transactions
 
 `AgentTaskRecord` contains a stable ID, task description, `TaskVerificationContract`, status,
@@ -73,6 +85,13 @@ inside the same transaction, enforcing one global active slot across processes. 
 complete validated record and an append-only event. Callers do not modify tables directly.
 
 The [AgentTask state contract](../forge/README.md#8-agenttask-model) defines public states. Store transitions must preserve those semantics; an `unknown` Tool record closes accounting without proving physical stop.
+
+The Gateway now labels its own pre-dispatch request validation with the explicit
+`FORGE_TOOL_REQUEST_VALIDATION_REJECTED` error code. PAOS treats that code as `failed` only
+when the response is HTTP 400 and has no invocation/attempt identity. An older or currently
+released Gateway that returns a bare 400 (`msg` without `error.code`) still stays `unknown`;
+the updated source must actually be deployed before the rejection stops recurring, so do not
+claim the running Gateway is fixed.
 
 ## 6. Bound execution lifecycle
 
@@ -179,11 +198,13 @@ selection and never switches to the other one after a failure:
 
 | Selection | Owner | Status |
 |:----------|:------|:-------|
-| `--runtime legacy` (default) | `cli/legacy/legacy_agent.py` | Existing path; still the default |
-| `--runtime core` | `cli/command_groups/agent_commands.py` | New Core path; opt-in, with the gaps listed below |
+| `--runtime core` (default) | `cli/command_groups/agent_commands.py` | Core path; does not import the legacy package |
+| `--runtime legacy` | `cli/legacy/legacy_agent.py` | Previous implementation, explicit opt-in for comparison |
 
 `commands.py` keeps the Typer app, the global callback, and the one registration point; each
-command group owns its own Typer app or `register_*` function. `configuration.py` holds config
+command group owns its own Typer app or `register_*` function. `register_agent` imports the legacy
+runner only inside an explicit `--runtime legacy` branch; building the app or running Core never
+imports `agent_legacy` or `cli.legacy`. `configuration.py` holds config
 loading and startup provider/evolution selection shared by the gateway and legacy paths.
 `agent_commands.py` owns only the Core path: it reads configuration, builds dependencies, builds
 one assembly per turn, and closes the session; it also still holds `CoreAgentSession` and the
@@ -282,6 +303,107 @@ receipt and a "processing" notice. The receipt never repeats the message text.
 `agent_legacy/session_verifier.py` re-exports it, so existing imports and module patches still
 apply.
 
+### Session catalog and identity
+
+The Core store keeps events and catalog metadata in the same `core.db`. `SessionCatalog`
+(`agent/services/session_catalog.py`) adds two tables: `session_catalog` holds a title and the last
+provider/model/effort selection per session, and `session_counters` allocates one sequence per
+local day. `create_session()` inserts the counter and the catalog row inside one
+`BEGIN IMMEDIATE` transaction and retries if the resulting id already exists, so concurrent
+processes and restarts never receive the same `cli:YYYYMMDD-NN` id. Sessions that only exist in
+`session_events` stay listed with their original id; metadata is created lazily and no id is
+renamed. The title comes from `derive_title()` over the first input: whitespace is collapsed,
+credential-shaped text is redacted, the value is shortened locally, and no model call is made. The
+title is metadata only; the id never changes. `--session <id>` calls `ensure_session()` instead of
+allocating a new id. Bare `/session` lists catalog entries (most recently updated first), and
+`/session <id>` resumes one. `/new` allocates a new id in the running process. Both commands are
+answered locally and never submit a model turn. Legacy JSONL sessions are neither read nor migrated.
+
+### Context accounting and the turn footer
+
+`UsageLedger` (`agent/services/usage.py`) is fed from durable events and is idempotent per
+`model_call_id`: a model call contributes its usage once, and a repeated completion only refines
+the stored snapshot. A failed or interrupted attempt that did report usage is counted as real
+spend; one without usage does not make history incomplete, while a completed call without usage
+does, and the summary says so. A missing field stays `None` and renders as `--`; only an explicit
+provider `0` becomes zero. `cached_tokens`
+and `reasoning_tokens` are informational: cache reads are already inside prompt tokens and
+reasoning tokens are already inside completion tokens, so they are never added to input, output or
+total. `total_tokens` uses the provider value when present and otherwise prompt plus completion.
+The cache hit ratio is shown only when every counted call reports both prompt and cached tokens.
+`estimate_context()` starts from the newest durable `request.prepared` snapshot, adds assistant and
+tool messages after it, and marks the number `exact` only while the provider-reported prompt size
+still describes the unchanged request. Its capacity is the effective window: the smaller of the
+configured `context_window_tokens` and the known model capacity. Model rounds count provider calls,
+not internal reasoning steps, and no reasoning step count is fabricated. The session cumulative
+line is rebuilt from stored events, so it survives a reload. The footer is a terminal rendering
+only; it is never inserted into the message history sent to a provider.
+
+### Streaming contract
+
+`ModelAdapter.stream()` is used when the injected provider exposes a callable `chat_stream`; a
+provider that does not keep the `complete` path and yields only the terminal response. Streaming
+text is body text only and is persisted as step-scoped `model.response.delta` events before
+`model.attempt.completed`; `reasoning_content` is never streamed. The terminal completed event
+still carries the full content and the usage actually received, history stores exactly one
+complete assistant message built from that terminal response, and the display layer appends
+deltas without printing the completed content again. Tool calls are collected from complete
+`tool_call` events, so the loop executes nothing until the arguments are fully received. Closing
+the returned generator closes the provider stream on cancellation; a cancelled or disconnected
+stream is never re-requested automatically. A budget error is raised before the first event so it
+is recorded as a clean failed attempt. Usage on failed or interrupted attempts contains only keys
+the provider actually sent.
+
+### Manual compaction
+
+`/compact` stores a checkpoint row in the session's append-only checkpoint projection; it never
+rewrites `session_events`, and the original events stay readable. It runs only between turns; it
+writes a summary of earlier history and keeps recent complete turns verbatim. Each summary call
+first writes a `compaction_attempts` row and finishes it with a status and the usage the provider
+actually reported. A compaction refused during planning, before any provider call, writes no
+attempt and costs nothing. A failed or cancelled attempt therefore leaves the conversation
+projection and the original context unchanged, while the attempt and any known usage remain
+visible. Successful and failed attempts contribute the usage they actually reported to the session
+cumulative total; a failed attempt without reported usage adds no tokens but stays visible in the
+attempt trail. The usage copied onto a checkpoint is reference metadata and is not added a second
+time. The before/after estimates for compaction and the per-request pre-check share one real token
+estimator that also counts the system prompt and the visible tools, instead of estimating from
+character counts; a checkpoint is written only when the next request's estimate actually shrinks.
+The UI switches the checkpoint projection only at `REQUEST_PREPARED`, so a turn start
+(`TURN_STARTED`) does not fall back to the old history. Compaction never dispatches a tool call and
+never changes an AgentTask or Forge record, so an unresolved `unknown` after compaction still
+blocks new tasks.
+
+### Background gateway runtime
+
+`paos gateway` builds its cron, heartbeat and channel turns from
+`open_background_core()` in `agent/services/background_runtime.py`, using the same
+`CoreAgentSession`, store, Forge coordinator/client and Skill activation manager as the CLI.
+`TurnBinding` freezes channel, chat, reply target and thread metadata before a turn starts, and
+capabilities read the binding by `session_id` (not a shared `ContextVar`), so a later turn cannot
+retarget an in-flight reply. The last external chat target is persisted to
+`<workspace>/.gateway_route.json` (only channel, chat and `message_thread_id`) and restored at
+startup; loading and use both re-check that the channel is enabled, so a stale target is not used.
+Heartbeat cycles are serialized by the heartbeat service's cycle lock, so they cannot overlap. A
+session's turns stay strictly ordered; different sessions run up to the configured concurrency and
+a session over its queue limit is refused instead of growing without bound. The channel dispatcher
+publishes at most one final message per turn as the completed text; streamed deltas are not
+forwarded to channels. It suppresses the message when the message tool already delivered the
+turn's reply. The Core CLI registers `CronCapability` over the same job store but never starts the
+scheduler; scheduling runs only in `paos gateway`. Shutdown stops intake, settles accepted turns
+and closes Core once. Channels that are not configured are not started. `--runtime legacy` keeps
+the old implementation available for comparison and imports it only when selected; building or
+running the Core gateway never imports `agent_legacy` or `cli.legacy`.
+
+Known cron store behavior: jobs live in one `jobs.json` with a sibling `.lock` file. `_store_lock()`
+takes a blocking `flock` (cross-process through `fcntl` on Linux; on platforms without `fcntl` it
+only serializes within the process) and is held only around the synchronous read-modify-write,
+never across an awaited model or tool call. Writes go to a temporary file and are published with
+`os.replace`. After a job runs, the service reads the latest file under the lock and merges only
+that job's own runtime state; an external add, delete, disable or schedule change is preserved. The
+store remains one JSON file: this round did not move it to SQLite or add a configuration option.
+Run a single scheduler owner; this is not a multi-gateway exactly-once claim.
+
 ### Skill activation scope
 
 `activate_skill` is a Core tool from `agent/capabilities/skill_access_capability.py`. An activation
@@ -292,24 +414,38 @@ Activation reads the Skill document and does not start a Skill runtime.
 
 ### What the Core path does not cover
 
-General-purpose tools, streaming replies, `/correct`, memory and evolution, managed interaction
-Sessions, fleet mode, and the cron, heartbeat, and channel entry points are not migrated. The Forge
-interaction supervisor is not wired into the Core CLI, so this is not a completed interaction
-migration. Existing legacy JSONL sessions are not imported; the Core store is a separate SQLite
-file. Provider failures are reported with a short redacted diagnostic: the exception type and HTTP
-status are kept, while response bodies and credentials are not.
+General-purpose tools, `/correct`, memory and evolution, managed interaction Sessions, and fleet
+mode are not migrated. The Forge interaction supervisor is not wired into the Core CLI, so this is
+not a completed interaction migration. Existing legacy JSONL sessions are not imported; the Core
+store is a separate SQLite file. Provider failures are reported with a short redacted diagnostic:
+the exception type and HTTP status are kept, while response bodies and credentials are not.
 
 ### Tests
 
 Focused suites cover document discovery, activation scope, verifier aliasing, Core CLI single-turn
 and per-turn assembly wiring, interactive FIFO, cancel, rendering, queue receipts, local command
-handling, and tool-row tracking. The terminal behaviour is exercised with a real prompt_toolkit
+handling, and tool-row tracking. Session catalog and manual compaction have local tests for atomic
+per-day ids, title derivation, event-only sessions, selection persistence, checkpoint projection,
+refused/failed summaries, open turns and retained tool pairs; the Core CLI session commands are
+covered by `test_cli_session_features.py`. Streaming coverage uses fake providers with delta,
+tool-call, usage, done and error events, including cancel and
+no-`chat_stream` fallback. A provider-level check drives the real `AsyncOpenAI` client through an
+in-process mock transport and SSE stream, confirming text before finish, one POST, one history
+message and usage/cache handling; no external provider is contacted. Usage display, provider usage
+details, streaming cancel/display and the gateway background runtime have local suites of their
+own (`test_core_usage_display.py`, `test_provider_usage_details.py`,
+`test_core_streaming_cancel.py`, `test_core_streaming_display.py`,
+`test_core_background_runtime.py`, `test_core_background_capabilities.py`,
+`test_core_scheduler_gateway.py`). Gateway tests cover route restore, the frozen heartbeat target,
+serialized heartbeat cycles, one-reply suppression and scheduler wiring against temporary stores. These are local tests: no external provider or real
+channel delivery is exercised; cron and heartbeat are driven locally, and no numeric test count is
+guaranteed by this manual. The terminal behaviour is also exercised with a real prompt_toolkit
 pipe input and Vt100 output: the session line above the prompt, the hidden marker and cursor plus
 blocked keys while busy, draft preservation, the first-Esc hint, a second Esc cancelling exactly
 once, timeout/other-key/arrow disarm, menu Esc containment, resize, and a paused reader around a
-menu. This is not only a mocked TTY flag. They use local fake providers, fake Forge clients, and temporary
-stores; no real provider or Gateway request is part of the suite. The full gate remains `pytest`,
-`ruff check PhyAgentOS tests`, and `compileall`.
+menu. This is not only a mocked TTY flag. They use local fake providers, fake Forge clients, and
+temporary stores; no real provider or Gateway request is part of the suite. The full gate remains
+`pytest`, `ruff check PhyAgentOS tests`, and `compileall`.
 
 ## 14. Test gates
 

@@ -179,15 +179,17 @@ def test_importing_new_composition_does_not_load_agent_legacy() -> None:
 
 
 def test_core_cli_modules_import_without_agent_legacy() -> None:
-    """The Core entry modules must not pull the default legacy runtime in.
+    """The Core CLI entry must not pull the legacy runtime into the process.
 
-    ``PhyAgentOS.cli.commands`` still imports the legacy module explicitly
-    because legacy remains the default runtime; that transitional dependency is
-    deliberately not covered by this check.
+    This covers the whole entry module now that Core is the default: building
+    the Typer app, including its one registration point, does not import
+    ``PhyAgentOS.agent_legacy`` or ``PhyAgentOS.cli.legacy``. Those are loaded
+    only when ``--runtime legacy`` is actually selected.
     """
     code = "\n".join(
         [
             "import sys",
+            "import PhyAgentOS.cli.commands",
             "import PhyAgentOS.cli.command_groups.agent_commands",
             "import PhyAgentOS.cli.configuration",
             "import PhyAgentOS.cli.interaction.agent_output",
@@ -197,6 +199,8 @@ def test_core_cli_modules_import_without_agent_legacy() -> None:
             "    name for name in sys.modules",
             "    if name == 'PhyAgentOS.agent_legacy'",
             "    or name.startswith('PhyAgentOS.agent_legacy.')",
+            "    or name == 'PhyAgentOS.cli.legacy'",
+            "    or name.startswith('PhyAgentOS.cli.legacy.')",
             "]",
             "assert loaded == [], loaded",
         ]

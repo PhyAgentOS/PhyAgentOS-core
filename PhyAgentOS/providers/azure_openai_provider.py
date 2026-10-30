@@ -194,12 +194,7 @@ class AzureOpenAIProvider(LLMProvider):
 
             usage = {}
             if response.get("usage"):
-                usage_data = response["usage"]
-                usage = {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                }
+                usage = self._usage_to_dict(response["usage"])
 
             reasoning_content = message.get("reasoning_content") or None
 

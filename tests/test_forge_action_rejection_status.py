@@ -270,3 +270,148 @@ async def test_audit_finalization_ignores_a_rejected_attempt(tmp_path) -> None:
     finalized = await coordinator.finalize_task(task.task_id)
 
     assert finalized.status.value == "succeeded"
+
+
+class CountingActionClient:
+    """Count every dispatch attempt; never succeed."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls = 0
+
+    async def invoke_action(
+        self,
+        tool_id: str,
+        arguments: dict[str, Any],
+        **_: Any,
+    ) -> dict[str, Any]:
+        del tool_id, arguments
+        self.calls += 1
+        raise self.error
+
+
+def _request_validation_rejection(**kwargs: Any) -> ForgeToolAPIError:
+    return ForgeToolAPIError(
+        "timeout_ms must not exceed configured tools.invoke_timeout_ms maximum 60000",
+        status_code=400,
+        error_code="FORGE_TOOL_REQUEST_VALIDATION_REJECTED",
+        retryable=False,
+        **kwargs,
+    )
+
+
+async def test_typed_request_validation_rejection_fails_without_resend_or_recreation(
+    tmp_path,
+) -> None:
+    client = CountingActionClient(_request_validation_rejection())
+    coordinator = _coordinator(tmp_path, client)
+    task_id = _new_task(coordinator)
+
+    with pytest.raises(ForgeToolAPIError):
+        await coordinator.start_action(
+            task_id, "motion.move_pose", {"distance_m": 0.05}
+        )
+    records = coordinator.store.get(task_id).execution_records
+    assert [record.status for record in records] == ["failed"]
+    assert records[0].rejected_before_dispatch is True
+    assert records[0].invocation_id is None
+    assert records[0].attempt_id is None
+    assert records[0].error is not None
+    assert records[0].error["status_code"] == 400
+    assert records[0].error["error_code"] == "FORGE_TOOL_REQUEST_VALIDATION_REJECTED"
+    assert records[0].error["retryable"] is False
+
+    # The rejection is not retried automatically.
+    assert client.calls == 1
+
+    finalized = await coordinator.finalize_task(task_id)
+    assert finalized.status.value == "failed"
+
+    # A cleanly rejected task no longer blocks the next task.
+    created = coordinator.create_task(
+        task_description="next attempt",
+        verification=TaskVerificationContract(mode="off"),
+    )
+    assert created.status.value == "executing"
+    assert client.calls == 1
+
+
+async def test_typed_request_validation_with_remote_identity_stays_unknown(
+    tmp_path,
+) -> None:
+    client = CountingActionClient(
+        _request_validation_rejection(
+            payload={
+                "ok": False,
+                "error": {
+                    "code": "FORGE_TOOL_REQUEST_VALIDATION_REJECTED",
+                    "message": "rejected",
+                },
+                "data": {"invocation_id": "inv_present", "attempt_id": "attempt_present"},
+            }
+        )
+    )
+    coordinator = _coordinator(tmp_path, client)
+    task_id = _new_task(coordinator)
+
+    with pytest.raises(ForgeToolAPIError):
+        await coordinator.start_action(
+            task_id, "motion.move_pose", {"distance_m": 0.05}
+        )
+    record = coordinator.store.get(task_id).execution_records[0]
+    assert record.status == "unknown"
+    assert record.rejected_before_dispatch is False
+    assert record.invocation_id == "inv_present"
+    assert record.attempt_id == "attempt_present"
+    assert client.calls == 1
+
+
+async def test_bare_400_without_code_stays_unknown(tmp_path) -> None:
+    client = CountingActionClient(
+        ForgeToolAPIError(
+            "Forge Gateway Tool API /tools/motion.move_pose:invoke rejected request: "
+            "timeout_ms must not exceed configured tools.invoke_timeout_ms maximum 60000",
+            status_code=400,
+        )
+    )
+    coordinator = _coordinator(tmp_path, client)
+    task_id = _new_task(coordinator)
+
+    with pytest.raises(ForgeToolAPIError):
+        await coordinator.start_action(
+            task_id, "motion.move_pose", {"distance_m": 0.05}
+        )
+    record = coordinator.store.get(task_id).execution_records[0]
+    assert record.status == "unknown"
+    assert record.rejected_before_dispatch is False
+    assert record.error is not None
+    assert record.error["status_code"] == 400
+    assert "error_code" not in record.error
+
+    with pytest.raises(AgentTaskError, match="identical Action"):
+        await coordinator.start_action(
+            task_id, "motion.move_pose", {"distance_m": 0.05}
+        )
+    assert client.calls == 1
+
+
+async def test_validation_code_on_non_400_stays_unknown(tmp_path) -> None:
+    client = CountingActionClient(
+        ForgeToolAPIError(
+            "typed code on an unexpected status",
+            status_code=503,
+            error_code="FORGE_TOOL_REQUEST_VALIDATION_REJECTED",
+            retryable=False,
+        )
+    )
+    coordinator = _coordinator(tmp_path, client)
+    task_id = _new_task(coordinator)
+
+    with pytest.raises(ForgeToolAPIError):
+        await coordinator.start_action(
+            task_id, "motion.move_pose", {"distance_m": 0.05}
+        )
+    record = coordinator.store.get(task_id).execution_records[0]
+    assert record.status == "unknown"
+    assert record.rejected_before_dispatch is False
+    assert client.calls == 1

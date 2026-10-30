@@ -72,11 +72,16 @@ def compose_agent(
     deadline_seconds: float | None = None,
     additional_capabilities: Sequence[Capability] = (),
     forge_capability: Capability | None = None,
+    stream: bool = True,
 ) -> AgentAssembly:
     """Build the Forge-enabled host from already-built collaborators.
 
     ``provider`` is anything exposing the provider's
     ``chat_with_retry`` coroutine; it is wrapped by :class:`ModelAdapterImpl`.
+    When it also exposes ``chat_stream``, ``stream=True`` (the default) lets
+    the core display body text before the model finishes; providers without it
+    keep the non-streaming path unchanged. ``stream=False`` disables native
+    streaming explicitly.
     ``store``, ``coordinator``, and ``client`` are injected and remain owned by
     the caller's process, except that ``host.aclose()`` closes the store
     through the runtime as the core contract requires. ``system_instructions``
@@ -106,7 +111,7 @@ def compose_agent(
         system_instructions,
         fragments=tuple(item.prompt_context for item in capabilities),
     )
-    adapter = ModelAdapterImpl(provider)
+    adapter = ModelAdapterImpl(provider, stream=stream)
     executor = ToolExecutorImpl(registrations, store)
     driver = LoopDriverImpl(
         assembler=assembler,

@@ -31,6 +31,7 @@ from .protocols import (
     ModelAdapter,
     PromptAssembler,
     SessionStore,
+    StreamingModelAdapter,
     ToolExecutor,
 )
 from .runtime import AgentRuntimeImpl
@@ -44,6 +45,7 @@ from .types import (
     ModelCallError,
     ModelRequest,
     ModelResponse,
+    ModelStreamDelta,
     OperationCancelledError,
     PromptBundle,
     ToolCall,
@@ -83,6 +85,7 @@ __all__ = [
     "ModelCallError",
     "ModelRequest",
     "ModelResponse",
+    "ModelStreamDelta",
     "OperationCancelledError",
     "PromptAssembler",
     "PromptAssemblerImpl",
@@ -91,6 +94,7 @@ __all__ = [
     "RuntimeEvent",
     "SessionStore",
     "SQLiteSessionStore",
+    "StreamingModelAdapter",
     "ToolCall",
     "ToolDefinition",
     "ToolError",

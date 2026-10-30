@@ -19,12 +19,19 @@ reasoning_effort, tool_choice)`` coroutine is accepted.
 from __future__ import annotations
 
 import copy
+import inspect
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from enum import Enum
 from typing import Any, Protocol
 
-from .types import ModelCallError, ModelRequest, ModelResponse, ToolCall
+from .types import (
+    ModelCallError,
+    ModelRequest,
+    ModelResponse,
+    ModelStreamDelta,
+    ToolCall,
+)
 
 __all__ = ["ChatProvider", "ModelAdapter"]
 
@@ -75,13 +82,20 @@ class ModelAdapter:
     A request that leaves ``temperature``/``max_tokens``/``reasoning_effort``
     unset passes nothing for them, so the injected provider decides its own
     defaults; the adapter never invents or overrides them.
+
+    ``stream`` is available when ``stream=True`` (the default) and the injected
+    provider exposes a callable ``chat_stream``. It yields body-text deltas as
+    they arrive and ends with exactly one :class:`ModelResponse`; the loop
+    driver, not the adapter, persists deltas and history. Providers without
+    ``chat_stream`` keep the old ``complete`` path. Passing ``stream=False``
+    disables native streaming explicitly.
     """
 
-    def __init__(self, provider: ChatProvider) -> None:
+    def __init__(self, provider: ChatProvider, *, stream: bool = True) -> None:
         self._provider = provider
+        self._stream_enabled = stream
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
-        """Call the provider once and map its answer, or raise ModelCallError."""
+    def _generation_kwargs(self, request: ModelRequest) -> dict[str, Any]:
         generation: dict[str, Any] = {}
         if request.model is not None:
             generation["model"] = request.model
@@ -93,6 +107,11 @@ class ModelAdapter:
             generation["reasoning_effort"] = request.reasoning_effort
         if request.tool_choice is not None:
             generation["tool_choice"] = request.tool_choice
+        return generation
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        """Call the provider once and map its answer, or raise ModelCallError."""
+        generation = self._generation_kwargs(request)
 
         # Both helpers return deep copies; the request snapshot is never mutated.
         messages = request.to_messages()
@@ -119,6 +138,162 @@ class ModelAdapter:
                 request.model_call_id,
                 _safe_detail(f"malformed provider response: {type(exc).__name__}: {exc}"),
             ) from exc
+
+    def stream(
+        self, request: ModelRequest
+    ) -> AsyncIterator[ModelStreamDelta | ModelResponse]:
+        """Stream one answer as deltas followed by one terminal response.
+
+        The returned object is an async iterator that also exposes the usage
+        observed so far (``usage``) and whether a native provider stream was
+        used (``native``). Closing it closes the provider stream; the loop does
+        this on cancellation and reads ``usage`` afterwards, so token counts
+        seen before a stop are not lost. A provider error raises
+        :class:`ModelCallError`; if the provider had already reported usage, it
+        is attached to the error instead of being dropped.
+
+        When ``stream=False`` or the provider has no ``chat_stream``, the old
+        ``complete`` path is replayed and ``native`` is ``False``. That is the
+        only fallback: an error from a real stream is never retried through
+        ``complete``.
+        """
+        chat_stream = getattr(self._provider, "chat_stream", None)
+        native = (
+            self._stream_enabled
+            and callable(chat_stream)
+            and bool(getattr(self._provider, "supports_native_stream", True))
+        )
+        usage: dict[str, int] = {}
+        return _ModelStream(
+            self._stream_response(request, usage), usage, native=native
+        )
+
+    async def _stream_response(
+        self, request: ModelRequest, usage: dict[str, int]
+    ) -> AsyncIterator[ModelStreamDelta | ModelResponse]:
+        chat_stream = getattr(self._provider, "chat_stream", None)
+        native = (
+            self._stream_enabled
+            and callable(chat_stream)
+            and bool(getattr(self._provider, "supports_native_stream", True))
+        )
+        if not native:
+            yield await self.complete(request)
+            return
+
+        generation = self._generation_kwargs(request)
+        messages = request.to_messages()
+        tools = request.to_provider_tools()
+        model_call_id = request.model_call_id
+
+        try:
+            events = chat_stream(
+                messages=messages,
+                tools=tools or None,
+                **generation,
+            )
+        except Exception as exc:
+            raise ModelCallError(
+                model_call_id,
+                _safe_detail(f"{type(exc).__name__}: {exc}"),
+            ) from exc
+        if not hasattr(events, "__aiter__"):
+            raise ModelCallError(
+                model_call_id,
+                "provider chat_stream did not return an async iterator",
+            )
+
+        content_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        try:
+            try:
+                async for event in events:
+                    # Usage may ride on any provider event, including one just
+                    # before a failure. Keep it before deciding how to react.
+                    event_usage = _to_usage(getattr(event, "usage", None))
+                    if event_usage:
+                        usage.update(event_usage)
+                    kind = getattr(event, "type", None)
+                    if kind == "delta":
+                        text = getattr(event, "content", None)
+                        if isinstance(text, str) and text:
+                            content_parts.append(text)
+                            yield ModelStreamDelta(text)
+                        continue
+                    if kind == "tool_call":
+                        tool_calls.append(
+                            _to_tool_call(model_call_id, getattr(event, "tool_call", None))
+                        )
+                        continue
+                    if kind == "usage":
+                        continue
+                    if kind == "done":
+                        yield _streamed_response(
+                            model_call_id,
+                            content="".join(content_parts),
+                            tool_calls=tuple(tool_calls),
+                            usage=usage,
+                            event=event,
+                        )
+                        return
+                    if kind == "error":
+                        raise ModelCallError(
+                            model_call_id,
+                            _safe_detail(
+                                getattr(event, "content", None) or "provider stream error"
+                            ),
+                            usage=usage,
+                        )
+                    raise ModelCallError(
+                        model_call_id,
+                        f"provider stream emitted an unknown event type: {kind!r}",
+                        usage=usage,
+                    )
+            except ModelCallError:
+                raise
+            except Exception as exc:
+                raise ModelCallError(
+                    model_call_id,
+                    _safe_detail(f"{type(exc).__name__}: {exc}"),
+                    usage=usage,
+                ) from exc
+        finally:
+            await _close_stream(events)
+
+        raise ModelCallError(
+            model_call_id,
+            "provider stream ended without a terminal event",
+            usage=usage,
+        )
+
+
+class _ModelStream:
+    """Async iterator returned by :meth:`ModelAdapter.stream`.
+
+    Exposes the usage observed so far and whether a native provider stream was
+    used, so the driver can record a cancelled attempt with what it already
+    knows. Closing it closes the inner adapter generator.
+    """
+
+    def __init__(
+        self,
+        events: AsyncIterator[ModelStreamDelta | ModelResponse],
+        usage: dict[str, int],
+        *,
+        native: bool,
+    ) -> None:
+        self._events = events
+        self.usage = usage
+        self.native = native
+
+    def __aiter__(self) -> "_ModelStream":
+        return self
+
+    async def __anext__(self) -> ModelStreamDelta | ModelResponse:
+        return await self._events.__anext__()
+
+    async def aclose(self) -> None:
+        await _close_stream(self._events)
 
 
 def _finish_reason(response: object) -> str:
@@ -160,6 +335,69 @@ def _to_model_response(model_call_id: str, response: object) -> ModelResponse:
             model_call_id, getattr(response, "thinking_blocks", None)
         ),
     )
+
+
+def _streamed_response(
+    model_call_id: str,
+    *,
+    content: str,
+    tool_calls: tuple[ToolCall, ...],
+    usage: Mapping[str, int],
+    event: object,
+) -> ModelResponse:
+    """Build the terminal response from a provider's ``done`` stream event.
+
+    The provider's done event does not repeat the text, so the adapter passes
+    the accumulated deltas. ``finish_reason`` must be terminal and non-error;
+    the loop's existing truncation and tool-validation rules then apply to the
+    same shape as the non-streaming path.
+    """
+    finish_reason = _finish_reason(event)
+    if not finish_reason:
+        raise ModelCallError(model_call_id, "provider stream has no finish_reason")
+    if finish_reason == "error":
+        detail = getattr(event, "content", None)
+        raise ModelCallError(
+            model_call_id,
+            _safe_detail(detail if isinstance(detail, str) and detail.strip() else "provider error"),
+            usage=usage,
+        )
+
+    reasoning = getattr(event, "reasoning_content", None)
+    if reasoning is not None and not isinstance(reasoning, str):
+        raise ModelCallError(model_call_id, "provider reasoning_content is not text")
+    if not tool_calls and not content.strip():
+        raise ModelCallError(model_call_id, "provider returned no usable answer")
+
+    try:
+        return ModelResponse(
+            content=content,
+            finish_reason=finish_reason,
+            tool_calls=tool_calls,
+            usage=usage,
+            reasoning_content=reasoning,
+            thinking_blocks=_to_thinking_blocks(
+                model_call_id, getattr(event, "thinking_blocks", None)
+            ),
+        )
+    except ModelCallError:
+        raise
+    except Exception as exc:
+        raise ModelCallError(
+            model_call_id,
+            _safe_detail(f"malformed provider response: {type(exc).__name__}: {exc}"),
+        ) from exc
+
+
+async def _close_stream(stream: object) -> None:
+    """Close an async stream/iterator, awaiting its result when needed."""
+    for name in ("aclose", "close"):
+        close = getattr(stream, name, None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+            return
 
 
 def _to_usage(raw: object) -> dict[str, int]:

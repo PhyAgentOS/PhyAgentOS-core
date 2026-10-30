@@ -17,6 +17,7 @@ per-session serialization, which then sees only one accepted turn at a time.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,14 +26,31 @@ import typer
 from rich.console import Console
 
 from PhyAgentOS.agent.bootstrap import build_forge_components
+from PhyAgentOS.agent.capabilities.cron_capability import CronCapability
 from PhyAgentOS.agent.capabilities.forge_capability import ForgeCapability
 from PhyAgentOS.agent.capabilities.skill_access_capability import SkillAccessCapability
 from PhyAgentOS.agent.composition import AgentAssembly, compose_agent
 from PhyAgentOS.agent.core import SQLiteSessionStore, TurnRequest, TurnStatus
+from PhyAgentOS.agent.core.events import EventType
 from PhyAgentOS.agent.core.host import AgentHostCloseError
+from PhyAgentOS.agent.core.session import CHECKPOINT_SUMMARY_NOTICE
+from PhyAgentOS.agent.services.context_compaction import compact_session
+from PhyAgentOS.agent.services.session_catalog import (
+    SessionCatalog,
+    SessionInfo,
+    SessionSelection,
+)
 from PhyAgentOS.agent.services.skill_documents import SkillDocumentLoader
 from PhyAgentOS.agent.services.turn_activation import TurnSkillActivationManager
+from PhyAgentOS.agent.services.usage import (
+    ContextSnapshot,
+    estimate_context,
+    estimate_context_from_conversation,
+)
 from PhyAgentOS.config.loader import load_config, set_config_path
+from PhyAgentOS.config.paths import get_cron_dir
+from PhyAgentOS.cron.service import CronService
+from PhyAgentOS.providers.base import StreamEvent
 from PhyAgentOS.providers.service import (
     ProviderError,
     ProviderService,
@@ -67,6 +85,18 @@ def _instructions(config) -> str:
         "Poll an admitted action to a terminal result before finalizing its task. "
         "Unknown remote state must not cause an automatic resubmission. "
         "Local cancellation is not confirmation that remote execution stopped.",
+        "When the Gateway's execution timeout limit is unknown, omit the optional "
+        "timeout_ms argument and let the Gateway apply its default. Never hard-code a "
+        "timeout, and never treat an HTTP client timeout as the remote execution timeout.",
+        "Only use tools declared by an activated Skill document or a ToolSpec you fetched "
+        "in this process. If the current end-effector pose or robot state is unavailable, "
+        "do not report a relative displacement as done and do not send a guessed absolute "
+        "target.",
+        "An unresolved remote blocker is authoritative even when it belongs to another "
+        "session: keep its task and invocation identity, write None when the invocation "
+        "was never confirmed, do not invent an id, do not resend the old Action/Session, "
+        "do not call forge_task_create again while it is unchanged, and do not cancel "
+        "another session's task to get around it. Never present a blocker as resolved.",
         "The existing task contract defaults to verification off (execution facts only). "
         "Verification modes are off, audit, enforce, and recovery. Respect the user's "
         "verification requirement; never silently turn it off. Semantic verification "
@@ -123,30 +153,105 @@ class _SelectedProvider:
     wrapper never substitutes the selection for them: if the request says a
     different model or effort, that is the call that is made, so the persisted
     ``request.prepared`` snapshot cannot disagree with the actual request.
+
+    Both the blocking and streaming paths use the same prompt budget guard.
+    A provider without ``chat_stream`` is called once through
+    ``chat_with_retry``; the terminal says so once instead of retrying a
+    connection that never produced a stream.
     """
 
-    def __init__(self, selection, context_window, max_tokens):
+    def __init__(self, selection, context_window, max_tokens, *, notice=None):
         self.selection = selection
         self.context_window = min(
             context_window, selection.context_window_tokens or context_window
         )
         self.max_tokens = max_tokens
+        self._notice = notice
+        self._fallback_notified = False
+        # A wrapper must not turn a non-native provider into a native one.
+        # A provider that only has the inherited ``chat_stream`` fallback is
+        # non-native; an older wrapper without the flag and with a real
+        # ``chat_stream`` is treated as native for compatibility.
+        underlying = selection.provider
+        self.supports_native_stream = bool(
+            callable(getattr(underlying, "chat_stream", None))
+            and bool(getattr(underlying, "supports_native_stream", True))
+        )
 
-    async def chat_with_retry(self, *, messages, tools=None, **kwargs):
-        selected = self.selection
-        model = kwargs.get("model") or selected.model
+    def _check_budget(self, *, messages, tools, model) -> None:
         estimated, _ = estimate_prompt_tokens_chain(
-            selected.provider, model, messages, tools
+            self.selection.provider, model, messages, tools
         )
         if estimated and estimated + self.max_tokens > self.context_window:
             raise ProviderError(
                 f"Context limit reached (estimated prompt {estimated}, reply budget "
-                f"{self.max_tokens}, limit {self.context_window}). Start a new --session "
-                "or use --runtime legacy for history compaction. No further model call "
-                "was sent."
+                f"{self.max_tokens}, limit {self.context_window}). Use /compact to "
+                "summarize older history, or /new to start a new session. No further "
+                "model call was sent."
             )
-        return await selected.provider.chat_with_retry(
+
+    async def chat_with_retry(self, *, messages, tools=None, **kwargs):
+        model = kwargs.get("model") or self.selection.model
+        self._check_budget(messages=messages, tools=tools, model=model)
+        return await self.selection.provider.chat_with_retry(
             messages=messages, tools=tools, **kwargs
+        )
+
+    async def chat_stream(self, *, messages, tools=None, **kwargs):
+        """Forward one stream with the same budget guard as the blocking path."""
+        selected = self.selection
+        model = kwargs.get("model") or selected.model
+        self._check_budget(messages=messages, tools=tools, model=model)
+        stream = getattr(selected.provider, "chat_stream", None)
+        if self.supports_native_stream and callable(stream):
+            events = stream(messages=messages, tools=tools, **kwargs)
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                # An outer cancellation can stop ``async for`` without
+                # exhausting the supplier; close it explicitly.
+                close = getattr(events, "aclose", None)
+                if close is None:
+                    close = getattr(events, "close", None)
+                if callable(close):
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+            return
+
+        # Called directly (the Core adapter chooses its own fallback path when
+        # supports_native_stream is False). This is a single completed answer,
+        # never a replayed fake stream, so it emits no delta.
+        if self._notice is not None and not self._fallback_notified:
+            self._fallback_notified = True
+            try:
+                self._notice(
+                    "This provider has no native streaming; the answer is "
+                    "shown once it is complete."
+                )
+            except Exception:
+                pass
+        response = await selected.provider.chat_with_retry(
+            messages=messages, tools=tools, **kwargs
+        )
+        finish_reason = getattr(response, "finish_reason", None)
+        content = getattr(response, "content", None)
+        if finish_reason == "error" or not finish_reason:
+            yield StreamEvent(
+                type="error",
+                content=content if isinstance(content, str) else "provider error",
+                finish_reason="error",
+            )
+            return
+        for call in getattr(response, "tool_calls", None) or ():
+            yield StreamEvent(type="tool_call", tool_call=call)
+        yield StreamEvent(
+            type="done",
+            finish_reason=finish_reason,
+            usage=dict(getattr(response, "usage", {}) or {}),
+            reasoning_content=getattr(response, "reasoning_content", None),
+            thinking_blocks=getattr(response, "thinking_blocks", None),
         )
 
 
@@ -172,6 +277,9 @@ class _SessionSlot:
     tail: "asyncio.Future[None] | None" = None
     abort: asyncio.Event = field(default_factory=asyncio.Event)
     current: _AssemblyState | None = None
+    # The summary task registered for a manual compaction. It is the only
+    # target of ``cancel``/``aclose`` while no model turn is running.
+    compact: "asyncio.Task | None" = None
 
 
 class CoreAgentSession:
@@ -222,13 +330,21 @@ class CoreAgentSession:
         store,
         sessions: SessionRuntimes,
         output,
+        raw_store=None,
+        compact=None,
     ):
         self._seed = seed
         self._seed_selection = selection
         self._build = build
         self._store = store
+        self.raw_store = raw_store if raw_store is not None else getattr(store, "store", None)
         self.sessions = sessions
         self.output = output
+        self._compact = compact
+        # Attached by the composition root; other entries may leave them unset.
+        self.catalog: SessionCatalog | None = None
+        self.instructions: str = ""
+        self.config = None
         self._canonical_capabilities = seed.capabilities
         self._slots: dict[str, _SessionSlot] = {}
         self._accepted_sessions: dict[str, None] = {}
@@ -312,16 +428,124 @@ class CoreAgentSession:
             if self._closed:
                 return
             slot = self._slots.get(session_id)
+            summary = None if slot is None else slot.compact
             state = None if slot is None else slot.current
             if state is None:
                 # No turn has run yet: ask the seed host so capability
                 # cancellation still receives the request.
                 state = _AssemblyState(self._seed_selection, self._seed)
+        if summary is not None and not summary.done():
+            # Cancelling the summary task makes the compaction service record
+            # an interrupted attempt and re-raise; no other session or queued
+            # turn is touched.
+            summary.cancel()
+            await asyncio.gather(summary, return_exceptions=True)
+            return
         await state.assembly.host.cancel(session_id)
 
     def model_command(self, session_id: str, text: str) -> str | None:
         """Apply one /provider, /model, /effort or /status command."""
         return self.sessions.command(session_id, text)
+
+    async def compact(self, session_id: str):
+        """Manually compact one session at a turn boundary.
+
+        The same ordering gate as ``submit`` is used, so no turn is active and
+        no queued turn can start while the summary runs. This never schedules
+        itself and never executes a user task. A failure leaves the original
+        event log and projection unchanged; only a success writes a checkpoint.
+        """
+        async with self._registry_lock:
+            if self._closed:
+                raise RuntimeError("agent session is closed")
+            slot = self._slots.setdefault(session_id, _SessionSlot())
+            previous = slot.tail
+            marker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            slot.tail = marker
+            self._pending += 1
+            self._idle.clear()
+        task: asyncio.Task | None = None
+        try:
+            await self._wait_turn(slot, previous)
+            if self._closed:
+                raise RuntimeError("agent session is closed")
+            selection = self.sessions.get(session_id)
+            # Register the summary as the session's current local work before
+            # it can run. It is cancellable by ``cancel(session_id)`` and by
+            # ``aclose`` without touching another session or a queued turn.
+            async with self._registry_lock:
+                if self._closed:
+                    raise RuntimeError("agent session is closed")
+                task = asyncio.create_task(self._run_compact(session_id, selection))
+                slot.compact = task
+            try:
+                return await task
+            finally:
+                if slot.compact is task:
+                    slot.compact = None
+        finally:
+            if not marker.done():
+                marker.set_result(None)
+            self._pending -= 1
+            if self._pending == 0:
+                self._idle.set()
+
+    async def _run_compact(self, session_id: str, selection):
+        if self._compact is not None:
+            return await self._compact(session_id, selection)
+        if self.raw_store is None:
+            raise RuntimeError(
+                "Context compaction is unavailable: the raw session store was not attached."
+            )
+        defaults = getattr(getattr(self.config, "agents", None), "defaults", None)
+        reply_budget = getattr(defaults, "max_tokens", None)
+        default_window = getattr(defaults, "context_window_tokens", None)
+        # Use the same capacity the request guard and status line use: the
+        # smaller of the configured window and the one the selected model
+        # reports. A larger default must not let compaction exceed the next
+        # request's real limit.
+        window = (
+            min(default_window, selection.context_window_tokens or default_window)
+            if default_window
+            else selection.context_window_tokens
+        )
+
+        events = list(await self.raw_store.read_session(session_id))
+        system_text = _last_request_system(events) or self.instructions or None
+        tools = _last_request_tools(events)
+
+        def token_estimator(messages):
+            tokens, _source = estimate_prompt_tokens_chain(
+                selection.provider, selection.model, list(messages), None
+            )
+            return tokens
+
+        def request_token_estimator(messages):
+            # Use the same fixed system prompt and visible tools the status
+            # line measures; the summary prompt budget above stays free of
+            # them because the summary call itself sends neither.
+            request_messages = (
+                [{"role": "system", "content": system_text}] if system_text else []
+            )
+            request_messages.extend(dict(message) for message in messages)
+            tokens, _source = estimate_prompt_tokens_chain(
+                selection.provider, selection.model, request_messages, tools
+            )
+            return tokens
+
+        return await compact_session(
+            self.raw_store,
+            selection.provider,
+            session_id,
+            model=selection.model,
+            effort=selection.effort,
+            provider_name=selection.name,
+            max_tokens=reply_budget,
+            context_window_tokens=window,
+            reserve_tokens=reply_budget,
+            token_estimator=token_estimator,
+            request_token_estimator=request_token_estimator,
+        )
 
     async def aclose(self) -> None:
         async with self._close_lock:
@@ -334,6 +558,18 @@ class CoreAgentSession:
                 # shutdown began.
                 for slot in self._slots.values():
                     slot.abort.set()
+                summaries = [
+                    slot.compact
+                    for slot in self._slots.values()
+                    if slot.compact is not None and not slot.compact.done()
+                ]
+            # A summary blocked on its provider is stopped here, so shutdown
+            # never waits for the provider; the compaction service records the
+            # interrupted attempt before the task returns.
+            for task in summaries:
+                task.cancel()
+            if summaries:
+                await asyncio.gather(*summaries, return_exceptions=True)
             failures: list[tuple[str, Exception]] = []
 
             # Stop every runtime that may still own a turn: the seed and the
@@ -395,10 +631,19 @@ def _compose_for_selection(
     instructions: str,
     skill_capability: SkillAccessCapability,
     forge_capability: ForgeCapability,
+    additional_capabilities=(),
+    notice=None,
 ) -> AgentAssembly:
+    """Compose Skill, the entry's extra capabilities, then Forge.
+
+    ``additional_capabilities`` is the only extension point another entry
+    (the gateway's cron/message capabilities) needs. They become part of the
+    canonical capability tuple, so ``host.aclose`` closes them exactly once
+    with the rest.
+    """
     defaults = config.agents.defaults
     provider = _SelectedProvider(
-        selection, defaults.context_window_tokens, defaults.max_tokens
+        selection, defaults.context_window_tokens, defaults.max_tokens, notice=notice
     )
     return compose_agent(
         provider=provider,
@@ -411,15 +656,39 @@ def _compose_for_selection(
         max_tokens=defaults.max_tokens,
         reasoning_effort=selection.effort,
         max_steps=defaults.max_tool_iterations,
-        additional_capabilities=(skill_capability,),
+        additional_capabilities=(skill_capability, *tuple(additional_capabilities)),
         forge_capability=forge_capability,
     )
 
 
 @asynccontextmanager
-async def open_core_session(config, *, provider_name=None, model=None, effort=None, output):
-    service = ProviderService(config)
-    selected = service.resolve(provider_name, model, effort)
+async def open_core_session(
+    config,
+    *,
+    provider_name=None,
+    model=None,
+    effort=None,
+    output,
+    additional_capabilities=(),
+    service=None,
+    selected=None,
+):
+    """Open one Core session over the workspace database.
+
+    ``service``/``selected`` let another entry (the gateway background
+    runtime) reuse a provider it already resolved instead of resolving a
+    second time. ``additional_capabilities`` is appended after Skill and
+    before Forge; all of them are canonical and closed exactly once by the
+    host/session shutdown.
+
+    Required ``output`` methods are ``event(event)`` and ``error(text)``.
+    ``info(text)`` is optional and only receives one-time notices (for
+    example a provider without streaming).
+    """
+    service = service if service is not None else ProviderService(config)
+    selected = (
+        selected if selected is not None else service.resolve(provider_name, model, effort)
+    )
     config = config.model_copy(deep=True)
     config.agents.defaults.provider = selected.name
     config.agents.defaults.model = selected.model
@@ -450,15 +719,19 @@ async def open_core_session(config, *, provider_name=None, model=None, effort=No
         coordinator.set_activation_manager(activations)
         session_dir = config.workspace_path / "sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
-        store = SQLiteSessionStore(session_dir / "core.db")
+        database = session_dir / "core.db"
+        store = SQLiteSessionStore(database)
         # The host takes over the store after successful composition. This
         # callback also covers every later construction failure; aclose is
         # idempotent.
         resources.push_async_callback(store.aclose)
+        catalog = SessionCatalog(database)
+        resources.push_async_callback(asyncio.to_thread, catalog.close)
         display_store = _DisplayStore(store, output)
         skill_capability = SkillAccessCapability(activations)
         forge_capability = ForgeCapability(coordinator, client=client)
         instructions = _instructions(config)
+        notice = getattr(output, "info", None)
 
         def build(selection: RuntimeSelection) -> AgentAssembly:
             return _compose_for_selection(
@@ -470,6 +743,8 @@ async def open_core_session(config, *, provider_name=None, model=None, effort=No
                 instructions=instructions,
                 skill_capability=skill_capability,
                 forge_capability=forge_capability,
+                additional_capabilities=additional_capabilities,
+                notice=notice,
             )
 
         # Build one assembly before yielding so wiring failures surface here
@@ -483,12 +758,183 @@ async def open_core_session(config, *, provider_name=None, model=None, effort=No
                 store=display_store,
                 sessions=SessionRuntimes(service, selected),
                 output=output,
+                raw_store=store,
             )
         except BaseException:
             await seed.host.aclose()
             raise
+        session.catalog = catalog
+        session.instructions = instructions
+        session.config = config
         resources.push_async_callback(session.aclose)
         yield session
+
+
+def _last_request_tools(events):
+    tools = None
+    for event in reversed(events):
+        if event.type is EventType.REQUEST_PREPARED:
+            payload = event.payload
+            raw = payload.get("tools")
+            tools = [dict(item) for item in raw] if isinstance(raw, list) else None
+            break
+    return tools
+
+
+def _last_request_system(events):
+    """The exact system prompt of the newest prepared request.
+
+    The prompt assembler reads live fragments on every step, so the static
+    instructions alone miss capability text. The last request snapshot is the
+    same input the model actually received; using it keeps compaction and the
+    status line on one system/tool overhead.
+    """
+    for event in reversed(events):
+        if event.type is not EventType.REQUEST_PREPARED:
+            continue
+        messages = event.payload.get("messages")
+        if isinstance(messages, list):
+            parts = [
+                message["content"]
+                for message in messages
+                if isinstance(message, dict)
+                and message.get("role") == "system"
+                and isinstance(message.get("content"), str)
+            ]
+            if parts:
+                return "\n\n".join(parts)
+        break
+    return None
+
+
+class _ContextStatus:
+    """Estimate the next request without scanning the store per delta.
+
+    The in-memory event list is fed from already-persisted events. A
+    checkpoint-aware conversation is loaded once per session and refreshed at
+    a turn boundary; while a turn is active, the current request snapshot is
+    used instead. After compaction the projected conversation replaces the old
+    history until the live turn prepares its first request.
+    """
+
+    def __init__(self, session, output) -> None:
+        self._session = session
+        self._output = output
+        self._events: dict[str, list] = {}
+        self._conversation: dict[str, tuple] = {}
+        self._tools: dict[str, list | None] = {}
+        self._system: dict[str, str | None] = {}
+        self._loaded: set[str] = set()
+
+    async def load(self, session_id: str) -> None:
+        if session_id in self._loaded:
+            return
+        raw = getattr(self._session, "raw_store", None)
+        if raw is None:
+            return
+        events = list(await raw.read_session(session_id))
+        self._events[session_id] = events
+        self._conversation[session_id] = tuple(await raw.read_conversation(session_id))
+        self._tools[session_id] = _last_request_tools(events)
+        self._system[session_id] = self._system_text(events)
+        self._loaded.add(session_id)
+        self._output.ledger.seed(events)
+        await self.ensure_usage(session_id)
+
+    async def ensure_usage(self, session_id: str) -> None:
+        """Import persisted compaction attempts for one session, idempotently.
+
+        The attempt rows are the durable cost trail. A successful checkpoint's
+        copied usage is deliberately not read here, so it is never counted a
+        second time. Listing sessions calls this for every session, not just
+        the active one.
+        """
+        raw = getattr(self._session, "raw_store", None)
+        if raw is None:
+            return
+        try:
+            attempts = await raw.list_compaction_attempts(session_id)
+        except Exception:
+            return
+        for attempt in attempts:
+            self._output.ledger.record_compaction_attempt(
+                session_id,
+                attempt.attempt_id,
+                attempt.status,
+                attempt.usage,
+            )
+
+    async def refresh(self, session_id: str) -> None:
+        """Refresh the checkpoint-aware projection once, at a turn boundary."""
+        raw = getattr(self._session, "raw_store", None)
+        if raw is None:
+            return
+        try:
+            self._conversation[session_id] = tuple(await raw.read_conversation(session_id))
+        except Exception:
+            self._conversation.pop(session_id, None)
+        events = self._events.get(session_id, [])
+        self._tools[session_id] = _last_request_tools(events)
+        self._system[session_id] = self._system_text(events)
+
+    def _system_text(self, events) -> str | None:
+        """Keep the status line on the same system prompt the model receives."""
+        return _last_request_system(events) or getattr(self._session, "instructions", "") or None
+
+    def ingest(self, event) -> None:
+        self._events.setdefault(event.session_id, []).append(event)
+        if event.type is EventType.REQUEST_PREPARED:
+            # Only a prepared request supersedes the checkpoint/turn
+            # projection. TURN_STARTED deliberately keeps it: between the two
+            # events the old event log would still project the pre-compaction
+            # history and the status line would jump up until the new request
+            # snapshot exists.
+            self._conversation.pop(event.session_id, None)
+
+    def apply_compaction(self, session_id: str, result) -> None:
+        checkpoint = result.checkpoint
+        self._conversation[session_id] = (
+            {
+                "role": "assistant",
+                "content": f"{CHECKPOINT_SUMMARY_NOTICE}\n\n{checkpoint.summary}",
+            },
+            *checkpoint.retained_messages,
+        )
+        events = self._events.get(session_id, [])
+        self._tools[session_id] = _last_request_tools(events)
+        self._system[session_id] = self._system_text(events)
+        self._loaded.add(session_id)
+
+    def snapshot(self, session_id: str) -> ContextSnapshot:
+        selection = self._session.sessions.get(session_id)
+        defaults = getattr(getattr(self._session, "config", None), "agents", None)
+        configured = getattr(getattr(defaults, "defaults", None), "context_window_tokens", None)
+        model_capacity = getattr(selection, "context_window_tokens", None)
+        capacity = (
+            min(configured, model_capacity or configured)
+            if configured
+            else model_capacity
+        )
+        system_text = self._system.get(session_id)
+        if system_text is None:
+            system_text = self._system_text(self._events.get(session_id, []))
+        conversation = self._conversation.get(session_id)
+        if conversation is not None:
+            return estimate_context_from_conversation(
+                conversation,
+                self._tools.get(session_id),
+                instructions=system_text,
+                provider=selection.provider,
+                model=selection.model,
+                capacity=capacity,
+            )
+        return estimate_context(
+            self._events.get(session_id, []),
+            provider=selection.provider,
+            model=selection.model,
+            capacity=capacity,
+            instructions=system_text,
+        )
 
 
 async def run_core_agent(
@@ -504,54 +950,208 @@ async def run_core_agent(
     config = load_agent_config(config_path, workspace)
     if config.is_fleet_mode:
         raise ValueError("Core CLI currently supports one workspace; use --runtime legacy for fleet mode")
-    if not session_id.strip():
+    if session_id is not None and not str(session_id).strip():
         raise ValueError("session id must not be empty")
     if message is not None and not message.strip():
         raise ValueError("message must not be empty")
     logger.enable("PhyAgentOS") if logs else logger.disable("PhyAgentOS")
     output = AgentOutput(console, markdown=markdown)
     output.startup("Forge recovery")
+    # The CLI keeps the legacy cron tool without starting a scheduler: the
+    # service only persists jobs into the shared store the gateway reads.
+    # Tests override ``get_cron_dir`` so no real home directory is touched.
+    cron_capability = CronCapability(CronService(get_cron_dir() / "jobs.json"))
     async with open_core_session(
-        config, provider_name=provider_name, model=model, effort=effort, output=output
+        config,
+        provider_name=provider_name,
+        model=model,
+        effort=effort,
+        output=output,
+        additional_capabilities=(cron_capability,),
     ) as session:
-        def refresh_label() -> str:
-            selection = session.sessions.get(session_id)
-            label = f"session {session_id} · {selection.name}/{selection.model}"
+        catalog = getattr(session, "catalog", None)
+        infos: dict[str, SessionInfo | None] = {}
+        explicit = str(session_id).strip() if session_id is not None else ""
+        if explicit:
+            sid = explicit
+            if catalog is not None:
+                try:
+                    infos[sid] = await asyncio.to_thread(catalog.ensure_session, sid)
+                except Exception as exc:
+                    # Metadata failure must never silently rename the session.
+                    output.error(
+                        "Session metadata could not be read "
+                        f"({type(exc).__name__}); the explicit session id "
+                        f"{sid} is kept unchanged."
+                    )
+        else:
+            if catalog is None:
+                raise ValueError(
+                    "No session catalog is attached; pass --session to reuse an "
+                    "explicit id."
+                )
+            info = await asyncio.to_thread(catalog.create_session, "cli")
+            sid = info.session_id
+            infos[sid] = info
+
+        startup_selection = session.sessions.get(sid)
+        flags_given = any(value is not None for value in (provider_name, model, effort))
+        if catalog is not None and flags_given:
+            try:
+                await asyncio.to_thread(
+                    catalog.save_selection,
+                    sid,
+                    provider=startup_selection.name,
+                    model=startup_selection.model,
+                    effort=startup_selection.effort,
+                )
+            except Exception as exc:
+                output.error(
+                    "The session selection could not be saved "
+                    f"({type(exc).__name__}); the session id is unchanged."
+                )
+        elif catalog is not None:
+            saved: SessionSelection | None = None
+            try:
+                saved = await asyncio.to_thread(catalog.load_selection, sid)
+            except Exception as exc:
+                output.error(
+                    "The saved session selection could not be read "
+                    f"({type(exc).__name__}); this session uses the startup selection."
+                )
+            if saved is not None and (saved.provider or saved.model or saved.effort):
+                try:
+                    session.sessions.select(
+                        sid,
+                        saved.provider or startup_selection.name,
+                        saved.model or startup_selection.model,
+                        saved.effort or "none",
+                    )
+                except Exception as exc:
+                    # A stale saved selection is reported, never repaired by
+                    # changing the session id.
+                    output.error(
+                        f"Saved selection for session {sid} could not be applied: "
+                        f"{exc}. The session id is unchanged; startup selection is used."
+                    )
+
+        context = _ContextStatus(session, output)
+        if getattr(session, "raw_store", None) is not None:
+            await context.load(sid)
+        output.configure_stats(
+            ledger=output.ledger,
+            context_provider=context.snapshot,
+            event_observer=context.ingest,
+        )
+        active_session_id = sid
+
+        def refresh_label(target: str | None = None) -> str:
+            target = target or active_session_id
+            info = infos.get(target)
+            selection = session.sessions.get(target)
+            base = f"session {info.label}" if info is not None else f"session {target}"
+            label = f"{base} · {selection.name}/{selection.model}"
             if selection.effort:
                 label += f" · effort {selection.effort}"
             output.set_session_label(label)
+            output.refresh_status(target)
             return label
+
+        async def name_session(target: str, text: str) -> None:
+            if catalog is None:
+                return
+            try:
+                await asyncio.to_thread(catalog.name_from_first_input, target, text)
+                info = await asyncio.to_thread(catalog.get_session, target)
+                if info is not None:
+                    infos[target] = info
+            except Exception as exc:
+                # Naming is display metadata; a failure must not rename the
+                # session or fail the turn.
+                output.error(
+                    "The session title could not be saved "
+                    f"({type(exc).__name__}); the session id is unchanged."
+                )
+            if target == active_session_id:
+                refresh_label(target)
 
         output.ready()
         label = refresh_label()
         if message is not None:
+            await name_session(sid, message)
+            label = refresh_label()
             output.info(label)
-            output.turn_started()
+            output.turn_started(sid)
             try:
-                task = asyncio.create_task(session.submit(TurnRequest(session_id, message)))
+                task = asyncio.create_task(session.submit(TurnRequest(sid, message)))
                 try:
                     result = await asyncio.shield(task)
                 except asyncio.CancelledError:
                     output.cancel_requested()
-                    await session.cancel(session_id)
+                    await session.cancel(sid)
                     await task
                     raise
             finally:
                 output.turn_finished()
+            await context.refresh(sid)
             output.result(result)
             return {TurnStatus.COMPLETED: 0, TurnStatus.FAILED: 1, TurnStatus.INTERRUPTED: 130}[result.status]
 
         output.info(
-            "Local commands: /help · /tools · /model · /effort · /status · exit. "
+            "Local commands: /help · /tools · /new · /session · /compact · "
+            "/model · /effort · /status · exit. "
             "Press Esc twice while a turn runs to stop it locally. "
             "Accepted or running is not task success."
         )
 
+        from ..interaction.model_picker import _session_picker
         from ..interaction.terminal_input import TerminalInput
 
         terminal = TerminalInput(display=output.display)
 
+        def on_active_session(target) -> None:
+            nonlocal active_session_id
+            if target:
+                active_session_id = target
+            output.refresh_status(active_session_id)
+
+        async def apply_saved_selection(target: str) -> None:
+            if catalog is None:
+                return
+            try:
+                saved = await asyncio.to_thread(catalog.load_selection, target)
+            except Exception as exc:
+                output.error(
+                    "The saved session selection could not be read "
+                    f"({type(exc).__name__}); the session id is unchanged."
+                )
+                return
+            if saved is None or not (saved.provider or saved.model or saved.effort):
+                return
+            current = session.sessions.get(target)
+            try:
+                session.sessions.select(
+                    target,
+                    saved.provider or current.name,
+                    saved.model or current.model,
+                    saved.effort or "none",
+                )
+            except Exception as exc:
+                output.error(
+                    f"Saved selection for session {target} could not be applied: "
+                    f"{exc}. The session id is unchanged."
+                )
+
+        async def switch_to(target: str, info: SessionInfo | None) -> None:
+            nonlocal active_session_id
+            infos[target] = info or infos.get(target)
+            await context.load(target)
+            await apply_saved_selection(target)
+            active_session_id = target
+            refresh_label(target)
+
         async def model_command(text: str) -> str | None:
+            target = active_session_id
             try:
                 parts = text.strip().split(maxsplit=1)
                 command = parts[0].lower() if parts else ""
@@ -561,27 +1161,191 @@ async def run_core_agent(
                     await terminal.pause()
                     try:
                         selected = await _interactive_model_command(
-                            text, session.sessions, session_id
+                            text, session.sessions, target
                         )
                     finally:
                         terminal.resume()
                     if selected is not None:
+                        if catalog is not None and command in {"/provider", "/model", "/effort"}:
+                            current = session.sessions.get(target)
+                            await asyncio.to_thread(
+                                catalog.save_selection,
+                                target,
+                                provider=current.name,
+                                model=current.model,
+                                effort=current.effort,
+                            )
                         return selected
-                return session.model_command(session_id, text)
+                message_text = session.model_command(target, text)
+                if (
+                    catalog is not None
+                    and command in {"/provider", "/model", "/effort"}
+                    and message_text is not None
+                ):
+                    current = session.sessions.get(target)
+                    await asyncio.to_thread(
+                        catalog.save_selection,
+                        target,
+                        provider=current.name,
+                        model=current.model,
+                        effort=current.effort,
+                    )
+                return message_text
             finally:
                 # Every outcome (text change, menu, reset, cancellation or a
                 # failed command) republishes the selection that is actually in
                 # force, so the toolbar can never keep a stale provider/model.
-                refresh_label()
+                refresh_label(target)
+
+        async def session_command(text: str, binding) -> str | None:
+            nonlocal active_session_id
+            parts = text.strip().split(maxsplit=1)
+            command = parts[0].lower() if parts else ""
+            argument = parts[1].strip() if len(parts) == 2 else ""
+            fallback = binding.fallback or active_session_id
+
+            def failed(message: str) -> None:
+                binding.session_id = fallback
+                output.error(message)
+
+            if catalog is None:
+                failed(
+                    "Session switching is unavailable because no session catalog "
+                    "is attached; the current session is unchanged."
+                )
+                return None
+            if command == "/new":
+                try:
+                    info = await asyncio.to_thread(catalog.create_session, "cli")
+                except Exception as exc:
+                    failed(
+                        "A new session could not be created "
+                        f"({type(exc).__name__}); the current session is unchanged."
+                    )
+                    return None
+                await switch_to(info.session_id, info)
+                binding.session_id = info.session_id
+                return f"Started new session {info.label}."
+            if command != "/session":
+                failed("Unknown session command; the current session is unchanged.")
+                return None
+            if argument:
+                try:
+                    info = await asyncio.to_thread(catalog.get_session, argument)
+                except Exception as exc:
+                    failed(
+                        "The session could not be read "
+                        f"({type(exc).__name__}); the current session is unchanged."
+                    )
+                    return None
+                if info is None:
+                    failed(
+                        f"Unknown session {argument[:80]!r}; no switch was made. "
+                        "Use /session to list sessions."
+                    )
+                    return None
+                await switch_to(info.session_id, info)
+                binding.session_id = info.session_id
+                return f"Switched to session {info.label}."
+
+            try:
+                listed = await asyncio.to_thread(catalog.list_sessions)
+            except Exception as exc:
+                failed(
+                    "Sessions could not be listed "
+                    f"({type(exc).__name__}); the current session is unchanged."
+                )
+                return None
+            if not listed:
+                binding.session_id = fallback
+                return "No sessions in this workspace yet. Use /new to start one."
+            for info in listed:
+                await context.ensure_usage(info.session_id)
+            if terminal.menu_capable:
+                await terminal.pause()
+                try:
+                    chosen = await _session_picker(listed, current=active_session_id)
+                finally:
+                    terminal.resume()
+                if chosen is None:
+                    binding.session_id = fallback
+                    output.info("Session selection cancelled; the current session is unchanged.")
+                    return None
+                info = next((item for item in listed if item.session_id == chosen), None)
+                if info is None:
+                    failed("The selected session disappeared; the current session is unchanged.")
+                    return None
+                await switch_to(info.session_id, info)
+                binding.session_id = info.session_id
+                return f"Switched to session {info.label}."
+            binding.session_id = fallback
+            rows = [
+                f"{'*' if item.session_id == active_session_id else ' '} "
+                f"{item.label}"
+                for item in listed[:20]
+            ]
+            note = "" if len(listed) <= 20 else f"\n... and {len(listed) - 20} more"
+            return "Sessions (use /session <id> to switch):\n" + "\n".join(rows) + note
+
+        async def compact_command(text: str, binding) -> str | None:
+            target = binding.session_id or binding.fallback or active_session_id
+            if not target:
+                output.error("No active session to compact.")
+                return None
+            selection = session.sessions.get(target)
+            output.info(
+                f"Compacting session {target} with {selection.name}/{selection.model}; "
+                "this is a manual summary, not a new task."
+            )
+            output.compact_started()
+            succeeded = False
+            try:
+                result = await session.compact(target)
+                succeeded = True
+            except Exception as exc:
+                # A failed attempt changes no projection, but its audit row and
+                # any known usage are durable. Do not claim no write happened.
+                output.error(
+                    "Context compaction failed "
+                    f"({type(exc).__name__}): {exc}. The conversation projection "
+                    "is unchanged; the attempt is recorded for accounting."
+                )
+                return None
+            finally:
+                # Import the attempt rows on success and failure, then refresh
+                # the projection. This keeps an in-process failure visible
+                # without waiting for a restart.
+                await context.ensure_usage(target)
+                if succeeded:
+                    context.apply_compaction(target, result)
+                else:
+                    await context.refresh(target)
+                refresh_label(target)
+            message_text = (
+                f"Context compacted: {result.before_tokens} -> {result.after_tokens} "
+                "estimated tokens. The raw event log and earlier history are unchanged."
+            )
+            if result.warnings:
+                message_text += "\nWarnings: " + "; ".join(result.warnings)
+            return message_text
+
+        async def on_turn_settled(target: str) -> None:
+            await context.refresh(target)
+            refresh_label(target)
 
         try:
             terminal.initialize()
             agent = InteractiveAgent(
                 session,
-                session_id=session_id,
+                session_id=sid,
                 output=output,
                 read_input=terminal.read,
                 model_command=model_command,
+                session_command=session_command,
+                compact_command=compact_command,
+                name_session=name_session,
+                on_active_session=on_active_session,
+                on_turn_settled=on_turn_settled,
             )
             terminal.bind_stop(agent.request_stop)
             await agent.run()
@@ -590,13 +1354,24 @@ async def run_core_agent(
     return 0
 
 
-def register_agent(app, *, legacy_runner):
-    """Register one explicit command; never fall back after a Core failure."""
+def register_agent(app, *, legacy_runner=None):
+    """Register one explicit command; never fall back after a Core failure.
+
+    ``legacy_runner`` is the already-resolved legacy entry point when a caller
+    injects one (tests, embedding code). The default registration passes
+    nothing and the legacy package is imported only inside the ``legacy``
+    branch, so building the CLI app and running Core never load it.
+    """
 
     @app.command("agent")
     def agent(
         message: str | None = typer.Option(None, "--message", "-m"),
-        session_id: str = typer.Option("cli:direct", "--session", "-s"),
+        session_id: str | None = typer.Option(
+            None,
+            "--session",
+            "-s",
+            help="Reuse an explicit session id; omit to start a new session.",
+        ),
         workspace: str | None = typer.Option(None, "--workspace", "-w"),
         config: str | None = typer.Option(None, "--config", "-c"),
         markdown: bool = typer.Option(True, "--markdown/--no-markdown"),
@@ -605,16 +1380,34 @@ def register_agent(app, *, legacy_runner):
         model: str | None = typer.Option(None, "--model"),
         reasoning_effort: str | None = typer.Option(None, "--reasoning-effort"),
         runtime: str = typer.Option(
-            "legacy", "--runtime", help="Agent runtime: core (new, opt-in) or legacy (default)."
+            "core",
+            "--runtime",
+            help="Agent runtime: core (default) or legacy.",
         ),
     ):
         """Interact with the Agent using an explicitly selected runtime."""
         if runtime not in {"core", "legacy"}:
             raise typer.BadParameter("choose core or legacy", param_hint="--runtime")
         if runtime == "legacy":
-            return legacy_runner(
-                message=message, session_id=session_id, workspace=workspace, config=config,
-                markdown=markdown, logs=logs, provider=provider, model=model,
+            runner = legacy_runner
+            if runner is None:
+                # Imported only for an explicit legacy selection: the Core
+                # default must be usable without the old implementation.
+                from ..legacy import legacy_agent
+
+                runner = legacy_agent.agent
+            return runner(
+                message=message,
+                # The legacy entry point has its own default; Typer no longer
+                # supplies it for the Core path's new-session default. Never
+                # use ``or`` here: an explicitly empty id stays explicit.
+                session_id=session_id if session_id is not None else "cli:direct",
+                workspace=workspace,
+                config=config,
+                markdown=markdown,
+                logs=logs,
+                provider=provider,
+                model=model,
                 reasoning_effort=reasoning_effort,
             )
         try:

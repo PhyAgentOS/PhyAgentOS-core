@@ -19,7 +19,16 @@ Storage rules:
 * reads are ordered by ``sequence`` only. ``recorded_at`` is display data;
 * ``read_conversation`` is a read-only projection over stored
   ``request.prepared`` / ``turn.completed`` payloads, not a second message
-  table.
+  table. When a context checkpoint exists, the projection starts from the
+  checkpoint (summary plus the retained recent messages) and only reads events
+  after ``covers_sequence``; a completed turn after that point still wins with
+  its own request snapshot, so the full log is not replayed on every turn;
+* context checkpoints are a separate, append-only projection table. They never
+  rewrite ``session_events`` and they are not ``context.compacted`` events:
+  that event type belongs to the loop driver's turn, while a checkpoint is a
+  stored read projection. A checkpoint is committed with a
+  compare-and-swap on the session head sequence, so work appended after the
+  summary was requested is never silently covered by it.
 
 Recovery is descriptive. :meth:`SQLiteSessionStore.recover` reports turns
 that started without a terminal ``turn.*`` event and model/tool calls that
@@ -45,8 +54,9 @@ import copy
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -54,7 +64,23 @@ from typing import Any
 from .events import CallKind, EventType, RecoveryReport, RuntimeEvent, UnfinishedCall
 from .types import require_non_empty
 
-__all__ = ["SessionStoreClosedError", "SQLiteSessionStore"]
+__all__ = [
+    "CHECKPOINT_SUMMARY_NOTICE",
+    "CheckpointConflictError",
+    "CompactionAttempt",
+    "ContextCheckpoint",
+    "SessionStoreClosedError",
+    "SQLiteSessionStore",
+]
+
+# The summary is stored as an assistant message because leading system messages
+# are dropped when a later request snapshot is projected. The notice keeps the
+# message honest: it is generated text, not something the assistant said.
+CHECKPOINT_SUMMARY_NOTICE = (
+    "[context checkpoint] Earlier conversation was compacted to save context. "
+    "This is a model-generated summary of it, not a user message and not an "
+    "instruction to execute anything."
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_events (
@@ -66,7 +92,33 @@ CREATE TABLE IF NOT EXISTS session_events (
     payload TEXT NOT NULL,
     recorded_at TEXT NOT NULL,
     PRIMARY KEY (session_id, sequence)
-)
+);
+CREATE TABLE IF NOT EXISTS session_checkpoints (
+    checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    covers_sequence INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    retained_messages TEXT NOT NULL,
+    selection TEXT NOT NULL,
+    usage TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_checkpoints_session
+    ON session_checkpoints (session_id, checkpoint_id);
+CREATE TABLE IF NOT EXISTS compaction_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    provider TEXT,
+    model TEXT,
+    effort TEXT,
+    usage TEXT NOT NULL,
+    reason TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_compaction_attempts_session
+    ON compaction_attempts (session_id, attempt_id)
 """
 
 _TERMINAL_TURN_EVENTS = frozenset(
@@ -98,6 +150,159 @@ class SessionStoreClosedError(RuntimeError):
         super().__init__(f"session store is closed: {path}")
 
 
+class CheckpointConflictError(RuntimeError):
+    """A checkpoint cannot be written without covering or rewriting new work.
+
+    Raised when the session head moved after the summary snapshot was taken,
+    when the session has an unfinished turn, or when a checkpoint would not
+    move past the previous one. Nothing was written; the event log is
+    unchanged.
+    """
+
+    def __init__(self, session_id: str, reason: str) -> None:
+        self.session_id = session_id
+        self.reason = reason
+        super().__init__(f"context checkpoint rejected for session {session_id!r}: {reason}")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCheckpoint:
+    """A stored read projection that replaces an older conversation prefix.
+
+    ``covers_sequence`` is the session head the summary was taken from.
+    ``retained_messages`` are the complete recent messages kept verbatim beside
+    the summary; they start at a user-message boundary so a tool call and its
+    results are never split. ``selection`` records the provider/model/effort
+    used for the summary; it is metadata and does not change the session log.
+    ``usage`` is a copy of the summary call's token accounting for reference;
+    cumulative session totals come from compaction attempts, so the same call
+    is not counted twice.
+
+    The raw events stay in ``session_events``; a checkpoint only changes what
+    ``read_conversation`` projects.
+    """
+
+    session_id: str
+    covers_sequence: int
+    summary: str
+    retained_messages: tuple[Mapping[str, Any], ...] = ()
+    selection: Mapping[str, str | None] = field(default_factory=dict)
+    usage: Mapping[str, int] = field(default_factory=dict)
+    checkpoint_id: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __post_init__(self) -> None:
+        require_non_empty("session_id", self.session_id)
+        if not isinstance(self.covers_sequence, int) or isinstance(self.covers_sequence, bool):
+            raise TypeError("covers_sequence must be an int")
+        if self.covers_sequence < 0:
+            raise ValueError("covers_sequence must be >= 0")
+        if not isinstance(self.summary, str) or not self.summary.strip():
+            raise ValueError("summary must be a non-empty string")
+
+        retained: list[Mapping[str, Any]] = []
+        for message in self.retained_messages:
+            if not isinstance(message, Mapping):
+                raise TypeError("retained_messages must contain mappings")
+            role = message.get("role")
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("retained messages require a non-empty role")
+            retained.append(dict(message))
+        object.__setattr__(self, "retained_messages", tuple(retained))
+
+        selection: dict[str, str | None] = {}
+        for key, value in self.selection.items():
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"selection[{key!r}] must be a string or None")
+            selection[str(key)] = value
+        object.__setattr__(self, "selection", selection)
+
+        usage: dict[str, int] = {}
+        for key, value in self.usage.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"usage[{key!r}] must be a non-negative int")
+            usage[str(key)] = value
+        object.__setattr__(self, "usage", usage)
+
+        if self.checkpoint_id is not None:
+            if (
+                not isinstance(self.checkpoint_id, int)
+                or isinstance(self.checkpoint_id, bool)
+                or self.checkpoint_id < 1
+            ):
+                raise ValueError("checkpoint_id must be a positive int or None")
+        if not isinstance(self.created_at, datetime):
+            raise TypeError("created_at must be a datetime")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+
+
+_ATTEMPT_STATUSES = frozenset({"started", "completed", "failed", "interrupted"})
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionAttempt:
+    """One manual summary call, tracked independently from the checkpoint.
+
+    The row is written before the provider call and is updated once when the
+    attempt ends. It records known token usage even when the summary is
+    rejected or the checkpoint commit loses the compare-and-swap, so a failed
+    attempt never changes the conversation projection but its cost stays
+    visible. ``usage`` only contains keys the provider reported; unknown
+    output tokens are absent, not zero.
+
+    ``status`` is one of ``started``, ``completed``, ``failed`` or
+    ``interrupted``.
+    """
+
+    session_id: str
+    status: str
+    attempt_id: int | None = None
+    provider: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    usage: Mapping[str, int] = field(default_factory=dict)
+    reason: str | None = None
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    finished_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        require_non_empty("session_id", self.session_id)
+        if self.status not in _ATTEMPT_STATUSES:
+            raise ValueError(f"unknown compaction attempt status: {self.status!r}")
+        for name, value in (
+            ("provider", self.provider),
+            ("model", self.model),
+            ("effort", self.effort),
+        ):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be a non-empty string or None")
+        usage: dict[str, int] = {}
+        for key, value in self.usage.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"usage[{key!r}] must be a non-negative int")
+            usage[str(key)] = value
+        object.__setattr__(self, "usage", usage)
+        if self.attempt_id is not None:
+            if (
+                not isinstance(self.attempt_id, int)
+                or isinstance(self.attempt_id, bool)
+                or self.attempt_id < 1
+            ):
+                raise ValueError("attempt_id must be a positive int or None")
+        if self.reason is not None:
+            if not isinstance(self.reason, str):
+                raise TypeError("reason must be a string or None")
+            object.__setattr__(self, "reason", self.reason[:500])
+        for name, value in (("started_at", self.started_at), ("finished_at", self.finished_at)):
+            if value is None:
+                continue
+            if not isinstance(value, datetime):
+                raise TypeError(f"{name} must be a datetime")
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"{name} must be timezone-aware")
+
+
 def _plain(value: Any) -> Any:
     """Convert read-only mappings into plain containers for JSON encoding.
 
@@ -118,6 +323,18 @@ def _encode_payload(payload: Mapping[str, Any]) -> str:
     for a non-finite float, both before anything is written.
     """
     return json.dumps(_plain(payload), ensure_ascii=False, allow_nan=False)
+
+
+def _encode_usage_json(usage: Mapping[str, int] | None) -> str:
+    clean: dict[str, int] = {}
+    if usage is not None:
+        if not isinstance(usage, Mapping):
+            raise TypeError("usage must be a mapping or None")
+        for key, value in usage.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"usage[{key!r}] must be a non-negative int")
+            clean[str(key)] = value
+    return json.dumps(clean, ensure_ascii=False)
 
 
 def _row_to_event(session_id: str, row: tuple[Any, ...]) -> RuntimeEvent:
@@ -268,6 +485,160 @@ def _conversation_from_events(
     return tuple(messages)
 
 
+def _checkpoint_from_row(row: tuple[Any, ...]) -> ContextCheckpoint:
+    (
+        checkpoint_id,
+        session_id,
+        covers_sequence,
+        summary,
+        retained_json,
+        selection_json,
+        usage_json,
+        created_at,
+    ) = row
+    retained = json.loads(retained_json)
+    selection = json.loads(selection_json)
+    usage = json.loads(usage_json)
+    if not isinstance(retained, list):
+        raise ValueError(f"checkpoint {checkpoint_id!r} retained_messages is not a list")
+    if not isinstance(selection, Mapping):
+        raise ValueError(f"checkpoint {checkpoint_id!r} selection is not an object")
+    if not isinstance(usage, Mapping):
+        raise ValueError(f"checkpoint {checkpoint_id!r} usage is not an object")
+    return ContextCheckpoint(
+        session_id=session_id,
+        covers_sequence=int(covers_sequence),
+        summary=summary,
+        retained_messages=tuple(retained),
+        selection=selection,
+        usage=usage,
+        checkpoint_id=int(checkpoint_id),
+        created_at=datetime.fromisoformat(created_at),
+    )
+
+
+def _attempt_from_row(row: tuple[Any, ...]) -> CompactionAttempt:
+    (
+        attempt_id,
+        session_id,
+        status,
+        provider,
+        model,
+        effort,
+        usage_json,
+        reason,
+        started_at,
+        finished_at,
+    ) = row
+    usage = json.loads(usage_json)
+    if not isinstance(usage, Mapping):
+        raise ValueError(f"compaction attempt {attempt_id!r} usage is not an object")
+    return CompactionAttempt(
+        session_id=session_id,
+        status=status,
+        attempt_id=int(attempt_id),
+        provider=provider,
+        model=model,
+        effort=effort,
+        usage=usage,
+        reason=reason,
+        started_at=datetime.fromisoformat(started_at),
+        finished_at=datetime.fromisoformat(finished_at) if finished_at else None,
+    )
+
+
+def _checkpoint_conversation(
+    checkpoint: ContextCheckpoint,
+) -> tuple[Mapping[str, Any], ...]:
+    """Project a checkpoint as legal messages: summary first, then the kept tail."""
+    summary_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": f"{CHECKPOINT_SUMMARY_NOTICE}\n\n{checkpoint.summary}",
+    }
+    messages: list[Mapping[str, Any]] = [summary_message]
+    messages.extend(copy.deepcopy(dict(message)) for message in checkpoint.retained_messages)
+    return tuple(messages)
+
+
+_INIT_RETRY_ATTEMPTS = 20
+_INIT_RETRY_BASE_SECONDS = 0.005
+_INIT_RETRY_MAX_SECONDS = 0.1
+_SQLITE_BUSY_BASE_CODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
+
+
+def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    """True only for SQLITE_BUSY / SQLITE_LOCKED, not every OperationalError."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and (code & 0xFF) in _SQLITE_BUSY_BASE_CODES:
+        return True
+    text = str(exc).lower()
+    return "database is locked" in text or "database table is locked" in text or "busy" in text
+
+
+def _open_sqlite_connection(
+    path: str,
+    busy_timeout_ms: int,
+    schema: str,
+) -> sqlite3.Connection:
+    """Open a connection and finish WAL/schema setup despite simultaneous first opens.
+
+    ``PRAGMA journal_mode = WAL`` needs a brief exclusive lock. Unlike ordinary
+    reads and writes, that switch can fail immediately with SQLITE_BUSY /
+    SQLITE_LOCKED even when ``busy_timeout`` is set, so several processes
+    opening a brand-new database at once can fail the first one. The whole
+    setup is retried with bounded backoff for exactly those two result codes;
+    any other ``OperationalError`` is raised on the first attempt. WAL and
+    ``synchronous = FULL`` are never downgraded, and after the retry budget the
+    last real error is raised.
+    """
+    is_memory = path == ":memory:" or "mode=memory" in path
+    timeout = max(busy_timeout_ms, 0) / 1000.0
+    delay = _INIT_RETRY_BASE_SECONDS
+    last_error: sqlite3.OperationalError | None = None
+    last_mode: object | None = None
+
+    for attempt in range(_INIT_RETRY_ATTEMPTS):
+        conn = sqlite3.connect(
+            path,
+            timeout=timeout,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {max(busy_timeout_ms, 0)}")
+            if not is_memory:
+                mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                if str(mode).lower() != "wal":
+                    # The switch can also report the unchanged mode instead of
+                    # raising when another connection holds the lock.
+                    last_mode = mode
+                    last_error = None
+                else:
+                    conn.execute("PRAGMA synchronous = FULL")
+                    conn.executescript(schema)
+                    return conn
+            else:
+                conn.executescript(schema)
+                return conn
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_busy(exc):
+                conn.close()
+                raise
+            last_error = exc
+        except BaseException:
+            conn.close()
+            raise
+        conn.close()
+        if attempt + 1 < _INIT_RETRY_ATTEMPTS:
+            time.sleep(delay)
+            delay = min(_INIT_RETRY_MAX_SECONDS, delay * 2)
+
+    if last_mode is not None and last_error is None:
+        raise RuntimeError(f"SQLite refused WAL mode for {path}: {last_mode}")
+    assert last_error is not None
+    raise last_error
+
+
 class SQLiteSessionStore:
     """Append-only session event log on SQLite (WAL for file databases).
 
@@ -291,29 +662,8 @@ class SQLiteSessionStore:
 
     # -- construction -------------------------------------------------
 
-    @property
-    def _is_memory(self) -> bool:
-        return self._path == ":memory:" or "mode=memory" in self._path
-
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(
-            self._path,
-            timeout=max(self._busy_timeout_ms, 0) / 1000.0,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-        try:
-            conn.execute(f"PRAGMA busy_timeout = {max(self._busy_timeout_ms, 0)}")
-            if not self._is_memory:
-                mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-                if str(mode).lower() != "wal":
-                    raise RuntimeError(f"SQLite refused WAL mode for {self._path}: {mode}")
-                conn.execute("PRAGMA synchronous = FULL")
-            conn.execute(_SCHEMA)
-        except BaseException:
-            conn.close()
-            raise
-        return conn
+        return _open_sqlite_connection(self._path, self._busy_timeout_ms, _SCHEMA)
 
     # -- state --------------------------------------------------------
 
@@ -363,17 +713,113 @@ class SQLiteSessionStore:
         return await asyncio.to_thread(self._select_sync, session_id, None, after_sequence)
 
     async def read_conversation(self, session_id: str) -> Sequence[Mapping[str, Any]]:
-        """Return the message history of the newest completed turn.
+        """Return the message history the next turn should start from.
 
-        Read-only projection: the last ``request.prepared`` messages of the
-        last completed turn, leading system messages removed, plus the
-        ``turn.completed`` reply as an assistant message. Returns an empty
-        tuple when the session has no completed turn. Failed, interrupted and
-        unfinished turns contribute nothing, and no work is resumed.
+        Read-only projection. Without a checkpoint this is the newest completed
+        turn's last ``request.prepared`` messages (leading system messages
+        removed) plus the ``turn.completed`` reply. With a checkpoint covering
+        sequence ``N``, the newest completed turn after ``N`` wins with its own
+        request snapshot; otherwise the projection is the checkpoint summary
+        plus its retained messages. Failed, interrupted and unfinished turns
+        contribute nothing, and no work is resumed.
         """
         require_non_empty("session_id", session_id)
         self._raise_if_closed()
         return await asyncio.to_thread(self._conversation_sync, session_id)
+
+    async def read_head_sequence(self, session_id: str) -> int:
+        """Return the highest stored sequence for ``session_id`` (0 when empty)."""
+        require_non_empty("session_id", session_id)
+        self._raise_if_closed()
+        return await asyncio.to_thread(self._head_sequence_sync, session_id)
+
+    async def read_checkpoint(self, session_id: str) -> ContextCheckpoint | None:
+        """Return the newest context checkpoint, or ``None`` when none exists."""
+        require_non_empty("session_id", session_id)
+        self._raise_if_closed()
+        return await asyncio.to_thread(self._latest_checkpoint_sync, session_id)
+
+    async def get_compaction_usage(self, session_id: str) -> dict[str, int]:
+        """Return cumulative summary-call usage for one session.
+
+        Only compaction attempts are summed, so a successful checkpoint's
+        copied usage is not counted twice. Unknown token kinds stay absent.
+        """
+        require_non_empty("session_id", session_id)
+        self._raise_if_closed()
+        return await asyncio.to_thread(self._attempt_usage_sync, session_id)
+
+    async def list_compaction_attempts(
+        self, session_id: str
+    ) -> Sequence[CompactionAttempt]:
+        """Return this session's attempts in start order (durable cost trail)."""
+        require_non_empty("session_id", session_id)
+        self._raise_if_closed()
+        return await asyncio.to_thread(self._list_attempts_sync, session_id)
+
+    async def begin_compaction_attempt(
+        self,
+        session_id: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> CompactionAttempt:
+        """Record a summary attempt before the provider call.
+
+        A row left in ``started`` means the process stopped before the outcome
+        was recorded; readers must not assume either success or failure.
+        """
+        require_non_empty("session_id", session_id)
+        self._raise_if_closed()
+        return await asyncio.to_thread(
+            self._begin_attempt_sync, session_id, provider, model, effort
+        )
+
+    async def finish_compaction_attempt(
+        self,
+        attempt_id: int,
+        *,
+        status: str,
+        usage: Mapping[str, int] | None = None,
+        reason: str | None = None,
+    ) -> CompactionAttempt:
+        """Close a started attempt with its known usage and a short reason."""
+        if not isinstance(attempt_id, int) or isinstance(attempt_id, bool) or attempt_id < 1:
+            raise ValueError("attempt_id must be a positive int")
+        if status not in {"completed", "failed", "interrupted"}:
+            raise ValueError(f"terminal compaction status required, got {status!r}")
+        self._raise_if_closed()
+        return await asyncio.to_thread(
+            self._finish_attempt_sync, attempt_id, status, usage, reason
+        )
+
+    async def commit_checkpoint(
+        self, checkpoint: ContextCheckpoint, *, expected_head_sequence: int
+    ) -> ContextCheckpoint:
+        """Store a projection checkpoint under a head compare-and-swap.
+
+        ``expected_head_sequence`` must be the head observed *before* the
+        summary input was read. The commit is rejected when the head moved,
+        when the session has an unfinished turn, or when the checkpoint would
+        not move past the previous one. A rejected commit writes nothing, so
+        the original history and the previous projection stay intact.
+        """
+        if not isinstance(checkpoint, ContextCheckpoint):
+            raise TypeError("checkpoint must be a ContextCheckpoint")
+        if (
+            not isinstance(expected_head_sequence, int)
+            or isinstance(expected_head_sequence, bool)
+        ):
+            raise TypeError("expected_head_sequence must be an int")
+        if expected_head_sequence < 0:
+            raise ValueError("expected_head_sequence must be >= 0")
+        if checkpoint.covers_sequence != expected_head_sequence:
+            raise ValueError("checkpoint.covers_sequence must equal expected_head_sequence")
+        self._raise_if_closed()
+        return await asyncio.to_thread(
+            self._commit_checkpoint_sync, checkpoint, expected_head_sequence
+        )
 
     async def recover(self, session_id: str) -> RecoveryReport:
         """Report unfinished work and close it with recovery events.
@@ -466,7 +912,211 @@ class SQLiteSessionStore:
             return report
 
     def _conversation_sync(self, session_id: str) -> tuple[Mapping[str, Any], ...]:
-        return _conversation_from_events(self._select_sync(session_id, None, 0))
+        checkpoint = self._latest_checkpoint_sync(session_id)
+        if checkpoint is None:
+            return _conversation_from_events(self._select_sync(session_id, None, 0))
+        tail = self._select_sync(session_id, None, checkpoint.covers_sequence)
+        if tail:
+            # A turn completed after the checkpoint carries the exact history
+            # the model was given, which already starts with the checkpoint
+            # projection. Use it instead of rebuilding the old log.
+            projected = _conversation_from_events(tail)
+            if projected:
+                return projected
+        return _checkpoint_conversation(checkpoint)
+
+    def _head_sequence_sync(self, session_id: str) -> int:
+        with self._conn_lock:
+            self._raise_if_closed()
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def _latest_checkpoint_sync(self, session_id: str) -> ContextCheckpoint | None:
+        with self._conn_lock:
+            self._raise_if_closed()
+            row = self._conn.execute(
+                "SELECT checkpoint_id, session_id, covers_sequence, summary,"
+                " retained_messages, selection, usage, created_at"
+                " FROM session_checkpoints WHERE session_id = ?"
+                " ORDER BY checkpoint_id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return None if row is None else _checkpoint_from_row(row)
+
+    def _attempt_usage_sync(self, session_id: str) -> dict[str, int]:
+        with self._conn_lock:
+            self._raise_if_closed()
+            rows = self._conn.execute(
+                "SELECT usage FROM compaction_attempts WHERE session_id = ?"
+                " ORDER BY attempt_id ASC",
+                (session_id,),
+            ).fetchall()
+        totals: dict[str, int] = {}
+        for (usage_json,) in rows:
+            usage = json.loads(usage_json)
+            if not isinstance(usage, Mapping):
+                raise ValueError("compaction attempt usage is not an object")
+            for key, value in usage.items():
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    totals[str(key)] = totals.get(str(key), 0) + value
+        return totals
+
+    def _list_attempts_sync(self, session_id: str) -> tuple[CompactionAttempt, ...]:
+        with self._conn_lock:
+            self._raise_if_closed()
+            rows = self._conn.execute(
+                "SELECT attempt_id, session_id, status, provider, model, effort,"
+                " usage, reason, started_at, finished_at"
+                " FROM compaction_attempts WHERE session_id = ?"
+                " ORDER BY attempt_id ASC",
+                (session_id,),
+            ).fetchall()
+        return tuple(_attempt_from_row(row) for row in rows)
+
+    def _begin_attempt_sync(
+        self,
+        session_id: str,
+        provider: str | None,
+        model: str | None,
+        effort: str | None,
+    ) -> CompactionAttempt:
+        candidate = CompactionAttempt(
+            session_id=session_id,
+            status="started",
+            provider=provider,
+            model=model,
+            effort=effort,
+        )
+        with self._conn_lock:
+            self._raise_if_closed()
+            now = datetime.now(timezone.utc)
+            cursor = self._conn.execute(
+                "INSERT INTO compaction_attempts"
+                " (session_id, status, provider, model, effort, usage, reason,"
+                "  started_at, finished_at)"
+                " VALUES (?, 'started', ?, ?, ?, '{}', NULL, ?, NULL)",
+                (session_id, provider, model, effort, now.isoformat()),
+            )
+            attempt_id = int(cursor.lastrowid)
+        return replace(candidate, attempt_id=attempt_id, started_at=now)
+
+    def _finish_attempt_sync(
+        self,
+        attempt_id: int,
+        status: str,
+        usage: Mapping[str, int] | None,
+        reason: str | None,
+    ) -> CompactionAttempt:
+        usage_json = _encode_usage_json(usage)
+        if reason is not None and not isinstance(reason, str):
+            raise TypeError("reason must be a string or None")
+        with self._conn_lock:
+            self._raise_if_closed()
+            now = datetime.now(timezone.utc)
+            cursor = self._conn.execute(
+                "UPDATE compaction_attempts SET status = ?, usage = ?, reason = ?,"
+                " finished_at = ? WHERE attempt_id = ? AND status = 'started'",
+                (
+                    status,
+                    usage_json,
+                    reason[:500] if reason else None,
+                    now.isoformat(),
+                    attempt_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"compaction attempt {attempt_id} is missing or already finished"
+                )
+            row = self._conn.execute(
+                "SELECT attempt_id, session_id, status, provider, model, effort,"
+                " usage, reason, started_at, finished_at"
+                " FROM compaction_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return _attempt_from_row(row)
+
+    def _commit_checkpoint_sync(
+        self, checkpoint: ContextCheckpoint, expected_head_sequence: int
+    ) -> ContextCheckpoint:
+        self._raise_if_closed()
+        # Encode before the transaction: an unserializable retained message or
+        # selection must fail without changing the database.
+        retained_json = json.dumps(
+            _plain([dict(message) for message in checkpoint.retained_messages]),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        selection_json = json.dumps(_plain(dict(checkpoint.selection)), ensure_ascii=False)
+        usage_json = json.dumps(_plain(dict(checkpoint.usage)), ensure_ascii=False)
+        created_at = checkpoint.created_at.astimezone(timezone.utc).isoformat()
+        session_id = checkpoint.session_id
+
+        with self._session_lock(session_id):
+            with self._conn_lock:
+                self._raise_if_closed()
+                conn = self._conn
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    head = int(
+                        conn.execute(
+                            "SELECT COALESCE(MAX(sequence), 0) FROM session_events"
+                            " WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchone()[0]
+                    )
+                    if head != expected_head_sequence:
+                        raise CheckpointConflictError(
+                            session_id,
+                            f"session head moved from {expected_head_sequence} to {head}",
+                        )
+                    unfinished_turns, open_calls = _unfinished_state(
+                        session_id, self._select_sync(session_id, None, 0)
+                    )
+                    if unfinished_turns or open_calls:
+                        raise CheckpointConflictError(
+                            session_id,
+                            "session has unfinished work; compact only between turns",
+                        )
+                    previous = conn.execute(
+                        "SELECT covers_sequence FROM session_checkpoints"
+                        " WHERE session_id = ? ORDER BY checkpoint_id DESC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if previous is not None and int(previous[0]) >= checkpoint.covers_sequence:
+                        raise CheckpointConflictError(
+                            session_id,
+                            "checkpoint does not move past the previous coverage",
+                        )
+                    cursor = conn.execute(
+                        "INSERT INTO session_checkpoints"
+                        " (session_id, covers_sequence, summary, retained_messages,"
+                        "  selection, usage, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            session_id,
+                            checkpoint.covers_sequence,
+                            checkpoint.summary,
+                            retained_json,
+                            selection_json,
+                            usage_json,
+                            created_at,
+                        ),
+                    )
+                    checkpoint_id = int(cursor.lastrowid)
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+                conn.execute("COMMIT")
+        return replace(
+            checkpoint,
+            checkpoint_id=checkpoint_id,
+            created_at=datetime.fromisoformat(created_at),
+        )
 
     def _close_sync(self) -> None:
         with self._conn_lock:

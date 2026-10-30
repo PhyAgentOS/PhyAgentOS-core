@@ -36,8 +36,9 @@ factory in this layer.
 Event writers are split so no transition is recorded twice: ``AgentRuntime``
 writes ``input.accepted``, ``turn.started``, terminal ``turn.*`` events, and
 ``session.snapshot.created``; ``LoopDriver`` writes ``request.prepared``,
-``model.attempt.*``, and ``context.compacted``; ``ToolExecutor`` writes
-``tool.intent``, ``tool.dispatched``, and ``tool.settled``.
+``model.attempt.*``, ``model.response.delta``, and ``context.compacted``;
+``ToolExecutor`` writes ``tool.intent``, ``tool.dispatched``, and
+``tool.settled``.
 
 The store API is async and must stay async across every implementation. Its
 ordering rules are what make a crashed turn recoverable: ``append`` assigns
@@ -50,7 +51,7 @@ conversation state in the core.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .events import RecoveryReport, RuntimeEvent
@@ -58,6 +59,7 @@ from .types import (
     ExecutionContext,
     ModelRequest,
     ModelResponse,
+    ModelStreamDelta,
     PromptBundle,
     ToolCall,
     ToolDefinition,
@@ -76,6 +78,7 @@ __all__ = [
     "ModelAdapter",
     "PromptAssembler",
     "SessionStore",
+    "StreamingModelAdapter",
     "ToolExecutor",
 ]
 
@@ -117,10 +120,39 @@ class ModelAdapter(Protocol):
     :class:`~PhyAgentOS.agent.core.types.ModelCallError` when no usable answer
     was obtained; a provider error must never be returned as an assistant
     reply (``finish_reason="error"`` is rejected by the response contract).
-    Streaming is out of scope for this contract.
+
+    Streaming is an optional extension of this contract, described by
+    :class:`StreamingModelAdapter`. A driver that only has ``complete`` still
+    works; it simply cannot display partial text.
     """
 
     async def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+
+@runtime_checkable
+class StreamingModelAdapter(Protocol):
+    """A :class:`ModelAdapter` that can report body text before the answer ends.
+
+    ``stream`` returns an async iterator that yields zero or more
+    :class:`~PhyAgentOS.agent.core.types.ModelStreamDelta` values (body text
+    only, never reasoning) and then exactly one terminal
+    :class:`~PhyAgentOS.agent.core.types.ModelResponse`. Provider tool call
+    arguments must already be fully assembled and structurally complete in
+    that response; the driver still validates them before execution and must
+    never execute a truncated payload.
+
+    A failure raises :class:`~PhyAgentOS.agent.core.types.ModelCallError`,
+    carrying any usage the provider had reported, so partial output stays
+    traceable without becoming a successful turn. Closing the iterator stops
+    the underlying provider stream; the adapter must not retry after its first
+    delta.
+    """
+
+    async def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+    def stream(
+        self, request: ModelRequest
+    ) -> AsyncIterator[ModelStreamDelta | ModelResponse]: ...
 
 
 @runtime_checkable

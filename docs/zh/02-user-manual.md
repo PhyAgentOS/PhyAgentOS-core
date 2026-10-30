@@ -367,15 +367,77 @@ paos agent -m "检查运动 Tool context，将夹爪向前移动 5 cm，并验�
 paos gateway
 ```
 
-`paos agent` 默认使用旧 runtime。新 Core runtime 需要显式启用：
+`paos agent` 默认使用 Core runtime。旧实现仍保留，用于显式对比：
 
 ```bash
-paos agent --runtime core
+paos agent
 paos agent --runtime core -m "检查运动 Tool context。"
+paos agent --runtime legacy
 ```
 
-Core runtime 仍是实验入口：回复不流式输出，没有 `/correct`。在终端里，不带参数的 `/model` 与
-`/effort` 会打开与默认 runtime 相同的行内选择器；带参数的写法（如 `/model 2`、`/effort high`）
+选 Core（默认或显式）不会加载 `agent_legacy` 或 `cli.legacy`；只有真正选择
+`--runtime legacy` 时才导入这些模块。Core 失败时直接退出，不回退到旧 runtime。两套会话
+历史分开存放（`<workspace>/sessions/core.db` 与 `<workspace>/sessions/` 下的 JSONL），但
+未解决的远端状态与 AgentTask 保护是全 workspace 共享的，两条路径都受约束。
+
+### 会话
+
+`paos agent` 每次启动都会新建会话。会话 id 为 `cli:YYYYMMDD-NN`：日期和两位序号按工作区
+分配，在同一个写事务里取号，因此并发进程不会拿到同一个 id，重启也不会重用旧号。标题从首轮
+任务文本本地提炼，单独保存；设置标题不改变 id。`--session <id>` 直接使用给定 id，不再分配新号；
+该 id 已存在时就是复用。进入 Core 会话后，`/new` 新建会话，不带参数的 `/session` 列出 Core
+会话供选择（终端里是行内选择器），`/session <id>` 直接加载已存在的 id。`/new` 与 `/session`
+都在本地处理，不提交模型回合。旧聊天里的 `/new` 只清空历史；Core 的 `/new` 会分配新的
+session id。`core.db` 里已有的 Core 会话保留；旧 JSONL 会话不导入、不转换，也不会自动迁移
+legacy 会话。
+
+### 流式输出、context 与回合脚注
+
+provider 支持流式时，回复正文会在回合结束前先做实时预览（重定向输出时直接写出），最终答案
+不会重复打印一遍。工具调用只有在参数完整接收后才执行；流在参数完整前结束，这次调用不会执行。
+取消或断线的流不会自动重发。provider 报告的用量在调用结束时补记；它没报的字段保持未知。
+不支持流式的 provider 仍会给出一次普通回复。
+
+session 行显示 `context ...`：当前请求（system prompt、工具 schema 与历史）的估算大小占有效窗口
+的比例；有效窗口取配置窗口与已知模型容量中较小的一个。`≈` 表示估算值，`exact` 表示 provider
+报告的真实值，`--%` 表示大小或容量未知；请求超过容量时仍显示超过 100%，不会被截断。
+
+每轮结束时脚注显示本轮用时、模型轮次、工具调用次数、输入/输出 tokens、缓存命中率，以及
+provider 确实报告时才出现的推理 tokens；随后显示会话累计输入、输出与合计。模型轮次统计的是
+provider 调用次数，不是内部推理步数。`--` 表示未知，`--%` 表示 provider 未报告缓存用量。
+cache 与 reasoning tokens 已经包含在输入/输出或合计里，不会再加一次。累计值从已存事件重建，
+重新载入后仍然可用；如果某个已完成的调用没有用量记录，该行会标注历史用量不完整。脚注只是
+终端显示，不进入模型历史。
+
+### 压缩会话
+
+`/compact` 手动压缩历史：为较早的回合写一份摘要，最近若干个完整回合保持原文。它只在回合之间
+执行。摘要请求一旦发出，即使失败或被取消也会记录尝试：原上下文与历史保持不变，尝试记录仍
+保留，它报告的 token 用量计入会话累计。只有压缩后下一次请求的估算确实变小才会写入
+checkpoint；如果估算没有变小（例如摘要比原文更长），这次压缩会被拒绝，原上下文保持不变，
+尝试记录与已报告的用量仍然保留。成功时写入的 checkpoint 是对只追加事件历史的投影，原始事件
+不会被改写或删除；checkpoint 上抄录的用量不会再次计入。压缩不会派发任何工具调用，因此不能
+创建、取消或解决 Forge Action/Session；未解决的 `unknown` 仍然保持未解决。
+
+### Gateway 后台入口
+
+`paos gateway` 默认用同一套 Core runtime 承接 cron、heartbeat 与聊天 channels。
+`--runtime legacy` 仍保留用于对比，只有真正选中它时才导入旧实现。每个后台回合在开始前冻结
+自己的 channel、chat 与回复目标，之后到来的 heartbeat 或聊天消息不能改变已在执行回合的投递
+方向。最近的外部聊天目标保存在 `<workspace>/.gateway_route.json`（只含 channel、chat 与
+thread），重启后恢复；对应 channel 已停用时不使用该目标。一个 channel 回合最多投递一条最终
+回复，且是一条完整消息；流式 delta 不会转发到 channel。如果 message 工具已经投递过，runtime
+不再重复发布。`paos agent` 可以通过 cron 工具添加、列出或删除任务，但只有 `paos gateway` 启动
+scheduler，仅在 agent 会话打开时任务不会运行。gateway 每秒至少检查一次共享的 `jobs.json`，
+能发现其他进程新增的任务。写入时会对同目录的 `.lock` 文件加排他锁（Linux 的 `flock` 跨进程
+生效；Windows 上只覆盖本进程），读改写全程不跨 await，并用原子替换发布文件。
+任务结束后只合并该任务自己的运行状态：其他进程新增、删除、停用或改过调度的任务都会保留。
+请只运行一个 scheduler owner（一个 `paos gateway`）；这不代表多个 gateway 之间能保证恰好一次
+执行。未配置的 channel 不会自动启动。当前版本不把媒体字节转给模型：引用会保留在回合文本里，
+并明确告知模型字节没有转发。
+
+Core runtime 仍是实验入口：`/correct` 不可用。在终端里，不带参数的 `/model` 与
+`/effort` 会打开与 legacy 相同的行内选择器；带参数的写法（如 `/model 2`、`/effort high`）
 和非终端输入仍使用文字列表。选择器里按 Esc 或 Ctrl+C 只关闭菜单，会话和当前选择都不变。
 `/help` 列出本地命令，`/tools [on|off]` 展开或收起本回合完整工具调用记录。运行中要停止，
 请在两秒内连续按两次 Esc：第一次显示黄色提示，第二次请求本地取消；它不能证明远端动作已停。
@@ -383,9 +445,16 @@ Core runtime 仍是实验入口：回复不流式输出，没有 `/correct`。�
 未知斜杠命令在本地拒绝。session/model 一行在输入框上方；运行中隐藏 `You:` 和光标，普通按键
 不进入输入框（已有草稿保留），不会暗中排队。运行中的回合显示带耗时的转圈，并在准备、思考、
 调用工具、本地停止之间切换；底部工具区显示最近 4 次调用以及隐藏数量和总数。它的历史存在
-`<workspace>/sessions/core.db`；默认 runtime 继续用 `<workspace>/sessions/` 下的 JSONL。
-两份历史不导入、不合并。Core 失败时直接退出，不会回退到旧 runtime。fleet 模式仍要求默认
-runtime。
+`<workspace>/sessions/core.db`；旧 runtime 继续用 `<workspace>/sessions/` 下的 JSONL。
+两份历史不导入、不合并。Core 失败时直接退出，不会回退到旧 runtime。fleet 模式仍要求
+`--runtime legacy`。
+
+workspace 内任一 session 留下未解决的远端状态，都会阻止新建 AgentTask。Core 提示词每步都会
+报告该阻塞的 task/invocation 身份；Gateway 从未确认 invocation 时明确写 `None`。它不会引用
+其他 session 的任务描述、工具参数或证据。不要重发旧的 Action/Session，不要猜 invocation id，
+也不要靠取消别人的任务绕过。只能用激活 Skill 或已取得 ToolSpec 声明的工具；如果当前末端位姿
+或机器人状态拿不到，就不能声称相对位移已完成，也不要发送猜测的绝对目标。可选 `timeout_ms`
+不填时由 Gateway 用自己的默认超时。
 
 ## 5. 检查 Tool context
 

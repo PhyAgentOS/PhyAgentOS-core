@@ -291,7 +291,15 @@ def _invoke_schema(*, task_required: bool, include_timeout: bool) -> dict[str, A
     if task_required:
         required.insert(0, "task_id")
     if include_timeout:
-        properties["timeout_ms"] = {"type": "integer", "minimum": 1}
+        properties["timeout_ms"] = {
+            "type": "integer",
+            "minimum": 1,
+            "description": (
+                "Optional Gateway execution timeout in ms. Omit it when the Gateway's "
+                "limit is unknown so the Gateway default applies; never substitute an "
+                "HTTP client timeout."
+            ),
+        }
     return {
         "type": "object",
         "properties": properties,
@@ -310,14 +318,18 @@ _QUERY_DEFINITION = ToolDefinition(
     name="forge_tool_query",
     description=(
         "Invoke a Gateway-declared read-only Query. Supply task_id while executing an "
-        "AgentTask so the result is audited; omit it only for unbound diagnostics."
+        "AgentTask so the result is audited; omit it only for unbound diagnostics. "
+        "Omit timeout_ms unless the Gateway's limit is known."
     ),
     parameters=_invoke_schema(task_required=False, include_timeout=True),
 )
 
 _START_ACTION_DEFINITION = ToolDefinition(
     name="forge_tool_start_action",
-    description="Start a task-bound Forge Action; admission is not completion or task success.",
+    description=(
+        "Start a task-bound Forge Action; admission is not completion or task success. "
+        "Omit timeout_ms unless the Gateway's limit is known; the Gateway default applies."
+    ),
     parameters=_invoke_schema(task_required=True, include_timeout=True),
 )
 

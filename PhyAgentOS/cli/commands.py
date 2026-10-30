@@ -26,7 +26,6 @@ from .command_groups.gateway_commands import register_gateway_commands
 from .command_groups.provider_commands import register_provider_commands
 from .command_groups.skill_commands import register_skill_commands
 from .command_groups.system_commands import register_system_commands
-from .legacy import legacy_agent
 
 app = typer.Typer(
     name="paos",
@@ -55,10 +54,10 @@ def main(
 
 register_system_commands(app)
 register_gateway_commands(app)
-# The legacy runtime is still the CLI default. Importing it here is an explicit
-# transitional dependency of that default, not a claim that importing this
-# module keeps legacy code out of the process.
-register_agent(app, legacy_runner=legacy_agent.agent)
+# The Core runtime is the default. The legacy runner is resolved lazily inside
+# the command when ``--runtime legacy`` is actually selected, so building the
+# app never imports the legacy package.
+register_agent(app)
 register_skill_commands(app)
 register_forge_node_commands(app)
 register_channel_commands(app)

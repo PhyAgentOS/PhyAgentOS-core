@@ -6,10 +6,10 @@ completed turns) plus the current input, mints a step id per iteration, and
 stops on a final answer, cancellation, deadline, failure, or step exhaustion.
 
 Event ownership is split so nothing is recorded twice: this module writes only
-``request.prepared`` and ``model.attempt.*``. ``input.accepted`` and terminal
-``turn.*`` events belong to the runtime; ``tool.*`` events belong to the
-executor. A driver that wrote them would make a single transition look like
-two.
+``request.prepared``, ``model.attempt.*``, ``model.response.delta``, and
+``context.compacted``. ``input.accepted`` and terminal ``turn.*`` events belong
+to the runtime; ``tool.*`` events belong to the executor. A driver that wrote
+them would make a single transition look like two.
 
 Persistence comes before side effects: the request snapshot and
 ``model.attempt.started`` are durably appended before the adapter is called.
@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +43,7 @@ from .types import (
     ModelCallError,
     ModelRequest,
     ModelResponse,
+    ModelStreamDelta,
     OperationCancelledError,
     PromptBundle,
     ToolCall,
@@ -68,6 +71,15 @@ _CORE_PERSISTENCE_FAILURE_CODES = frozenset(
     }
 )
 
+# Streaming display batches: the first delta is written immediately so text is
+# visible before the model finishes; later deltas are grouped by size or by a
+# short idle interval so one token does not become one synchronous SQLite
+# commit and a slow stream still appears promptly. The queue is bounded so a
+# slow store applies backpressure instead of growing memory without limit.
+_DELTA_FLUSH_CHARS = 64
+_DELTA_FLUSH_INTERVAL = 0.05
+_DELTA_QUEUE_SIZE = 64
+
 
 @dataclass(frozen=True, slots=True)
 class _ModelStep:
@@ -80,6 +92,17 @@ class _ModelStep:
 def _describe(exc: BaseException) -> str:
     detail = str(exc).strip()
     return detail or type(exc).__name__
+
+
+async def _close_stream(stream: object) -> None:
+    """Close an adapter stream, awaiting the result when needed."""
+    for name in ("aclose", "close"):
+        close = getattr(stream, name, None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+            return
 
 
 def _tool_call_payload(call: ToolCall) -> dict[str, Any]:
@@ -142,12 +165,15 @@ def _prepared_payload(request: ModelRequest) -> dict[str, Any]:
     }
 
 
-def _completed_payload(response: ModelResponse, model_call_id: str) -> dict[str, Any]:
+def _completed_payload(
+    response: ModelResponse, model_call_id: str, streaming: str = "blocking"
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model_call_id": model_call_id,
         "finish_reason": response.finish_reason,
         "usage": dict(response.usage),
         "tool_calls": [_tool_call_payload(call) for call in response.tool_calls],
+        "streaming": streaming,
     }
     if response.content is not None:
         payload["content"] = response.content
@@ -321,6 +347,230 @@ class LoopDriverImpl:
                 )
             )
 
+        stream_factory = getattr(self._adapter, "stream", None)
+        if callable(stream_factory):
+            return await self._run_streaming_model(
+                turn, context, request, stream_factory
+            )
+        return await self._run_blocking_model(turn, context, request)
+
+    async def _run_streaming_model(
+        self,
+        turn: TurnStart,
+        context: ExecutionContext,
+        request: ModelRequest,
+        stream_factory: Any,
+    ) -> _ModelStep:
+        """Run one streamed attempt and persist its deltas before it ends.
+
+        A producer task feeds a bounded queue with a fixed-capacity backlog, so
+        a slow consumer applies backpressure instead of buffering without
+        limit. The consumer flushes the first delta immediately and then on
+        either a character threshold or a short idle interval, so a slow stream
+        still becomes visible and a token is never one SQLite commit.
+
+        Everything already received is made durable before a failure or local
+        stop is recorded: the queue is drained, the buffered tail is written,
+        and only then are ``model.attempt.failed`` / ``interrupted`` appended.
+        That keeps the partial answer traceable while leaving the turn
+        unsuccessful and the conversation history untouched. A provider failure
+        after the first delta is never replayed.
+        """
+        model_call_id = request.model_call_id
+
+        try:
+            stream = stream_factory(request)
+        except Exception as exc:
+            detail = _describe(exc)
+            await self._record_attempt_failure(
+                turn, context, model_call_id, detail
+            )
+            return _ModelStep(failure=_failed(turn, f"model call failed: {detail}"))
+        if not hasattr(stream, "__aiter__"):
+            detail = (
+                "model adapter stream did not return an async iterator "
+                f"(got {type(stream).__name__})"
+            )
+            await self._record_attempt_failure(
+                turn, context, model_call_id, detail
+            )
+            return _ModelStep(failure=_failed(turn, f"model call failed: {detail}"))
+
+        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=_DELTA_QUEUE_SIZE)
+        end = object()
+
+        async def pump() -> None:
+            try:
+                async for item in stream:
+                    await queue.put(item)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - reported to the driver
+                await queue.put(exc)
+                return
+            await queue.put(end)
+
+        producer = asyncio.create_task(pump())
+
+        final: ModelResponse | None = None
+        pending: list[str] = []
+        pending_chars = 0
+        persisted_any = False
+        last_flush = time.monotonic()
+        local_stop = False
+        failure_detail: str | None = None
+        failure_usage: dict[str, int] = {}
+        flush_failed = False
+        observed_usage: dict[str, int] = {}
+
+        async def flush_pending() -> bool:
+            nonlocal pending_chars, last_flush
+            if not pending:
+                return True
+            if not await self._persist_delta(
+                turn, context, model_call_id, "".join(pending)
+            ):
+                return False
+            pending.clear()
+            pending_chars = 0
+            last_flush = time.monotonic()
+            return True
+
+        try:
+            while True:
+                if turn.cancellation.cancelled:
+                    local_stop = True
+                    break
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(), timeout=_DELTA_FLUSH_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    # A slow stream must still become visible: flush what was
+                    # received instead of waiting to reach the char threshold.
+                    if not await flush_pending():
+                        flush_failed = True
+                        failure_detail = (
+                            "could not persist model.response.delta; "
+                            "the model call was stopped"
+                        )
+                        break
+                    continue
+                if item is end:
+                    break
+                if isinstance(item, BaseException):
+                    failure_detail = _describe(item)
+                    if isinstance(item, ModelCallError):
+                        failure_usage = dict(item.usage)
+                    break
+                if isinstance(item, ModelStreamDelta):
+                    pending.append(item.content)
+                    pending_chars += len(item.content)
+                    elapsed = time.monotonic() - last_flush
+                    if (
+                        not persisted_any
+                        or pending_chars >= _DELTA_FLUSH_CHARS
+                        or elapsed >= _DELTA_FLUSH_INTERVAL
+                    ):
+                        if not await flush_pending():
+                            flush_failed = True
+                            failure_detail = (
+                                "could not persist model.response.delta; "
+                                "the model call was stopped"
+                            )
+                            break
+                        persisted_any = True
+                    continue
+                if isinstance(item, ModelResponse):
+                    final = item
+                    break
+                failure_detail = (
+                    "model adapter stream yielded "
+                    f"{type(item).__name__}, expected ModelStreamDelta or ModelResponse"
+                )
+                break
+        finally:
+            # Stop the producer first, then keep whatever text was already
+            # handed over. This is what makes a cut-off answer traceable.
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            observed_usage = dict(getattr(stream, "usage", {}) or {})
+            while True:
+                try:
+                    buffered = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if isinstance(buffered, ModelStreamDelta):
+                    pending.append(buffered.content)
+            if not await flush_pending():
+                flush_failed = True
+            await _close_stream(stream)
+
+        if local_stop:
+            payload: dict[str, Any] = {"model_call_id": model_call_id}
+            if observed_usage:
+                payload["usage"] = observed_usage
+            await self._persist(
+                turn, context, EventType.MODEL_ATTEMPT_INTERRUPTED, payload
+            )
+            return _ModelStep(failure=_interrupted(turn))
+
+        usage_payload = dict(observed_usage)
+        usage_payload.update(failure_usage)
+
+        if failure_detail is not None or flush_failed:
+            detail = failure_detail or (
+                "could not persist model.response.delta; no tool was executed"
+            )
+            await self._record_attempt_failure(
+                turn, context, model_call_id, detail, usage_payload or None
+            )
+            return _ModelStep(failure=_failed(turn, f"model call failed: {detail}"))
+
+        if final is None:
+            detail = "model stream ended without a terminal response"
+            await self._record_attempt_failure(
+                turn, context, model_call_id, detail, usage_payload or None
+            )
+            return _ModelStep(failure=_failed(turn, f"model call failed: {detail}"))
+
+        streaming_mode = "native" if getattr(stream, "native", False) else "fallback"
+        if not await self._persist(
+            turn,
+            context,
+            EventType.MODEL_ATTEMPT_COMPLETED,
+            _completed_payload(final, model_call_id, streaming_mode),
+        ):
+            return _ModelStep(
+                failure=_failed(
+                    turn,
+                    "could not persist model.attempt.completed; no tool was executed",
+                )
+            )
+
+        if turn.cancellation.cancelled:
+            return _ModelStep(failure=_interrupted(turn))
+
+        # The attempt itself succeeded, so it is recorded as completed with its
+        # usage and reasoning. The turn still fails: truncated tool arguments
+        # are not a usable answer and must never be executed.
+        if final.finish_reason == "length" and final.has_tool_calls:
+            return _ModelStep(
+                failure=_failed(
+                    turn,
+                    "model output was truncated (finish_reason=length) with tool "
+                    "calls; no tool was executed",
+                )
+            )
+        return _ModelStep(response=final)
+
+    async def _run_blocking_model(
+        self,
+        turn: TurnStart,
+        context: ExecutionContext,
+        request: ModelRequest,
+    ) -> _ModelStep:
         attempt_task = asyncio.create_task(self._adapter.complete(request))
         cancel_task = asyncio.create_task(turn.cancellation.wait())
         try:
@@ -361,7 +611,7 @@ class LoopDriverImpl:
         except ModelCallError as exc:
             detail = _describe(exc)
             await self._record_attempt_failure(
-                turn, context, request.model_call_id, detail
+                turn, context, request.model_call_id, detail, exc.usage
             )
             return _ModelStep(failure=_failed(turn, f"model call failed: {detail}"))
         except Exception as exc:
@@ -463,12 +713,32 @@ class LoopDriverImpl:
         context: ExecutionContext,
         model_call_id: str,
         error: str,
+        usage: Mapping[str, int] | None = None,
     ) -> None:
+        payload: dict[str, Any] = {"model_call_id": model_call_id, "error": error}
+        if usage:
+            payload["usage"] = dict(usage)
         await self._persist(
             turn,
             context,
             EventType.MODEL_ATTEMPT_FAILED,
-            {"model_call_id": model_call_id, "error": error},
+            payload,
+        )
+
+    async def _persist_delta(
+        self,
+        turn: TurnStart,
+        context: ExecutionContext,
+        model_call_id: str,
+        content: str,
+    ) -> bool:
+        if not content:
+            return True
+        return await self._persist(
+            turn,
+            context,
+            EventType.MODEL_RESPONSE_DELTA,
+            {"model_call_id": model_call_id, "content": content},
         )
 
     async def _persist(

@@ -70,6 +70,7 @@ class EventType(str, Enum):
     TURN_INTERRUPTED = "turn.interrupted"
     REQUEST_PREPARED = "request.prepared"
     MODEL_ATTEMPT_STARTED = "model.attempt.started"
+    MODEL_RESPONSE_DELTA = "model.response.delta"
     MODEL_ATTEMPT_COMPLETED = "model.attempt.completed"
     MODEL_ATTEMPT_FAILED = "model.attempt.failed"
     MODEL_ATTEMPT_INTERRUPTED = "model.attempt.interrupted"
@@ -98,6 +99,7 @@ _MODEL_CALL_EVENTS = frozenset(
     {
         EventType.REQUEST_PREPARED,
         EventType.MODEL_ATTEMPT_STARTED,
+        EventType.MODEL_RESPONSE_DELTA,
         EventType.MODEL_ATTEMPT_COMPLETED,
         EventType.MODEL_ATTEMPT_FAILED,
         EventType.MODEL_ATTEMPT_INTERRUPTED,
@@ -172,6 +174,14 @@ class RuntimeEvent:
 
         if event_type in _MODEL_CALL_EVENTS and not _payload_text(payload, "model_call_id"):
             raise ValueError(f"{event_type.value} requires payload.model_call_id")
+        if event_type is EventType.MODEL_RESPONSE_DELTA:
+            # A streaming delta may be whitespace on its own. The body text is
+            # replayed verbatim, so only empty or non-string content is invalid.
+            delta_content = payload.get("content")
+            if not isinstance(delta_content, str) or not delta_content:
+                raise ValueError(
+                    "model.response.delta requires non-empty payload.content"
+                )
         if event_type in _TOOL_CALL_EVENTS and not _payload_text(payload, "tool_call_id"):
             raise ValueError(f"{event_type.value} requires payload.tool_call_id")
         if event_type is EventType.TOOL_SETTLED:

@@ -41,6 +41,7 @@ from PhyAgentOS.forge.task import (
     ToolExecutionRecord,
 )
 from PhyAgentOS.forge.tool_client import ForgeToolAPIError, ForgeToolAPITimeoutError
+from PhyAgentOS.providers.base import LLMResponse
 from PhyAgentOS.verification.contracts import TaskVerificationContract
 
 
@@ -112,11 +113,15 @@ class _FakeCoordinator:
         self.started: list[tuple[str, str]] = []
         self.start_action_error: Exception | None = None
         self.records: dict[str, AgentTaskRecord] = {}
+        self.blockers: list[dict[str, Any]] = []
         self.store = SimpleNamespace(latest_for_session=self._latest_for_session)
         self.interaction = SimpleNamespace(
             restricted=lambda: False,
             managed=lambda _task_id: False,
         )
+
+    def unknown_remote_blockers(self) -> list[dict[str, Any]]:
+        return list(self.blockers)
 
     def _latest_for_session(self, session_id: str) -> AgentTaskRecord | None:
         return self.records.get(session_id)
@@ -535,6 +540,111 @@ def test_prompt_context_uses_authoritative_store_state() -> None:
     assert "task_1" in text
     assert "status=executing" in text
     assert "unknown_invocations=1" in text
+
+
+def _blocker(**overrides: Any) -> dict[str, Any]:
+    blocker: dict[str, Any] = {
+        "task_id": "task_remote",
+        "invocation_id": "inv_remote",
+        "status": "unknown",
+        "semantics": "action",
+        "origin_session_key": "local:forge-test",
+    }
+    blocker.update(overrides)
+    return blocker
+
+
+def test_prompt_context_reports_cross_session_blocker_without_local_task() -> None:
+    coordinator = _FakeCoordinator()
+    coordinator.blockers.append(
+        _blocker(
+            invocation_id=None,
+            task_description="another session's private plan",
+            arguments={"target": "secret"},
+            evidence=["secret evidence"],
+        )
+    )
+    capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
+
+    text = capability.prompt_context(_context("fresh-session"))
+
+    assert text is not None
+    assert 'task_id="task_remote"' in text
+    assert "invocation_id=None" in text
+    assert "Gateway identity never confirmed" in text
+    assert "status=unknown" in text
+    assert "semantics=action" in text
+    assert "cannot be located by the status tools" in text
+    # Only task/invocation identity and status leave this capability.
+    assert "private plan" not in text
+    assert "secret" not in text
+
+
+def test_prompt_context_keeps_global_blocker_after_local_success() -> None:
+    coordinator = _FakeCoordinator()
+    coordinator.records["session-1"] = _task(task_id="task_local", status="succeeded")
+    coordinator.blockers.append(_blocker())
+    capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
+
+    text = capability.prompt_context(_context("session-1"))
+
+    assert text is not None
+    assert "task_local" in text
+    assert "status=succeeded" in text
+    assert "task_remote" in text
+
+
+def test_prompt_context_reads_blockers_live_and_drops_them_when_clear() -> None:
+    coordinator = _FakeCoordinator()
+    coordinator.blockers.append(_blocker())
+    capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
+
+    assert "task_remote" in (capability.prompt_context(_context("fresh")) or "")
+
+    coordinator.blockers.clear()
+
+    assert capability.prompt_context(_context("fresh")) is None
+
+
+async def test_first_model_request_carries_global_blocker_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    coordinator = _FakeCoordinator()
+    coordinator.blockers.append(
+        _blocker(invocation_id=None, task_description="another session's private plan")
+    )
+    calls: list[dict[str, Any]] = []
+
+    class Provider:
+        async def chat_with_retry(self, *, messages, tools=None, **kwargs):
+            del kwargs
+            calls.append({"messages": messages, "tools": tools})
+            return LLMResponse(content="blocked", finish_reason="stop")
+
+    assembly = compose_agent(
+        provider=Provider(),  # type: ignore[arg-type]
+        store=SQLiteSessionStore(tmp_path / "core.db"),
+        coordinator=coordinator,  # type: ignore[arg-type]
+        system_instructions="base instructions",
+        model="fake-model",
+        max_steps=4,
+    )
+    try:
+        result = await assembly.host.submit(
+            TurnRequest(session_id="cli:direct", text="move the arm")
+        )
+    finally:
+        await assembly.host.aclose()
+
+    assert result.status is TurnStatus.COMPLETED
+    assert len(calls) == 1
+    system = calls[0]["messages"][0]
+    assert system["role"] == "system"
+    assert 'task_id="task_remote"' in system["content"]
+    assert "invocation_id=None" in system["content"]
+    assert "private plan" not in system["content"]
+    # The model saw the blocker before dispatch and no action was started.
+    assert coordinator.started == []
 
 
 async def test_two_sessions_do_not_share_prompt_or_creation_identity() -> None:

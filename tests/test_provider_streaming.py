@@ -355,6 +355,12 @@ async def test_litellm_stream_reports_usage_and_finish_reason(
 
     events = await _collect(provider.chat_stream([{"role": "user", "content": "go"}]))
 
+    assert [event.type for event in events] == ["delta", "usage", "done"]
+    assert events[1].usage == {
+        "prompt_tokens": 3,
+        "completion_tokens": 5,
+        "total_tokens": 8,
+    }
     assert events[-1].type == "done"
     assert events[-1].finish_reason == "stop"
     assert events[-1].usage == {
@@ -569,6 +575,12 @@ async def test_custom_stream_text_and_usage() -> None:
 
     events = await _collect(provider.chat_stream([{"role": "user", "content": "go"}]))
 
+    assert [event.type for event in events] == ["delta", "delta", "usage", "done"]
+    assert events[2].usage == {
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "total_tokens": 3,
+    }
     assert [event.content for event in events if event.type == "delta"] == ["a", "b"]
     assert events[-1].finish_reason == "stop"
     assert events[-1].usage == {
@@ -686,7 +698,13 @@ async def test_custom_stream_ignores_empty_and_role_only_chunks() -> None:
 
     events = await _collect(provider.chat_stream([{"role": "user", "content": "go"}]))
 
-    assert [event.type for event in events] == ["done"]
+    assert [event.type for event in events] == ["usage", "done"]
+    usage_event = events[0]
+    assert usage_event.usage == {
+        "prompt_tokens": 1,
+        "completion_tokens": 0,
+        "total_tokens": 1,
+    }
     assert events[-1].usage == {
         "prompt_tokens": 1,
         "completion_tokens": 0,

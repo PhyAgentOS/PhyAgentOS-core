@@ -919,13 +919,21 @@ class AgentTaskCoordinator:
             # the record is definitively failed: the identical-Action guard
             # must not arm and block a later identical resend.
             rejected_before_dispatch = _rejected_before_dispatch(exc)
+            error: dict[str, Any] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            for name in ("status_code", "error_code", "retryable"):
+                value = getattr(exc, name, None)
+                if value is not None:
+                    error[name] = value
             self._finish_execution(
                 task_id,
                 record_id,
                 status="failed" if rejected_before_dispatch else "unknown",
                 invocation_id=invocation_id,
                 attempt_id=attempt_id,
-                error={"type": type(exc).__name__, "message": str(exc)},
+                error=error,
                 rejected_before_dispatch=rejected_before_dispatch,
             )
             if invocation_id and self.runtime_invocation_ids is not None:
@@ -2174,6 +2182,9 @@ def _remote_identity(exc: BaseException) -> tuple[str | None, str | None]:
 # FORGE_TOOL_INVOKE_TIMEOUT is deliberately absent: the gateway also emits it
 # after dispatch when the synchronous caller response times out, where the
 # provider may still be executing and the outcome is genuinely unknown.
+# FORGE_TOOL_REQUEST_VALIDATION_REJECTED is emitted only while validating the
+# caller's request, before endpoint lookup or admission. A bare 400 without this
+# code (older Gateway) stays unknown.
 _PRE_DISPATCH_REJECTION_CODES = frozenset(
     (
         "FORGE_TOOL_GATEWAY_BUSY",
@@ -2181,6 +2192,7 @@ _PRE_DISPATCH_REJECTION_CODES = frozenset(
         "FORGE_TOOL_ENDPOINT_UNKNOWN",
         "FORGE_TOOL_OPERATION_NOT_FOUND",
         "FORGE_TOOL_ENDPOINT_UNAVAILABLE",
+        "FORGE_TOOL_REQUEST_VALIDATION_REJECTED",
     )
 )
 
@@ -2188,10 +2200,15 @@ _PRE_DISPATCH_REJECTION_CODES = frozenset(
 def _rejected_before_dispatch(exc: Exception) -> bool:
     """True when the gateway rejected the invoke without dispatching it."""
     error_code = getattr(exc, "error_code", None)
-    if error_code not in _PRE_DISPATCH_REJECTION_CODES:
-        return False
     invocation_id, attempt_id = _remote_identity(exc)
-    return invocation_id is None and attempt_id is None
+    if invocation_id is not None or attempt_id is not None:
+        return False
+    if error_code == "FORGE_TOOL_REQUEST_VALIDATION_REJECTED":
+        # This code is the Gateway's typed pre-dispatch validation rejection and
+        # is emitted as HTTP 400. Keep the status check explicit so the same code
+        # on another status is not accepted as proof.
+        return getattr(exc, "status_code", None) == 400
+    return error_code in _PRE_DISPATCH_REJECTION_CODES
 
 
 def _fail_replan(task: AgentTaskRecord, message: str) -> None:

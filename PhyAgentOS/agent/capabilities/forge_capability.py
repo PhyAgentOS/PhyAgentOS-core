@@ -538,26 +538,64 @@ class ForgeCapability:
         return handle
 
     def prompt_context(self, context: ExecutionContext) -> str | None:
-        """Return the authoritative latest task state for this session.
+        """Return live Forge state for this step: local task and global blockers.
 
-        The store is queried on every call; nothing is cached and nothing is
-        invented when the session has no task.
+        The store and the coordinator are queried on every call; nothing is
+        cached and nothing is invented. An unresolved remote Action/Session
+        from any session in this workspace is a workspace-wide blocker, so it
+        is reported even when this session has no task or its own task has
+        already succeeded. Only task/invocation identity, status and semantics
+        are copied; task descriptions, tool arguments, evidence and user text
+        from other sessions are never quoted here.
         """
+        lines: list[str] = []
         record = self._coordinator.store.latest_for_session(context.session_id)
-        if record is None:
+        if record is not None:
+            nonterminal = sum(
+                1 for item in record.execution_records if not item.terminal
+            )
+            unknown = sum(
+                1 for item in record.execution_records if item.status == "unknown"
+            )
+            lines.append(
+                f"Forge task {record.task_id}: status={record.status.value}; "
+                f"active_revision={record.active_revision_id}; "
+                f"cancellation_requested={record.cancellation_requested}; "
+                f"nonterminal_invocations={nonterminal}; unknown_invocations={unknown}."
+            )
+
+        blockers = self._coordinator.unknown_remote_blockers()
+        if blockers:
+            lines.append(
+                "Forge has unresolved remote Action/Session state in this workspace. "
+                "It blocks creating a new AgentTask from every session until it is "
+                "reconciled:"
+            )
+            for blocker in blockers:
+                invocation = blocker.get("invocation_id")
+                identity = (
+                    f'task_id="{blocker.get("task_id")}" invocation_id="{invocation}"'
+                    if invocation
+                    else f'task_id="{blocker.get("task_id")}" invocation_id=None '
+                    "(Gateway identity never confirmed)"
+                )
+                lines.append(
+                    f"- {identity} status={blocker.get('status')} "
+                    f"semantics={blocker.get('semantics')}"
+                )
+            lines.append(
+                "Do not invent an invocation_id, do not resend the old Action/Session, "
+                "do not call forge_task_create again while a blocker is unchanged, and "
+                "do not cancel another session's task to get around it. A record whose "
+                "invocation_id is None cannot be located by the status tools, which "
+                "require both task_id and invocation_id; keep it unknown and verify the "
+                "original Gateway record. This is current blocking state, not proof that "
+                "anything has been resolved."
+            )
+
+        if not lines:
             return None
-        nonterminal = sum(
-            1 for item in record.execution_records if not item.terminal
-        )
-        unknown = sum(
-            1 for item in record.execution_records if item.status == "unknown"
-        )
-        return (
-            f"Forge task {record.task_id}: status={record.status.value}; "
-            f"active_revision={record.active_revision_id}; "
-            f"cancellation_requested={record.cancellation_requested}; "
-            f"nonterminal_invocations={nonterminal}; unknown_invocations={unknown}."
-        )
+        return "\n".join(lines)
 
     async def cancel(
         self, session_id: str, context: ExecutionContext | None

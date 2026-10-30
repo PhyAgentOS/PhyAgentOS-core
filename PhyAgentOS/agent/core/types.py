@@ -42,6 +42,7 @@ __all__ = [
     "ModelCallError",
     "ModelRequest",
     "ModelResponse",
+    "ModelStreamDelta",
     "OperationCancelledError",
     "PromptBundle",
     "ToolCall",
@@ -608,16 +609,53 @@ class ModelResponse:
         return bool(self.tool_calls)
 
 
+@dataclass(frozen=True, slots=True)
+class ModelStreamDelta:
+    """One incremental piece of assistant body text from a streaming adapter.
+
+    Only visible answer text is carried here; provider reasoning stays in the
+    terminal :class:`ModelResponse`. The loop driver persists these in batches
+    so a terminal answer is displayed before the model call completes, and the
+    terminal response remains the single source for conversation history.
+    """
+
+    content: str
+
+    def __post_init__(self) -> None:
+        # A provider may legally send whitespace as its own delta (a space
+        # between tokens, or a newline before a Markdown block). It carries
+        # body text and must be kept verbatim; only empty or non-string
+        # content is invalid.
+        if not isinstance(self.content, str):
+            raise TypeError("content must be a string")
+        if not self.content:
+            raise ValueError("content must be a non-empty string")
+
+
 class ModelCallError(RuntimeError):
     """The adapter could not obtain a usable model answer.
 
     The driver records ``model.attempt.failed`` and must not treat this as an
     empty assistant reply. ``detail`` is the provider's own error text.
+    ``usage`` holds whatever token accounting the provider had already
+    reported when the stream failed; it is empty when nothing was observed, so
+    a failure never invents usage numbers.
     """
 
-    def __init__(self, model_call_id: str, detail: str) -> None:
+    def __init__(
+        self,
+        model_call_id: str,
+        detail: str,
+        *,
+        usage: Mapping[str, int] | None = None,
+    ) -> None:
         self.model_call_id = require_non_empty("model_call_id", model_call_id)
         self.detail = detail
+        observed: dict[str, int] = {}
+        for key, value in (usage or {}).items():
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                observed[str(key)] = value
+        self.usage: Mapping[str, int] = MappingProxyType(observed)
         super().__init__(detail)
 
 

@@ -190,11 +190,7 @@ class OpenAIResponsesProvider(LLMProvider):
             content=content,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
-            usage={
-                "prompt_tokens": u.input_tokens,
-                "completion_tokens": u.output_tokens,
-                "total_tokens": u.total_tokens,
-            } if u else {},
+            usage=self._usage_to_dict(u),
             reasoning_content="\n".join(reasoning_parts) or None,
         )
 

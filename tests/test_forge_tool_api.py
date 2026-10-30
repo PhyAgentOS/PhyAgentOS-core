@@ -4,6 +4,10 @@ import json
 
 import httpx
 
+from PhyAgentOS.agent.capabilities.forge_tool_api import (
+    TOOL_API_DEFINITIONS,
+    execute_tool_api_tool,
+)
 from PhyAgentOS.agent_legacy.tools.forge_tool_api import build_forge_tool_api_tools
 from PhyAgentOS.config.schema import ForgeConfig
 from PhyAgentOS.forge.task import AgentTaskCoordinator
@@ -104,6 +108,51 @@ async def test_tool_client_uses_authoritative_query_and_action_routes() -> None:
             {"arguments": {"target_pose": {"x": 0.05}}, "caller_id": "paos:test"},
         ),
     ]
+
+
+async def test_core_start_action_passes_no_timeout_when_omitted() -> None:
+    calls: list[int | None] = []
+
+    class Coordinator:
+        async def start_action(
+            self, task_id, tool_id, arguments, *, timeout_ms=None
+        ):
+            del task_id, tool_id, arguments
+            calls.append(timeout_ms)
+            return {"ok": True, "data": {"status": "accepted"}}
+
+    payload = await execute_tool_api_tool(
+        "forge_tool_start_action",
+        None,
+        Coordinator(),  # type: ignore[arg-type]
+        {"task_id": "task_1", "tool_id": "motion.move", "arguments": {}},
+    )
+    assert payload["data"]["status"] == "accepted"
+    assert calls == [None]
+
+    await execute_tool_api_tool(
+        "forge_tool_start_action",
+        None,
+        Coordinator(),  # type: ignore[arg-type]
+        {
+            "task_id": "task_1",
+            "tool_id": "motion.move",
+            "arguments": {},
+            "timeout_ms": 500,
+        },
+    )
+    assert calls == [None, 500]
+
+
+def test_tool_schema_keeps_optional_timeout_with_omit_policy() -> None:
+    definitions = {item.name: item for item in TOOL_API_DEFINITIONS}
+
+    for name in ("forge_tool_query", "forge_tool_start_action"):
+        parameters = definitions[name].parameters
+        assert "timeout_ms" in parameters["properties"]
+        assert "timeout_ms" not in parameters["required"]
+        assert "Omit" in parameters["properties"]["timeout_ms"]["description"]
+        assert "Omit timeout_ms" in definitions[name].description
 
 
 async def test_action_pending_cancel_and_unknown_do_not_imply_stopped(tmp_path) -> None:
@@ -269,3 +318,52 @@ def test_mutating_tools_are_not_registered_without_a_coordinator() -> None:
         "verify_forge_session",
         "create_replanned_forge_session",
     }
+
+
+async def test_pre_dispatch_validation_code_is_passed_through_and_failed(tmp_path) -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(
+            400,
+            json={
+                "ok": False,
+                "msg": "timeout_ms must not exceed configured maximum",
+                "error": {
+                    "code": "FORGE_TOOL_REQUEST_VALIDATION_REJECTED",
+                    "message": "timeout_ms must not exceed configured maximum",
+                    "retryable": False,
+                },
+            },
+        )
+
+    client = ForgeToolClient(
+        "http://gateway.test",
+        transport=httpx.MockTransport(handler),
+    )
+    coordinator, task = _coordinator(tmp_path, client)
+    try:
+        payload = await execute_tool_api_tool(
+            "forge_tool_start_action",
+            client,
+            coordinator,
+            {
+                "task_id": task.task_id,
+                "tool_id": "motion.move_pose",
+                "arguments": {"distance_m": 0.05},
+                "timeout_ms": 60001,
+            },
+        )
+    finally:
+        await client.close()
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "FORGE_TOOL_REQUEST_VALIDATION_REJECTED"
+    assert payload["error"]["status_code"] == 400
+    assert payload["error"]["retryable"] is False
+    record = coordinator.get_task(task.task_id).execution_records[0]
+    assert record.status == "failed"
+    assert record.rejected_before_dispatch is True
+    assert record.invocation_id is None
+    assert requests == [("POST", "/tools/motion.move_pose:invoke")]

@@ -70,6 +70,9 @@ class FakeCoordinator:
     def set_activation_manager(self, manager) -> None:
         self.activation_manager = manager
 
+    def unknown_remote_blockers(self) -> list[dict]:
+        return []
+
     async def reconcile_nonterminal(self):
         self.reconcile_calls += 1
         if self.reconcile_error is not None:
@@ -933,14 +936,14 @@ async def test_run_core_agent_wires_one_argument_model_command(tmp_path, monkeyp
     fake_session = FakeSession()
 
     @asynccontextmanager
-    async def fake_open(config, *, provider_name=None, model=None, effort=None, output):
+    async def fake_open(config, *, provider_name=None, model=None, effort=None, output, additional_capabilities=(), **_kwargs):
         yield fake_session
 
     class FakeInteractive:
         def request_stop(self):
             pass
 
-        def __init__(self, session, *, session_id, output, read_input, model_command):
+        def __init__(self, session, *, session_id, output, read_input, model_command, **kwargs):
             seen["session"] = session
             seen["session_id"] = session_id
             seen["model_command"] = model_command
@@ -1016,7 +1019,7 @@ async def test_run_core_agent_pauses_reader_for_the_model_menu(tmp_path, monkeyp
             return "text path"
 
     @asynccontextmanager
-    async def fake_open(config, *, provider_name=None, model=None, effort=None, output):
+    async def fake_open(config, *, provider_name=None, model=None, effort=None, output, additional_capabilities=(), **_kwargs):
         yield FakeSession()
 
     async def fake_picker(text, sessions, key):
@@ -1028,7 +1031,7 @@ async def test_run_core_agent_pauses_reader_for_the_model_menu(tmp_path, monkeyp
         def request_stop(self):
             pass
 
-        def __init__(self, session, *, session_id, output, read_input, model_command):
+        def __init__(self, session, *, session_id, output, read_input, model_command, **kwargs):
             seen["model_command"] = model_command
 
         async def run(self):
@@ -1108,7 +1111,7 @@ async def test_run_core_agent_single_message_has_static_progress_and_colon_title
             raise AssertionError("no cancel expected")
 
     @asynccontextmanager
-    async def fake_open(config, *, provider_name=None, model=None, effort=None, output):
+    async def fake_open(config, *, provider_name=None, model=None, effort=None, output, additional_capabilities=(), **_kwargs):
         yield FakeSession()
 
     monkeypatch.setattr(agent_commands, "open_core_session", fake_open)
@@ -1193,7 +1196,7 @@ async def test_run_core_agent_republishes_the_actual_label_after_text_commands(
     fake_session = FakeSession()
 
     @asynccontextmanager
-    async def fake_open(config, *, provider_name=None, model=None, effort=None, output):
+    async def fake_open(config, *, provider_name=None, model=None, effort=None, output, additional_capabilities=(), **_kwargs):
         seen["output"] = output
         yield fake_session
 
@@ -1201,7 +1204,7 @@ async def test_run_core_agent_republishes_the_actual_label_after_text_commands(
         def request_stop(self):
             pass
 
-        def __init__(self, session, *, session_id, output, read_input, model_command):
+        def __init__(self, session, *, session_id, output, read_input, model_command, **kwargs):
             seen["model_command"] = model_command
 
         async def run(self):
@@ -1270,7 +1273,7 @@ async def test_run_core_agent_menu_refresh_shows_the_actual_selection(tmp_path, 
     fake_session.model_command = lambda session_id, text: "text path"
 
     @asynccontextmanager
-    async def fake_open(config, *, provider_name=None, model=None, effort=None, output):
+    async def fake_open(config, *, provider_name=None, model=None, effort=None, output, additional_capabilities=(), **_kwargs):
         seen["output"] = output
         yield fake_session
 
@@ -1284,7 +1287,7 @@ async def test_run_core_agent_menu_refresh_shows_the_actual_selection(tmp_path, 
         def request_stop(self):
             pass
 
-        def __init__(self, session, *, session_id, output, read_input, model_command):
+        def __init__(self, session, *, session_id, output, read_input, model_command, **kwargs):
             seen["model_command"] = model_command
 
         async def run(self):

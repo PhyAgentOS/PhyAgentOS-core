@@ -69,6 +69,11 @@ class HeartbeatService:
         self.enabled = enabled
         self._running = False
         self._task: asyncio.Task | None = None
+        # One heartbeat cycle (decision -> execute -> notify) runs at a time.
+        # A manual ``trigger_now`` must not interleave with a scheduled tick:
+        # the entry point freezes its delivery target around that whole cycle,
+        # and an overlapping execute would replace it before the notify.
+        self._cycle_lock = asyncio.Lock()
 
     @property
     def heartbeat_file(self) -> Path:
@@ -138,7 +143,12 @@ class HeartbeatService:
                 logger.error("Heartbeat error: {}", e)
 
     async def _tick(self) -> None:
-        """Execute a single heartbeat tick."""
+        """Run one complete cycle, serialized against ``trigger_now``."""
+        async with self._cycle_lock:
+            await self._run_cycle()
+
+    async def _run_cycle(self) -> None:
+        """Decision, execution and delivery for one tick."""
         content = self._read_heartbeat_file()
         if not content:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
@@ -163,7 +173,16 @@ class HeartbeatService:
             logger.exception("Heartbeat execution failed")
 
     async def trigger_now(self) -> str | None:
-        """Manually trigger a heartbeat."""
+        """Manually run one cycle, serialized against scheduled ticks.
+
+        It returns the execution result and never notifies; the lock still
+        covers the execution so a concurrent tick cannot observe a target
+        frozen by this call.
+        """
+        async with self._cycle_lock:
+            return await self._trigger_cycle()
+
+    async def _trigger_cycle(self) -> str | None:
         content = self._read_heartbeat_file()
         if not content:
             return None

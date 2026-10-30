@@ -395,7 +395,7 @@ async def test_pause_ends_prompt_menu_cancel_is_contained_and_resume_reads_again
         def result(self, result):
             displayed.append(result.turn_id)
 
-        def turn_started(self):
+        def turn_started(self, session_id=None):
             displayed.append("started")
 
         def turn_finished(self):
@@ -975,3 +975,27 @@ async def test_escape_window_expiry_other_keys_and_arrows_do_not_stop(
             pipe.send_text("exit\r")
             assert await asyncio.wait_for(reading, 2) == "exit"
             terminal.restore()
+
+
+def test_stream_preview_wraps_long_cjk_and_shows_the_newest_tail():
+    display, _ = _display(
+        live=False, size=lambda: (20, 8), session="session s"
+    )
+    display.begin_turn()
+    first = "机械臂状态检查" * 20
+    display.set_stream_text(first)
+    lines = display.render_lines(width=20, rows=8)
+    preview = [line for line in lines if line.startswith("│ ")]
+    assert len(preview) >= 2
+    assert all(len(line) <= 20 for line in preview)
+    # With a small viewport the oldest text is gone; the newest text remains.
+    assert any("检查" in line for line in preview)
+
+    latest = "最新增量XYZ"
+    display.set_stream_text(first + latest)
+    narrowed = display.render_lines(width=20, rows=8)
+    assert any(latest[-3:] in line or "XYZ" in line for line in narrowed)
+    # Resize re-wraps the retained full text instead of keeping stale lines.
+    widened = display.render_lines(width=30, rows=20)
+    assert widened != narrowed
+    assert any("XYZ" in line for line in widened)

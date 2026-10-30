@@ -395,15 +395,97 @@ paos agent -m "Inspect the motion Tool context, move the gripper forward 5 cm, a
 paos gateway
 ```
 
-`paos agent` uses the legacy runtime by default. The new Core runtime is opt-in:
+`paos agent` uses the Core runtime by default. The previous implementation is still
+selectable for comparison:
 
 ```bash
-paos agent --runtime core
+paos agent
 paos agent --runtime core -m "Inspect the motion Tool context."
+paos agent --runtime legacy
 ```
 
-The Core runtime is experimental: replies are not streamed and `/correct` is unavailable. On a
-terminal, `/model` and `/effort` without an argument open the same inline selector as the default
+Selecting `core` (explicitly or by default) does not load `agent_legacy` or `cli.legacy`;
+those modules are imported only when `--runtime legacy` is actually chosen. A Core failure
+exits; it does not fall back to the legacy runtime. Both runtimes write separate session
+history (`<workspace>/sessions/core.db` vs `<workspace>/sessions/` JSONL), but unresolved
+remote state and AgentTask protection are workspace-wide and shared by both.
+
+### Sessions
+
+`paos agent` starts a new session each time. Its id is `cli:YYYYMMDD-NN`, where the date and
+two-digit sequence belong to the workspace and are allocated atomically, so concurrent processes
+cannot receive the same id and a restart never reuses an old one. The title is derived from the
+first turn's task text and stored separately; setting a title never changes the id. `--session
+<id>` uses the given id instead of allocating a new one, resuming it when it already exists. In the
+Core session, `/new` starts a fresh session, bare `/session` lists the Core sessions to choose
+from (an inline picker on a terminal), and `/session <id>` loads an existing id directly. Both
+`/new` and `/session` are handled locally and do not submit a model turn. Unlike the legacy chat,
+where `/new` only clears history, the Core `/new` allocates a new session id. Existing Core sessions
+in `core.db` are preserved. Legacy JSONL sessions are not imported or converted, and there is no
+automatic legacy migration.
+
+### Streaming, context and the turn footer
+
+When the provider supports streaming, reply body text is previewed while the turn is still running
+(written directly when output is redirected) and the final answer is not printed a second time. A
+tool call runs only after its arguments are complete; if the stream ends before that, the call is
+not executed. A cancelled or disconnected stream is not resent automatically. Usage the provider
+reports is added when the call ends; fields it did not report stay unknown. A provider without
+streaming support still produces a normal one-shot reply.
+
+The session line shows `context ...`: the estimated size of the current request (system prompt,
+tool schemas and history) as a share of the effective window, which is the smaller of the
+configured window and the known model capacity. `≈` marks an estimate, `exact` marks a
+provider-reported value, and `--%` means the size or capacity is unknown. A request above capacity
+stays above 100% instead of being clamped.
+
+After each turn the footer reports elapsed time, model rounds, tool calls, input and output
+tokens, cache hit ratio, and, only when the provider reports it, reasoning tokens; it then shows
+the session cumulative input, output and total. Model rounds count provider calls, not hidden
+reasoning steps. `--` means unknown and `--%` means the provider did not report cache usage.
+Cached and reasoning tokens are already part of input/output/total and are never added again.
+The cumulative line is rebuilt from stored events, so it survives a reload; a completed call
+without a usage record marks it as incomplete. The footer is terminal output only and is never
+part of the model history.
+
+### Compacting a session
+
+`/compact` manually compacts history: it writes a summary of earlier turns and keeps recent
+complete turns verbatim. It runs only between turns. Once a summary request is sent, the attempt is
+recorded even if it fails or is cancelled: the original context and history stay unchanged, the
+attempt stays in the session record, and any token usage it reported is added to the session total.
+A checkpoint is written only when the estimate for the next request actually shrinks; if it does not
+(for example the summary is longer than the original), the compaction is refused and the original
+context stays unchanged, while the attempt and any reported usage are still recorded. A successful
+checkpoint is a projection over the append-only event history; original events are not rewritten or
+deleted, and the usage copied onto the checkpoint is not counted again. Compaction
+never dispatches a tool call, so it cannot create, cancel or resolve a Forge Action or Session, and
+an unresolved `unknown` stays unresolved.
+
+### Gateway background entries
+
+`paos gateway` uses the same Core runtime for cron, heartbeat and chat channels by default.
+`--runtime legacy` remains available for comparison, and the old implementation is imported only
+when that runtime is actually selected. Each background turn freezes its channel, chat and reply
+target before it starts, so a later heartbeat or chat message cannot redirect a reply already in
+flight. The last external chat target is saved in `<workspace>/.gateway_route.json` (channel, chat
+and thread only) and restored after a restart; a target whose channel is no longer enabled is
+ignored. A channel turn publishes at most one final reply, as one complete message; streamed
+deltas are not forwarded to channels. If the message tool already delivered it, the runtime does
+not publish it again. `paos agent` can add, list or remove cron jobs through the cron tool, but only
+`paos gateway` starts the scheduler, so jobs do not run while only an agent session is open. The
+gateway re-checks the shared `jobs.json` at least once per second and picks up a job another
+process added. Store writes take an exclusive lock on the sibling `.lock` file (on Linux this
+`flock` works across processes; on Windows it only covers one process), perform the
+read-modify-write without awaiting, and replace the file atomically. When a job finishes, only that
+job's own runtime state is merged back: a job another process added, deleted, disabled or
+rescheduled is preserved. Keep one scheduler owner (one `paos gateway`); this is not an
+exactly-once guarantee across multiple gateways. Channels that are not configured are not started
+automatically. Media bytes are not forwarded to the model in this version: the reference is kept
+in the turn text and the model is told the bytes were not forwarded.
+
+The Core runtime is still experimental: `/correct` is unavailable. On a
+terminal, `/model` and `/effort` without an argument open the same inline selector as the legacy
 runtime; text commands (`/model 2`, `/effort high`) and non-terminal input keep the text list.
 Interrupting a selector with Esc or Ctrl+C leaves the session and its selection unchanged. Locally,
 `/help` lists the commands and `/tools [on|off]` shows or hides this turn's full tool-call record.
@@ -415,9 +497,18 @@ session/model line sits above the input; while a turn runs the `You:` marker and
 and ordinary keys are ignored (an existing draft is kept), so nothing is silently queued. The
 running turn shows a spinner with elapsed time, switching between preparing, thinking, calling a
 tool, and stopping locally; the bottom toolbar lists the last four tool calls plus hidden and total
-counts. Its history lives in `<workspace>/sessions/core.db`; the default runtime keeps JSONL
+counts. Its history lives in `<workspace>/sessions/core.db`; the legacy runtime keeps JSONL
 history under `<workspace>/sessions/`. The two stores are not imported or merged. A Core failure
-exits; it does not fall back to the legacy runtime. Fleet mode still requires the default runtime.
+exits; it does not fall back to the legacy runtime. Fleet mode still requires `--runtime legacy`.
+
+Unresolved remote state from any session in the workspace blocks new AgentTasks. The Core prompt
+reports that blocker on every step, including its task/invocation identity and `None` when the
+Gateway never confirmed an invocation; it does not quote another session's description, arguments
+or evidence. Do not retry the old Action/Session, invent an invocation id, or cancel another
+session's task to get around the block. Use only tools declared by the activated Skill or a fetched
+ToolSpec. If the current end-effector pose or robot state is unavailable, a relative displacement
+cannot be claimed and no guessed absolute target is sent; leaving optional `timeout_ms` unset lets
+the Gateway apply its own timeout.
 
 ## 5. Inspect Tool context
 

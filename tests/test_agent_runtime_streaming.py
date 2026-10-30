@@ -104,7 +104,7 @@ def _invoke_cli_agent(tmp_path, monkeypatch, agent_cls):
 
     return CliRunner().invoke(
         commands.app,
-        ["agent", "--message", "hi", "--session", "cli:test"],
+        ["agent", "--runtime", "legacy", "--message", "hi", "--session", "cli:test"],
     )
 
 

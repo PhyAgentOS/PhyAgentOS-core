@@ -25,11 +25,15 @@
 | `agent/capabilities/` | Forge 工具的原生定义与操作、到 Core `ToolOutcome` 的映射，以及 `activate_skill` |
 | `agent/services/skill_documents.py`、`agent/services/turn_activation.py` | Skill 文档发现与按回合的激活身份 |
 | `agent/bootstrap.py`、`agent/services/forge_verifier.py` | 共享的 Forge 构造工厂与语义验证器；`agent_legacy/session_verifier.py` 只保留别名 |
+| `agent/services/session_catalog.py` | `core.db` 中的会话 id、标题、按天序号与按会话的 provider/model/effort 选择 |
+| `agent/services/context_compaction.py` | 手动压缩的摘要与最近完整回合投影 |
+| `agent/services/usage.py` | 用量账本、下一次请求的 context 估算与回合/会话脚注格式 |
+| `agent/services/background_runtime.py` | gateway 的 cron、heartbeat 与 channel 回合共用的一套 Core 装配，含冻结路由与有界准入 |
 | `cli/commands.py` | 单一 Typer app、全局 callback 与命令组注册，包括唯一的 `agent` 命令 |
-| `cli/command_groups/agent_commands.py` | Core 路径 `paos agent --runtime core`：依赖构造、逐回合装配、`CoreAgentSession` 与进程生命周期 |
+| `cli/command_groups/agent_commands.py` | Core 路径 `paos agent`（默认）：依赖构造、逐回合装配、`CoreAgentSession` 与进程生命周期 |
 | `cli/command_groups/`（其余模块） | provider、gateway、Skill、Forge Node、channels 与 onboard/status 命令组，由 `commands.py` 统一注册 |
 | `cli/configuration.py` | gateway 与 legacy 路径共用的配置加载和启动选择（provider/evolution） |
-| `cli/legacy/legacy_agent.py`、`cli/legacy/legacy_support.py` | 默认的旧 `paos agent`、其终端交互与旧 prompt 会话 helper |
+| `cli/legacy/legacy_agent.py`、`cli/legacy/legacy_support.py`、`cli/legacy/legacy_gateway.py` | 旧的 `paos agent --runtime legacy`、其终端交互、旧 prompt 会话 helper，以及 `paos gateway --runtime legacy` 选中的旧 gateway |
 | `cli/interaction/interactive_session.py`、`cli/interaction/agent_output.py`、`cli/interaction/terminal_input.py`、`cli/interaction/terminal_display.py`、`cli/interaction/model_picker.py` | Core 的输入调度与取消、消息展示、终端输入、实时状态与工具区，以及 provider/model/effort 选择器 |
 | `agent_legacy/loop.py` | 现有 Agent Loop、通用工具、动态 MCP、Forge tools 注册、上下文与生命周期 |
 | `agent_legacy/tools/forge_tool_api.py` | 十个 Gateway Tool API 工具的兼容 wrapper |
@@ -61,6 +65,12 @@ Core 路径还注册 `agent/capabilities/skill_access_capability.py` 提供的 `
 诊断 Query 与绑定调用使用相同 HTTP 方法；每个变更或任务归因 wrapper 都在网络访问前校验
 ownership 与冻结 binding。Tool wrapper 不能自行生成 Gateway identity 或 result。
 
+可选 `timeout_ms` 不由 Agent 填默认值：Gateway 上限未知时模型省略该字段，由 Gateway 用自己
+的默认超时。HTTP client timeout 是另一项设置，不能拿它代替。Core 的 prompt fragment 每步从
+coordinator 实时读取全 workspace 的未解决 Action/Session blocker，只给 task/invocation 身份、
+状态和 semantics；本 session 的 `succeeded` 不会掩盖更早的 unknown，`None` 表示 Gateway 身份
+从未确认。它只说明当前阻塞，不代表已经解决。
+
 ## 5. AgentTask 契约与事务
 
 `AgentTaskRecord` 包含稳定 ID、任务描述、`TaskVerificationContract`、状态、只追加
@@ -72,6 +82,12 @@ PlanRevision、evidence refs、verification attempts、取消状态和时间戳�
 修改表。
 
 公开状态由 [AgentTask 状态契约](../forge/README_zh.md#8-agenttask-模型)定义。Store 转移必须保持这些语义；`unknown` Tool record 结束记账，但不证明物理停止。
+
+Gateway 现在为自身的派发前请求校验返回明确的 `FORGE_TOOL_REQUEST_VALIDATION_REJECTED`
+错误码。只有响应为 HTTP 400 且不带 invocation/attempt 身份时，PAOS 才把该 code 记为
+`failed`。旧版或当前已发布的 Gateway 返回无 `error.code` 的裸 400（只有 `msg`）时仍保持
+`unknown`；必须实际部署更新后的版本，这类拒绝才不会重现，因此不要宣称当前运行的 Gateway
+已修。
 
 ## 6. 绑定执行生命周期
 
@@ -169,10 +185,10 @@ attempt。Outcome source 将每个 revision verdict 映射到该 revision
 
 | 选择 | 归属 | 状态 |
 |:-----|:-----|:-----|
-| `--runtime legacy`（默认） | `cli/legacy/legacy_agent.py` | 现有路径；仍是默认 |
-| `--runtime core` | `cli/command_groups/agent_commands.py` | 新 Core 路径；显式启用，缺口见下文 |
+| `--runtime core`（默认） | `cli/command_groups/agent_commands.py` | Core 路径；不 import legacy 包 |
+| `--runtime legacy` | `cli/legacy/legacy_agent.py` | 旧实现；显式选择，用于对比 |
 
-`commands.py` 保留 Typer app、全局 callback 和唯一的注册点；各命令组自己持有 Typer app 或 `register_*` 函数。`configuration.py` 存放 gateway 与 legacy 路径共用的配置加载及启动时的 provider/evolution 选择。`agent_commands.py` 只负责 Core 路径：读配置、建依赖、每回合建一次装配、结束时关闭会话；它目前仍持有 `CoreAgentSession` 和 Core 依赖装配，不是单一职责模块。`interaction/interactive_session.py` 调度 Core 输入，`interaction/agent_output.py` 负责消息展示，`interaction/terminal_input.py` 负责 prompt_toolkit 输入和终端状态，`interaction/terminal_display.py` 持有实时状态与工具区，`interaction/model_picker.py` 存放共用的终端选择器。Core 的 prompt 代理使用原始 ANSI 直通，Rich 样式会正常显示，不再变成可见的 `?[36m`；模型、工具和异常文本在渲染前会去掉控制字符，转义序列只由 Rich 产生。
+`commands.py` 保留 Typer app、全局 callback 和唯一的注册点；各命令组自己持有 Typer app 或 `register_*` 函数。`register_agent` 只在显式 `--runtime legacy` 分支里 import legacy runner；建 app 或跑 Core 都不会 import `agent_legacy` 或 `cli.legacy`。`configuration.py` 存放 gateway 与 legacy 路径共用的配置加载及启动时的 provider/evolution 选择。`agent_commands.py` 只负责 Core 路径：读配置、建依赖、每回合建一次装配、结束时关闭会话；它目前仍持有 `CoreAgentSession` 和 Core 依赖装配，不是单一职责模块。`interaction/interactive_session.py` 调度 Core 输入，`interaction/agent_output.py` 负责消息展示，`interaction/terminal_input.py` 负责 prompt_toolkit 输入和终端状态，`interaction/terminal_display.py` 持有实时状态与工具区，`interaction/model_picker.py` 存放共用的终端选择器。Core 的 prompt 代理使用原始 ANSI 直通，Rich 样式会正常显示，不再变成可见的 `?[36m`；模型、工具和异常文本在渲染前会去掉控制字符，转义序列只由 Rich 产生。
 
 终端只有一个实时区域写入者：prompt_toolkit 的底栏渲染回合阶段（准备、思考、调用工具、本地停止）、转圈和耗时，以及本回合最近 4 次工具调用、隐藏数量和总数。没有第二个 `Live` 或 `status` 写入者，因此输入框、动画和工具区不会互相移动光标。动画只由 prompt_toolkit 的刷新定时器驱动；状态变化只来自已经持久化的事件和会话的提交/取消回调。工具调用按 `(session_id, turn_id, tool_call_id)` 建键，从 `tool.intent` 到 `tool.dispatched` 再到 `tool.settled` 原地更新，重复事件不会增加总数；新回合开始时清空旧行，避免继承上一回合状态。没有 prompt 时（单次 `-m`、启动阶段、重定向流），同一份状态按变化打印普通行，不做动画，也不输出转义序列。`/tools` 按需打印脱敏记录：只有工具名、本地状态和限长错误摘要，不打印参数、结果或凭证。
 
@@ -200,17 +216,109 @@ legacy 路径的生命周期留在 `legacy/legacy_agent.py`：建 `AgentLoop`，
 
 `agent/services/forge_verifier.py` 是两条路径共用的唯一验证器实现；`agent_legacy/session_verifier.py` 只是重新导出，原有 import 和模块 patch 仍然生效。
 
+### 会话目录与身份
+
+Core 把事件与目录元数据放在同一个 `core.db`。`SessionCatalog`
+（`agent/services/session_catalog.py`）新增两张表：`session_catalog` 保存每个会话的标题和
+最近一次 provider/model/effort 选择，`session_counters` 按本地日期分配序号。
+`create_session()` 在同一个 `BEGIN IMMEDIATE` 事务里写序号与目录行，若生成的 id 已存在就继续
+取号，因此并发进程和重启不会拿到同一个 `cli:YYYYMMDD-NN`。只存在于 `session_events` 的旧会话
+仍按原 id 列出来；元数据按需补齐，不改名。标题由 `derive_title()` 从首轮输入本地提炼：
+折叠空白、脱敏形似凭证的文本、按长度截断，不发模型请求。标题只是元数据，id 从不随之改变。
+`--session <id>` 走 `ensure_session()`，不分配新 id。不带参数的 `/session` 列出目录会话
+（最近更新在前），`/session <id>` 复用指定会话，`/new` 在运行中的进程里分配新 id。这两个命令
+都在本地处理，不提交模型回合。旧 JSONL 会话既不读取也不迁移。
+
+### Context 记账与回合脚注
+
+`UsageLedger`（`agent/services/usage.py`）只从已持久化事件取数，并按 `model_call_id` 幂等：
+一个模型调用只计入一次，重复的 completed 只细化已有快照。失败或中断的 attempt 若确实报告了
+用量，仍按真实消耗计入；没有报告的不会让历史变成不完整。已完成的调用若没有用量，会标为
+不完整并在摘要里说明。
+缺失字段保持 `None` 并显示为 `--`；只有 provider 明确给出 `0` 才显示零。`cached_tokens` 与
+`reasoning_tokens` 只作参考：cache 已包含在 prompt tokens 内，reasoning 已包含在 completion
+tokens 内，都不再加进输入、输出或合计。`total_tokens` 优先用 provider 的值，没有才用输入加
+输出。只有每个计入的调用都同时报告 prompt 与 cached 时才显示缓存命中率。`estimate_context()`
+以最新的持久化 `request.prepared` 快照为起点，补上其后的 assistant 与 tool 消息；只有
+provider 报告的 prompt 大小仍对应未变化的请求时才标记为 `exact`。容量取有效窗口：配置的
+`context_window_tokens` 与已知模型容量中较小的一个。模型轮次统计 provider 调用次数，不是
+内部推理步数，也不伪造推理步数。会话累计行从已存事件重建，重新载入后仍可用。脚注只是终端
+渲染，绝不插入发给 provider 的消息历史。
+
+### 流式契约
+
+注入的 provider 提供可调用的 `chat_stream` 时，`ModelAdapter.stream()` 走流式；没有则保留
+`complete` 路径，只产出终态响应。流式文本只含正文，并在 `model.attempt.completed` 之前以
+step 级 `model.response.delta` 事件持久化；`reasoning_content` 从不流式输出。终态 completed
+事件仍带完整正文与真实收到的 usage，历史只存一条由终态响应构造的完整 assistant 消息，展示层
+追加 delta 后不再重复打印 completed 正文。工具调用只从完整的 `tool_call` 事件收集，参数没收
+全之前循环不执行任何工具。取消时关闭返回的生成器即关闭 provider 流；取消或断线的流不会自动
+重发。预算错误在第一个事件之前抛出，从而记为一次干净的失败尝试。失败或中断的 attempt 只带
+provider 确实发来的 usage 键。
+
+### 手动压缩
+
+手动压缩把 checkpoint 追加到会话独立的 checkpoint 投影表，不改写 `session_events`，原始事件
+始终可读。`/compact` 只在回合之间执行；它为较早历史写摘要，并把最近若干个完整回合按原文保留。
+每次摘要调用先写一行 `compaction_attempts`，结束时记录状态与 provider 确实报告的用量。在规划
+阶段就被拒绝、尚未发 provider 请求的压缩不写尝试，也没有消耗。因此失败或被取消的尝试不会改变
+会话投影和原上下文，但尝试记录与已知用量仍可见。成功和失败的摘要尝试都按实际报告的用量计入
+会话累计；没有报告用量的失败尝试不加 token，但仍保留在尝试记录里。checkpoint 上抄录的用量
+只是参考元数据，不会再次计入。压缩前（before）与压缩后（after）的估算，以及每次请求前的
+预检，用的是同一个真实 token 估算器，并把 system 与当前可见工具一并计入，不再按字符数
+估算；只有下一次请求的估算确实变小才写 checkpoint。UI 只在收到 `REQUEST_PREPARED` 时才
+切换 checkpoint 投影，回合开始（`TURN_STARTED`）不回退到旧历史。压缩从不派发工具调用，
+也不改 AgentTask 或 Forge 记录，因此压缩后未解决的 `unknown` 仍然阻塞新任务。
+
+### Gateway 后台运行时
+
+`paos gateway` 的 cron、heartbeat 与 channel 回合都来自
+`agent/services/background_runtime.py` 的 `open_background_core()`，与 CLI 共用同一个
+`CoreAgentSession`、store、Forge coordinator/client 和 Skill 激活管理器。`TurnBinding` 在回合
+开始前冻结 channel、chat、回复目标与 thread 元数据；能力按 `session_id` 读取绑定（不用共享
+`ContextVar`），后到的回合无法改变执行中回合的投递方向。最近的外部聊天目标持久化到
+`<workspace>/.gateway_route.json`（只含 channel、chat 与 `message_thread_id`），启动时恢复；
+加载和使用都会重新确认 channel 仍启用，因此不会使用失效目标。heartbeat 周期由 heartbeat
+service 的 cycle lock 串行，两个周期不会重叠。同一 session 的回合严格串行；不同 session 按
+配置并发，超过队列上限的会话被拒绝而不是无限增长。channel dispatcher 每回合最多发布一条
+最终消息，内容是完成后的完整文本，流式 delta 不转发到 channel；如果 message 工具已经投递过，
+就不再重复。Core CLI 也在同一个 job store 上注册 `CronCapability`，但从不启动 scheduler；
+调度只在 `paos gateway` 里运行。关闭时先停 intake，结算已接受的回合，最后只关一次 Core。
+未配置的 channel 不会启动。`--runtime legacy` 保留旧实现用于对比，只有真正选中时才导入；
+构建或运行 Core gateway 都不会 import `agent_legacy` 或 `cli.legacy`。
+
+已知 cron 存储行为：任务存在单个 `jobs.json` 和同目录 `.lock` 文件。`_store_lock()` 取阻塞
+`flock`（Linux 经 `fcntl` 跨进程；没有 `fcntl` 的平台只在进程内串行），只在同步读改写期间
+持有，绝不跨 await 的模型或工具调用。写入先落到临时文件，再用 `os.replace` 原子发布。任务
+结束后，service 在锁内重新读取最新文件，只合并该任务自己的运行状态；外部新增、删除、停用或
+修改调度都会保留。存储仍是单个 JSON 文件：本轮没有迁到 SQLite，也没有新增配置项。请只运行
+一个 scheduler owner；这不构成多 gateway 的恰好一次保证。
+
 ### Skill 激活作用域
 
 `activate_skill` 是 `agent/capabilities/skill_access_capability.py` 提供的 Core 工具。一次激活只属于一个 `session_id` 和一个 `turn_id`；上一回合、其他 session 或上一个进程的 id 都会被拒绝。激活记录只在内存里，重启后必须重新激活。一回合允许一个 primary Skill 和任意多个 supporting Skill。激活只读 Skill 文档，不启动 Skill runtime。
 
 ### Core 路径未覆盖的部分
 
-通用工具、流式回复、`/correct`、memory 与 evolution、managed interaction Sessions、fleet 模式，以及 cron、heartbeat、channels 入口都还没迁移。Forge interaction supervisor 没有接进 Core CLI，因此不能把交互迁移说成已完成。旧 JSONL 会话不导入；Core 使用独立的 SQLite 文件。Provider 错误只给简短的脱敏诊断：保留异常类型和 HTTP 状态，不回显响应体与凭证。
+通用工具、`/correct`、memory 与 evolution、managed interaction Sessions 以及 fleet 模式都还没
+迁移。Forge interaction supervisor 没有接进 Core CLI，因此不能把交互迁移说成已完成。旧 JSONL
+会话不导入；Core 使用独立的 SQLite 文件。Provider 错误只给简短的脱敏诊断：保留异常类型和
+HTTP 状态，不回显响应体与凭证。
 
 ### 测试
 
-相关用例覆盖文档发现、激活作用域、验证器别名、Core CLI 单条请求与逐回合装配，以及交互 FIFO、取消、展示、排队回执、本地命令和工具区记录。终端行为用真实的 prompt_toolkit pipe input 和 Vt100 output 验证：session 行在输入框上方、忙时隐藏 You 与光标并禁键、草稿保留、第一次 Esc 提示、第二次 Esc 只取消一次、超时/其他键/方向键清除、菜单 Esc 不取消、resize 与菜单前暂停 reader；不只依赖 mock 的 TTY 开关。测试使用本地 fake provider、fake Forge client 和临时 store；不包含真实 provider 或 Gateway 请求。全量门禁仍是 `pytest`、`ruff check PhyAgentOS tests` 和 `compileall`。
+相关用例覆盖文档发现、激活作用域、验证器别名、Core CLI 单条请求与逐回合装配，以及交互 FIFO、取消、展示、排队回执、本地命令和工具区记录。会话目录与手动压缩有本地用例，覆盖按天原子取号、标题提炼、只有事件的旧会话、选择持久化、checkpoint 投影、拒绝/失败的摘要、执行中的回合与工具调用配对保留；Core CLI 会话命令由 `test_cli_session_features.py` 覆盖。流式覆盖
+fake provider 的 delta、tool_call、usage、done、error，含取消与无 `chat_stream` 回退。provider 层检查让真实 `AsyncOpenAI` 客户端走进程内 mock transport
+与 SSE 流，确认完成前可见正文、只发一次 POST、只有一条历史消息，以及 usage/cache 处理；不联系
+外部 provider。用量展示、provider usage 明细、流式取消/展示与 gateway 后台运行时
+各有本地用例（`test_core_usage_display.py`、`test_provider_usage_details.py`、
+`test_core_streaming_cancel.py`、`test_core_streaming_display.py`、
+`test_core_background_runtime.py`、`test_core_background_capabilities.py`、
+`test_core_scheduler_gateway.py`）。gateway 用例覆盖 route 恢复、冻结 heartbeat 目标、heartbeat
+周期串行、单次回复抑制与 scheduler 接线，使用临时 store。这些都是本地测试：不联系外部
+provider，也不做真实 channel 投递；cron 与 heartbeat 在本地驱动，本文不承诺具体用例数量。
+
+终端行为用真实的 prompt_toolkit pipe input 和 Vt100 output 验证：session 行在输入框上方、忙时隐藏 You 与光标并禁键、草稿保留、第一次 Esc 提示、第二次 Esc 只取消一次、超时/其他键/方向键清除、菜单 Esc 不取消、resize 与菜单前暂停 reader；不只依赖 mock 的 TTY 开关。测试使用本地 fake provider、fake Forge client 和临时 store；不包含真实 provider 或 Gateway 请求。全量门禁仍是 `pytest`、`ruff check PhyAgentOS tests` 和 `compileall`。
 
 ## 14. 测试门禁
 

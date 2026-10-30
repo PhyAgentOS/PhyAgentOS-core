@@ -16,6 +16,8 @@ from PhyAgentOS.providers.errors import describe_provider_error
 
 class CustomProvider(LLMProvider):
 
+    supports_native_stream = True
+
     def __init__(
         self,
         api_key: str = "no-key",
@@ -186,7 +188,7 @@ class CustomProvider(LLMProvider):
         u = response.usage
         return LLMResponse(
             content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",
-            usage={"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens, "total_tokens": u.total_tokens} if u else {},
+            usage=self._usage_to_dict(u),
             reasoning_content=getattr(msg, "reasoning_content", None) or None,
         )
 

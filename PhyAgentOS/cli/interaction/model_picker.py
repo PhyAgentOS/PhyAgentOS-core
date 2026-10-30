@@ -184,6 +184,60 @@ async def _switch_session_model(sessions: SessionRuntimes, key: str) -> str:
     return sessions.select(key, name, model)
 
 
+async def _session_picker(sessions, *, current: str | None = None):
+    """Inline session picker; ``None`` means cancelled, never "new session"."""
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+
+    if not sessions:
+        return None
+    selected = next(
+        (index for index, info in enumerate(sessions) if info.session_id == current),
+        0,
+    )
+    bindings = KeyBindings()
+
+    @bindings.add("up")
+    def previous(event):
+        nonlocal selected
+        selected = (selected - 1) % len(sessions)
+
+    @bindings.add("down")
+    def following(event):
+        nonlocal selected
+        selected = (selected + 1) % len(sessions)
+
+    @bindings.add("enter")
+    def choose(event):
+        event.app.exit(result=sessions[selected].session_id)
+
+    @bindings.add("escape")
+    @bindings.add("c-c")
+    def cancel(event):
+        event.app.exit(result=None)
+
+    def render():
+        start = max(0, min(selected - 5, len(sessions) - 12))
+        lines = ["Select a session\n\n"]
+        for index in range(start, min(start + 12, len(sessions))):
+            info = sessions[index]
+            marker = ">" if index == selected else " "
+            suffix = " (current)" if info.session_id == current else ""
+            lines.append(f"  {marker} {info.label}{suffix}\n")
+        lines.append("\n↑/↓ Select   Enter Load   Esc / Ctrl+C Cancel\n")
+        return [("", "".join(lines))]
+
+    return await Application(
+        layout=Layout(Window(FormattedTextControl(render))),
+        key_bindings=bindings,
+        full_screen=False,
+        mouse_support=False,
+    ).run_async()
+
+
 async def _interactive_model_command(
     command: str, sessions: SessionRuntimes | None, key: str,
 ) -> str | None:

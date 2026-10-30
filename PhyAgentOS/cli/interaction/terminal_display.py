@@ -161,6 +161,30 @@ def _fit(text: str, width: int) -> str:
     return "".join(kept) + "…"
 
 
+def _wrap_display(text: str, width: int) -> list[str]:
+    """Wrap text at display-column boundaries, preserving zero-width marks."""
+    if width <= 0:
+        return []
+    lines: list[str] = []
+    current: list[str] = []
+    used = 0
+    for char in text:
+        if char == "\n":
+            lines.append("".join(current))
+            current = []
+            used = 0
+            continue
+        char_width = get_cwidth(char)
+        if current and used + char_width > width:
+            lines.append("".join(current))
+            current = []
+            used = 0
+        current.append(char)
+        used += char_width
+    lines.append("".join(current))
+    return lines
+
+
 def _clean(value: object, *, limit: int = 120) -> str:
     return _fit(display_text(" ".join(str(value or "").split())), limit)
 
@@ -211,6 +235,8 @@ class TerminalDisplay:
         self._clock = clock
         self._size_provider = size_provider
         self._session_label = session_label
+        self._context_label = ""
+        self._stream_text = ""
         self._prompt = None
         self._phase = IDLE
         self._detail = ""
@@ -257,15 +283,42 @@ class TerminalDisplay:
         self._session_label = display_text(label)
         self._invalidate()
 
+    def set_context_label(self, label: str) -> None:
+        """Set the context line (``context ≈23%``); never re-estimate here."""
+        label = display_text(label)
+        if label == self._context_label:
+            return
+        self._context_label = label
+        self._invalidate()
+
+    def set_stream_text(self, text: str) -> None:
+        """Preview streamed body text in the live region while a prompt owns it."""
+        text = display_text(text)
+        if text == self._stream_text:
+            return
+        self._stream_text = text
+        self._invalidate()
+
     @property
     def session_label(self) -> str:
         return self._session_label
 
+    @property
+    def context_label(self) -> str:
+        return self._context_label
+
+    @property
+    def stream_text(self) -> str:
+        return self._stream_text
+
     def prompt_message(self):
         """Session line above the input, then the normal You marker when idle."""
         fragments: list[tuple[str, str]] = []
-        if self._session_label:
-            fragments.append(("fg:ansibrightblack", self._session_label + "\n"))
+        line = self._session_label
+        if self._context_label:
+            line = f"{line} · {self._context_label}" if line else self._context_label
+        if line:
+            fragments.append(("fg:ansibrightblack", line + "\n"))
         if not self.busy:
             fragments.append(("bold fg:ansiblue", "You: "))
         return fragments
@@ -356,6 +409,7 @@ class TerminalDisplay:
         self._thinking_announced = False
         self._stop_hint = False
         self._armed_until = None
+        self._stream_text = ""
         self._announce()
         self._invalidate()
 
@@ -380,6 +434,7 @@ class TerminalDisplay:
         self._expanded = False
         self._stop_hint = False
         self._armed_until = None
+        self._stream_text = ""
         self._announce()
         self._invalidate()
 
@@ -520,6 +575,22 @@ class TerminalDisplay:
                 label = _STATUS_LABELS[STOPPING]
             lines.append(_fit(f"{frame} {label} {elapsed:.1f}s", width))
 
+        if self._stream_text:
+            # Wrap by terminal display columns, not by code points; CJK and
+            # emoji take two columns. Show the newest wrapped lines so a long
+            # reply without newlines keeps moving. The transcript gets the
+            # final Markdown once, printed by AgentOutput above the prompt.
+            inner_width = max(1, width - 2)
+            wrapped = _wrap_display(self._stream_text, inner_width)
+            reserved = 3  # status + session + prompt marker
+            if self._stop_hint and self._phase != IDLE:
+                reserved += 1
+            if self._turn_active and self._records and not self._collapsed:
+                reserved += self._row_limit(rows) + 1
+            available = max(1, rows - reserved)
+            for line in wrapped[-available:]:
+                lines.append(_fit(f"│ {line}", width))
+
         if not self._turn_active or not self._records or self._collapsed:
             return lines
 
@@ -552,6 +623,8 @@ class TerminalDisplay:
     def _style_for(self, line: str, index: int) -> str:
         if self._stop_hint and index == 0:
             return "fg:ansiyellow bold"
+        if line.startswith("│ "):
+            return "fg:ansibrightblack"
         if index > 0 and line.startswith("| "):
             token = line.split(" ", 2)[1] if line.count(" ") >= 2 else ""
             if token in _TOOL_MARKERS.values():

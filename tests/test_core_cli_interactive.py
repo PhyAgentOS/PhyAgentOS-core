@@ -119,7 +119,7 @@ class FakeOutput:
     def result(self, result: TurnResult) -> None:
         self.results.append(result)
 
-    def turn_started(self) -> None:
+    def turn_started(self, session_id=None) -> None:
         self.turn_starts += 1
 
     def turn_finished(self) -> None:

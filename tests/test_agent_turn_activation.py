@@ -200,6 +200,7 @@ async def test_real_core_can_recover_from_historical_activation_id(tmp_path):
     coordinator = SimpleNamespace(
         store=SimpleNamespace(latest_for_session=lambda session: None),
         create_task=create_task,
+        unknown_remote_blockers=lambda: [],
     )
 
     class Provider:

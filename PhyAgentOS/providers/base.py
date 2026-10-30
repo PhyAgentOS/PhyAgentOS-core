@@ -5,7 +5,7 @@ import inspect
 import json
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
@@ -137,6 +137,12 @@ class LLMProvider(ABC):
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
+
+    #: True only when this class implements its own ``chat_stream``. The core
+    #: adapter uses it to tell a real stream from the inherited non-streaming
+    #: fallback, so a provider that only implements ``chat`` keeps the old
+    #: single-response path and is reported as a fallback, not as streaming.
+    supports_native_stream: bool = False
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _TRANSIENT_ERROR_MARKERS = (
@@ -284,6 +290,7 @@ class LLMProvider(ABC):
                 type="error",
                 content=response.content,
                 finish_reason="error",
+                usage=dict(response.usage),
             )
             return
         if not response.finish_reason:
@@ -317,6 +324,7 @@ class LLMProvider(ABC):
         """
         delays = self._CHAT_RETRY_DELAYS
         last_error: StreamEvent | None = None
+        observed_usage: dict[str, int] = {}
 
         for attempt in range(len(delays) + 1):
             emitted = False
@@ -324,6 +332,12 @@ class LLMProvider(ABC):
             try:
                 async with aclosing(factory()) as stream:
                     async for event in stream:
+                        event_usage = getattr(event, "usage", None)
+                        if event_usage:
+                            # Usage can arrive on its own event before any
+                            # text. Remember it so an error after that point
+                            # still carries what was already measured.
+                            observed_usage.update(event_usage)
                         if event.type == "error" and not emitted:
                             if self._is_transient_error(event.content):
                                 last_error = event
@@ -340,6 +354,7 @@ class LLMProvider(ABC):
                     type="error",
                     content=describe_provider_error(exc),
                     finish_reason="error",
+                    usage=dict(observed_usage),
                 )
                 if emitted:
                     yield event
@@ -444,18 +459,78 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _usage_to_dict(usage: Any) -> dict[str, int]:
-        """Normalize an OpenAI-shaped usage object or dict."""
-        if not usage:
+        """Normalize provider usage without inventing token counts.
+
+        Canonical keys are the OpenAI ones (``prompt_tokens``,
+        ``completion_tokens``, ``total_tokens``), with the Responses-shaped
+        ``input_tokens`` / ``output_tokens`` accepted as aliases. Two optional
+        breakdown keys are preserved when the provider reports them:
+
+        * ``cached_tokens`` from ``prompt_tokens_details.cached_tokens``,
+          ``input_tokens_details.cached_tokens``, or the provider-native
+          DeepSeek / Anthropic cache fields;
+        * ``reasoning_tokens`` from ``completion_tokens_details`` /
+          ``output_tokens_details``.
+
+        Missing data stays missing: a key that was not reported is absent, not
+        ``0``. Cached input is already part of ``prompt_tokens`` under the
+        OpenAI (and LiteLLM-normalized Anthropic/DeepSeek) contract, and
+        reasoning tokens are already part of ``completion_tokens`` /
+        ``total_tokens``, so nothing is added or subtracted here.
+        """
+        if usage is None:
             return {}
-        if isinstance(usage, dict):
-            getter = usage.get
-        else:
-            def getter(key: str) -> Any:
-                return getattr(usage, key, 0)
+
+        def get(key: str) -> Any:
+            if isinstance(usage, Mapping):
+                return usage.get(key)
+            return getattr(usage, key, None)
+
+        def as_int(value: Any) -> int | None:
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+            return None
+
+        def first(*values: Any) -> int | None:
+            for value in values:
+                number = as_int(value)
+                if number is not None:
+                    return number
+            return None
+
+        def detail_value(details: Any, key: str) -> Any:
+            if details is None:
+                return None
+            if isinstance(details, Mapping):
+                return details.get(key)
+            return getattr(details, key, None)
+
+        prompt_details = get("prompt_tokens_details")
+        if prompt_details is None:
+            prompt_details = get("input_tokens_details")
+        completion_details = get("completion_tokens_details")
+        if completion_details is None:
+            completion_details = get("output_tokens_details")
+
+        normalized = {
+            "prompt_tokens": first(get("prompt_tokens"), get("input_tokens")),
+            "completion_tokens": first(
+                get("completion_tokens"), get("output_tokens")
+            ),
+            "total_tokens": first(get("total_tokens")),
+            "cached_tokens": first(
+                detail_value(prompt_details, "cached_tokens"),
+                get("cached_tokens"),
+                get("prompt_cache_hit_tokens"),
+                get("cache_read_input_tokens"),
+            ),
+            "reasoning_tokens": first(
+                detail_value(completion_details, "reasoning_tokens"),
+                get("reasoning_tokens"),
+            ),
+        }
         return {
-            "prompt_tokens": int(getter("prompt_tokens") or 0),
-            "completion_tokens": int(getter("completion_tokens") or 0),
-            "total_tokens": int(getter("total_tokens") or 0),
+            key: value for key, value in normalized.items() if value is not None
         }
 
     @staticmethod
@@ -557,7 +632,13 @@ class LLMProvider(ABC):
             async for chunk in stream:
                 chunk_usage = getattr(chunk, "usage", None)
                 if chunk_usage:
-                    usage = self._usage_to_dict(chunk_usage)
+                    normalized = self._usage_to_dict(chunk_usage)
+                    if normalized:
+                        # Publish usage as soon as the SDK reports it. A caller
+                        # may be cancelled before the final chunk; without this
+                        # event the already-billed tokens would be invisible.
+                        usage.update(normalized)
+                        yield StreamEvent(type="usage", usage=dict(normalized))
 
                 for choice in getattr(chunk, "choices", None) or []:
                     delta = getattr(choice, "delta", None)
@@ -581,12 +662,18 @@ class LLMProvider(ABC):
                 type="error",
                 content="stream ended without finish_reason",
                 finish_reason="error",
+                usage=dict(usage),
             )
             return
 
         tool_calls = self._finalize_tool_calls(pending, id_factory)
         if isinstance(tool_calls, str):
-            yield StreamEvent(type="error", content=tool_calls, finish_reason="error")
+            yield StreamEvent(
+                type="error",
+                content=tool_calls,
+                finish_reason="error",
+                usage=dict(usage),
+            )
             return
         for tool_call in tool_calls:
             yield StreamEvent(type="tool_call", tool_call=tool_call)
