@@ -29,7 +29,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from PhyAgentOS.agent.core.events import EventType, RuntimeEvent
+from PhyAgentOS.agent.core.events import EventType, RuntimeEvent, reverted_turn_ids
 from PhyAgentOS.utils.helpers import estimate_prompt_tokens_chain
 
 __all__ = [
@@ -583,6 +583,10 @@ def estimate_context(
     ``exact`` is used only for the provider-reported prompt size of the last
     prepared request while nothing has extended it. A reply, a tool result or
     a new turn all turn the number back into an estimate.
+
+    A turn named by a ``turn.reverted`` marker is skipped like the conversation
+    projection skips it, so undoing the last request also lowers the estimate;
+    a running turn has no such marker and is never skipped.
     """
     events = list(events)
     if not events:
@@ -595,11 +599,18 @@ def estimate_context(
             capacity_source=capacity_source,
         )
 
+    reverted = reverted_turn_ids(events)
+
+    def visible(event: RuntimeEvent) -> bool:
+        return event.turn_id is None or event.turn_id not in reverted
+
     last_request_index = _last_index(
-        events, lambda event: event.type is EventType.REQUEST_PREPARED
+        events,
+        lambda event: event.type is EventType.REQUEST_PREPARED and visible(event),
     )
     completed_turn_index = _last_index(
-        events, lambda event: event.type is EventType.TURN_COMPLETED
+        events,
+        lambda event: event.type is EventType.TURN_COMPLETED and visible(event),
     )
 
     if last_request_index is not None and completed_turn_index is not None:

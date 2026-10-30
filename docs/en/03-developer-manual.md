@@ -22,7 +22,8 @@ This manual covers Core implementation: AgentTask coordination, persistence, bin
 |:-------|:---------------|
 | `agent/core/` | Seven Core components (host, runtime, loop driver, model adapter, prompt assembler, tool executor, SQLite session store); contracts in `types.py`, `events.py`, and `protocols.py` |
 | `agent/composition.py` | `compose_agent`: builds the Core assembly from injected collaborators and fixes capability order |
-| `agent/capabilities/` | Native Forge tool definitions and operations, Core `ToolOutcome` mapping, and `activate_skill` |
+| `agent/capabilities/` | Core adapters for Forge, Skill access, general tools, images, MCP, subagents, cron and message |
+| `tooling/` | Shared tool implementations independent of Agent runtimes; legacy tool paths retain compatibility exports |
 | `agent/services/skill_documents.py`, `agent/services/turn_activation.py` | Skill document discovery and per-turn activation identity |
 | `agent/bootstrap.py`, `agent/services/forge_verifier.py` | Shared Forge factories and the semantic verifier; `agent_legacy/session_verifier.py` remains an alias |
 | `agent/services/session_catalog.py` | Session ids, titles, per-day counters and per-session provider/model/effort selection in `core.db` |
@@ -390,6 +391,26 @@ stream is never re-requested automatically. A budget error is raised before the 
 is recorded as a clean failed attempt. Usage on failed or interrupted attempts contains only keys
 the provider actually sent.
 
+### Undo
+
+`/undo` is a CLI-local command; nothing is sent to the model. `CoreAgentSession.undo` refuses while a
+turn is running or queued or a compaction is in flight, then delegates to the optional store
+capability `UndoTurnStore.undo_last_turn` (`PhyAgentOS/agent/core/protocols.py`). The store picks the
+newest terminal turn that is not already reverted, appends one session-scoped `turn.reverted` event
+whose `payload["reverted_turn_id"]` names that turn (the marker itself carries no `turn_id`, so it
+stays out of `read_turn` and out of recovery), and never deletes or rewrites a row. Target selection,
+validation and the insert happen inside one session lock and one `BEGIN IMMEDIATE` transaction.
+`_conversation_from_events` skips reverted turns, so the projection falls back to the previous
+completed turn's request snapshot. A turn already covered by a checkpoint is reported with
+`block_reason="checkpoint"` and no marker is written; a failed or interrupted turn is marked with
+`context_reverted=False` so the next undo moves further back. `UndoOutcome.request_text` is read back
+from that turn's newest `request.prepared` snapshot (`input.accepted` stores only a character count),
+and `TerminalInput.prefill` stages it as the next prompt's default text. The status line follows the
+same rule: `reverted_turn_ids` (in `events.py`) is shared by the projection, `estimate_context` and
+the `_last_request_tools` / `_last_request_system` helpers, and `_ContextStatus.refresh` re-reads
+the stored events so a marker written by the store itself is seen (the usage ledger is still only
+seeded by `load`).
+
 ### Manual compaction
 
 `/compact` stores a checkpoint row in the session's append-only checkpoint projection; it never
@@ -450,11 +471,32 @@ Activation reads the Skill document and does not start a Skill runtime.
 
 ### What the Core path does not cover
 
-General-purpose tools, `/correct`, memory and evolution, managed interaction Sessions, and fleet
-mode are not migrated. The Forge interaction supervisor is not wired into the Core CLI, so this is
+`/correct`, long-term memory, experience/evolution, managed interaction Sessions, and fleet
+mode remain separate follow-up tasks. The Forge interaction supervisor is not wired into the Core CLI, so this is
 not a completed interaction migration. Existing legacy JSONL sessions are not imported; the Core
 store is a separate SQLite file. Provider failures are reported with a short redacted diagnostic:
 the exception type and HTTP status are kept, while response bodies and credentials are not.
+
+### General tools and the legacy entry
+
+The Core CLI and gateway share `open_core_session()` to register filesystem, shell, web search/fetch,
+scene graph, image, MCP and `spawn` capabilities. Shared implementations live in `tooling/`, which
+must not import either Agent runtime. Corresponding `agent_legacy/tools/` modules retain compatibility
+exports. The explicit legacy entry remains available for regression comparisons; removing it is not
+a requirement of this migration. `agent_mode` is only offered for providers supporting the existing
+mode-management contract; an ordinary leaf provider is not advertised as supporting it.
+Image calls and subagents use the running turn's frozen provider/model selection and explicit session
+identity for routing. MCP discovers tools before composition and owns its connections until shutdown;
+tool errors must not be recorded as success. A server initialization failure produces a redacted
+notice while other tools remain available. Timeouts and disconnects after dispatch remain `unknown`
+and are not replayed automatically. Large general-tool, vision and MCP outputs retain their complete
+text in files and expose a bounded excerpt plus its path to the model.
+`spawn` runs an isolated child session through the existing
+Core components rather than the legacy model loop. Children do not recursively spawn or register Forge
+physical execution tools. Completion notifications retain the parent session and destination captured
+when the child was created. A bounded completion summary is available only to later requests from
+that parent session. Notification failure does not change the child's actual result; shutdown cancels
+delivery waits while retaining that result.
 
 ### Tests
 

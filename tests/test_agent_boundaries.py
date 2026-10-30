@@ -152,6 +152,40 @@ def test_agent_package_imports_never_resolve_to_agent_legacy() -> None:
     assert offenders == {}
 
 
+def test_shared_tooling_does_not_import_agent_runtimes() -> None:
+    """Both runtimes reuse implementations; tooling cannot load either loop."""
+    offenders: dict[str, list[str]] = {}
+    for path in (PACKAGE_DIR / "tooling").rglob("*.py"):
+        bad = sorted(
+            name for name in _resolved_imports(path)
+            if name in {"PhyAgentOS.agent", "PhyAgentOS.agent_legacy", "PhyAgentOS.cli"}
+            or name.startswith((
+                "PhyAgentOS.agent.", "PhyAgentOS.agent_legacy.", "PhyAgentOS.cli.",
+            ))
+        )
+        if bad:
+            offenders[str(path.relative_to(REPO_ROOT))] = bad
+    assert offenders == {}
+
+
+def test_legacy_tool_imports_share_the_migrated_implementations() -> None:
+    """Legacy comparison must exercise the same tool code, not a stale copy."""
+    for module_name, exports in {
+        "filesystem": ("ReadFileTool", "WriteFileTool", "EditFileTool", "ListDirTool"),
+        "shell": ("ExecTool",),
+        "web": ("WebSearchTool", "WebFetchTool"),
+        "scene_graph": ("SceneGraphQueryTool",),
+        "image": ("ImageTool",),
+        "agent": ("AgentModeTool",),
+        "mcp": ("MCPToolWrapper", "connect_mcp_servers"),
+    }.items():
+        shared_name = "agent_mode" if module_name == "agent" else module_name
+        legacy = importlib.import_module(f"PhyAgentOS.agent_legacy.tools.{module_name}")
+        shared = importlib.import_module(f"PhyAgentOS.tooling.{shared_name}")
+        for name in exports:
+            assert getattr(legacy, name) is getattr(shared, name)
+
+
 def test_importing_new_composition_does_not_load_agent_legacy() -> None:
     code = "\n".join(
         [

@@ -42,9 +42,21 @@ PROVIDER_CALLS: list[list[dict]] = []
 
 class _FakeProvider:
     async def chat_with_retry(self, *, messages, tools=None, **kwargs):
-        from PhyAgentOS.providers.base import LLMResponse
+        from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest
 
         PROVIDER_CALLS.append(list(messages))
+        assert "read_file" in {item["function"]["name"] for item in tools}
+        if messages[-1]["role"] == "user" and messages[-1]["content"] == "migration-read":
+            return LLMResponse(
+                content=None,
+                tool_calls=[ToolCallRequest(
+                    id="read-probe", name="read_file", arguments={"path": "probe.txt"},
+                )],
+                finish_reason="tool_calls",
+            )
+        if messages[-1]["role"] == "tool":
+            assert "migration-content" in messages[-1]["content"]
+            return LLMResponse(content="tool-read-confirmed", finish_reason="stop")
         return LLMResponse(content="done", finish_reason="stop")
 
 
@@ -107,13 +119,19 @@ def main() -> int:
     invocations = (
         ("default", ["agent", "-m", "hello"]),
         ("explicit-core", ["agent", "--runtime", "core", "-m", "hello"]),
+        ("migrated-tool", ["agent", "-m", "migration-read"]),
     )
     for label, args in invocations:
         workspace = temp_root / f"workspace-{label}"
+        if label == "migrated-tool":
+            workspace.mkdir(parents=True)
+            (workspace / "probe.txt").write_text("migration-content", encoding="utf-8")
         result = runner.invoke(app, [*args, "--workspace", str(workspace)])
         assert result.exit_code == 0, (label, result.output, result.exception)
         assert (workspace / "sessions" / "core.db").is_file(), label
-    assert len(PROVIDER_CALLS) == len(invocations), PROVIDER_CALLS
+        if label == "migrated-tool":
+            assert "tool-read-confirmed" in result.output, result.output
+    assert len(PROVIDER_CALLS) == len(invocations) + 1, PROVIDER_CALLS
 
     loaded = [
         name

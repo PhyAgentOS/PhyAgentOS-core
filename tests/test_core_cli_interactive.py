@@ -23,7 +23,7 @@ from PhyAgentOS.cli.interaction.agent_output import (
     display_text,
     visible_text,
 )
-from PhyAgentOS.cli.interaction.interactive_session import InteractiveAgent
+from PhyAgentOS.cli.interaction.interactive_session import InteractiveAgent, _Queued
 from PhyAgentOS.cli.interaction.terminal_input import TerminalInput
 
 
@@ -708,3 +708,145 @@ def test_agent_output_strips_external_control_sequences_before_raw_passthrough()
 def test_display_text_keeps_layout_while_removing_control_characters():
     assert display_text("a\nb\tc\x1b[31m") == "a\nb\tc[31m"
     assert display_text("bell\x07") == "bell"
+
+
+async def test_undo_is_local_and_reports_the_callback_message():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+    calls: list[str | None] = []
+
+    async def undo_command(binding):
+        assert session.active is None
+        calls.append(binding.session_id)
+        return "reverted turn-1"
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        undo_command=undo_command,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("/undo", "exit")
+        await asyncio.wait_for(run, 2)
+        assert calls == ["cli:test"]
+        assert not session.requests
+        assert "reverted turn-1" in output.infos
+        assert not output.errors
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_undo_is_refused_while_a_turn_runs_without_calling_the_callback():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+    calls: list[str | None] = []
+
+    async def undo_command(binding):
+        calls.append(binding.session_id)
+        return "reverted"
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        undo_command=undo_command,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("first")
+        await until(lambda: session.active is not None)
+        reader.send("/undo")
+        await until(lambda: len(output.errors) == 1)
+        assert "while a turn is running" in output.errors[0]
+        assert calls == []
+        session.releases[0].set()
+        await until(lambda: len(output.results) == 1)
+        reader.send("exit")
+        await asyncio.wait_for(run, 2)
+        assert calls == []
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_undo_is_refused_while_input_is_queued():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+    calls: list[str | None] = []
+
+    async def undo_command(binding):
+        calls.append(binding.session_id)
+        return "reverted"
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        undo_command=undo_command,
+    )
+    agent._pending.put_nowait(_Queued("queued", agent._binding))
+    await agent._handle_line("/undo")
+    assert calls == []
+    assert len(output.errors) == 1
+    assert "queued input is waiting" in output.errors[0]
+
+
+async def test_undo_without_a_callback_reports_it_is_unavailable(running_agent):
+    session, reader, output, task = running_agent
+    reader.send("/undo", "exit")
+    await asyncio.wait_for(task, 2)
+    assert not session.requests
+    assert len(output.errors) == 1
+    assert "/undo is not available" in output.errors[0]
+
+
+async def test_undo_with_an_argument_is_rejected_without_calling_the_callback(
+    running_agent,
+):
+    session, reader, output, task = running_agent
+    reader.send("/undo now", "exit")
+    await asyncio.wait_for(task, 2)
+    assert not session.requests
+    assert len(output.errors) == 1
+    assert "takes no arguments" in output.errors[0]
+
+
+async def test_undo_callback_failure_is_reported_and_the_reader_keeps_running():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+
+    async def undo_command(binding):
+        raise RuntimeError("store offline")
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        undo_command=undo_command,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("/undo", "exit")
+        await asyncio.wait_for(run, 2)
+        assert not session.requests
+        assert len(output.errors) == 1
+        assert "Undo failed" in output.errors[0]
+        assert "store offline" in output.errors[0]
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_help_lists_undo_with_its_side_effect_warning(running_agent):
+    session, reader, output, task = running_agent
+    reader.send("/help", "exit")
+    await asyncio.wait_for(task, 2)
+    help_text = next(info for info in output.infos if "Local commands" in info)
+    assert "/undo" in help_text
+    assert "not undone" in help_text

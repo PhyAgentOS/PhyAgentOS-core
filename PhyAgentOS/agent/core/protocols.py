@@ -49,14 +49,17 @@ turns for the runtime to hand to the loop driver. There is no other
 conversation state in the core. A store may additionally implement
 ``read_startup_snapshot`` (see :class:`StartupSnapshotStore`) to return the
 recovery report and that projection from one consistent read; the runtime uses
-it when present and otherwise keeps the explicit recover-then-read pair.
+it when present and otherwise keeps the explicit recover-then-read pair. It may
+also implement ``undo_last_turn`` (see :class:`UndoTurnStore`) to withdraw the
+newest terminal turn with one appended marker event; that is optional, and the
+core never requires it.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .events import RecoveryReport, RuntimeEvent
 from .types import (
@@ -74,6 +77,9 @@ from .types import (
     TurnStart,
 )
 
+if TYPE_CHECKING:  # annotation only; the store module imports these protocols
+    from .session import UndoOutcome
+
 __all__ = [
     "AgentHost",
     "AgentRuntime",
@@ -86,6 +92,7 @@ __all__ = [
     "StartupSnapshotStore",
     "StreamingModelAdapter",
     "ToolExecutor",
+    "UndoTurnStore",
 ]
 
 
@@ -129,6 +136,29 @@ class StartupSnapshotStore(Protocol):
         *,
         expected_head: int,
     ) -> tuple[RuntimeEvent, ...] | None: ...
+
+
+@runtime_checkable
+class UndoTurnStore(Protocol):
+    """Optional ``SessionStore`` extension for withdrawing the last request.
+
+    ``undo_last_turn`` withdraws the newest terminal turn that is not already
+    reverted and reports what it actually did, or returns ``None`` when no such
+    turn exists. It is append-only like every other write: the store adds one
+    session-scoped ``turn.reverted`` event naming the turn in
+    ``payload["reverted_turn_id"]`` and never deletes or rewrites rows, so the
+    conversation projection simply falls back to the previous completed turn.
+
+    Like :class:`StartupSnapshotStore` this is optional: a store that only
+    implements ``SessionStore`` keeps working, and callers test for it with
+    ``isinstance`` before using it. An implementation must refuse with
+    ``RuntimeError`` while the session still has an unfinished turn, must not
+    claim that a turn folded into a context checkpoint left the context, and
+    must read ``request_text`` back from the stored request snapshot instead of
+    rebuilding it.
+    """
+
+    async def undo_last_turn(self, session_id: str) -> UndoOutcome | None: ...
 
 
 @runtime_checkable

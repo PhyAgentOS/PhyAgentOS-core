@@ -17,6 +17,7 @@ per-session serialization, which then sees only one accepted turn at a time.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -26,12 +27,17 @@ import typer
 from rich.console import Console
 
 from PhyAgentOS.agent.bootstrap import build_forge_components
+from PhyAgentOS.agent.capabilities.agent_mode_capability import AgentModeCapability
 from PhyAgentOS.agent.capabilities.cron_capability import CronCapability
 from PhyAgentOS.agent.capabilities.forge_capability import ForgeCapability
+from PhyAgentOS.agent.capabilities.general_tools_capability import GeneralToolsCapability
+from PhyAgentOS.agent.capabilities.image_capability import ImageCapability
+from PhyAgentOS.agent.capabilities.mcp_capability import MCPCapability
 from PhyAgentOS.agent.capabilities.skill_access_capability import SkillAccessCapability
+from PhyAgentOS.agent.capabilities.spawn_capability import SpawnCapability
 from PhyAgentOS.agent.composition import AgentAssembly, compose_agent
 from PhyAgentOS.agent.core import SQLiteSessionStore, TurnRequest, TurnStatus
-from PhyAgentOS.agent.core.events import EventType
+from PhyAgentOS.agent.core.events import EventType, reverted_turn_ids
 from PhyAgentOS.agent.core.host import AgentHostCloseError
 from PhyAgentOS.agent.core.prompt import (
     project_forge_tool_results,
@@ -51,6 +57,7 @@ from PhyAgentOS.agent.services.usage import (
     estimate_context,
     estimate_context_from_conversation,
 )
+from PhyAgentOS.bus.events import OutboundMessage
 from PhyAgentOS.config.loader import load_config, set_config_path
 from PhyAgentOS.config.paths import get_cron_dir
 from PhyAgentOS.cron.service import CronService
@@ -469,9 +476,50 @@ class CoreAgentSession:
             return
         await state.assembly.host.cancel(session_id)
 
+    async def undo(self, session_id: str):
+        """Revert this session's last turn at a turn boundary.
+
+        A running or queued turn and a manual compaction both refuse the
+        request: the store must not select a target while another write for
+        this session is in flight. The store owns target selection, the
+        reversion marker, the checkpoint check and the original request text;
+        a store that cannot undo raises instead of reporting a silent success.
+        """
+        async with self._registry_lock:
+            if self._closed:
+                raise RuntimeError("agent session is closed")
+            slot = self._slots.get(session_id)
+            compacting = None if slot is None else slot.compact
+            tail = None if slot is None else slot.tail
+        if compacting is not None and not compacting.done():
+            raise RuntimeError(
+                "context compaction is running for this session; wait for it to "
+                "finish before /undo"
+            )
+        if tail is not None and not tail.done():
+            # ``tail`` is done only once that submit settled, so this also
+            # covers a queued turn that has not started yet.
+            raise RuntimeError(
+                "a turn is running or queued for this session; wait for it to "
+                "settle before /undo"
+            )
+        undo_last_turn = getattr(self._store, "undo_last_turn", None)
+        if not callable(undo_last_turn):
+            raise RuntimeError(
+                "this session store does not support undo; nothing was reverted."
+            )
+        return await undo_last_turn(session_id)
+
     def model_command(self, session_id: str, text: str) -> str | None:
         """Apply one /provider, /model, /effort or /status command."""
         return self.sessions.command(session_id, text)
+
+    def tool_selection(self, session_id: str) -> RuntimeSelection:
+        """Keep auxiliary model calls on the running turn's provider snapshot."""
+        slot = self._slots.get(session_id)
+        if slot is not None and slot.current is not None:
+            return slot.current.selection
+        return self.sessions.get(session_id)
 
     async def compact(self, session_id: str):
         """Manually compact one session at a turn boundary.
@@ -653,10 +701,10 @@ def _compose_for_selection(
     additional_capabilities=(),
     notice=None,
 ) -> AgentAssembly:
-    """Compose Skill, the entry's extra capabilities, then Forge.
+    """Compose Skill, shared tools and entry capabilities, then Forge.
 
     ``additional_capabilities`` is the only extension point another entry
-    (the gateway's cron/message capabilities) needs. They become part of the
+    (including gateway cron/message capabilities) needs. They become part of the
     canonical capability tuple, so ``host.aclose`` closes them exactly once
     with the rest.
     """
@@ -676,7 +724,13 @@ def _compose_for_selection(
         max_tokens=defaults.max_tokens,
         reasoning_effort=selection.effort,
         max_steps=defaults.max_tool_iterations,
-        additional_capabilities=(skill_capability, *tuple(additional_capabilities)),
+        additional_capabilities=(
+            skill_capability,
+            *(
+                item.for_selection(selection) if isinstance(item, AgentModeCapability) else item
+                for item in additional_capabilities
+            ),
+        ),
         forge_capability=forge_capability,
     )
 
@@ -690,6 +744,8 @@ async def open_core_session(
     effort=None,
     output,
     additional_capabilities=(),
+    routes=None,
+    send=None,
     service=None,
     selected=None,
 ):
@@ -697,9 +753,10 @@ async def open_core_session(
 
     ``service``/``selected`` let another entry (the gateway background
     runtime) reuse a provider it already resolved instead of resolving a
-    second time. ``additional_capabilities`` is appended after Skill and
-    before Forge; all of them are canonical and closed exactly once by the
-    host/session shutdown.
+    second time. Shared general, image, MCP and spawn capabilities are built
+    once; ``additional_capabilities`` follows them before Forge. Canonical
+    capabilities are closed by session shutdown. ``routes`` and ``send`` let
+    gateway tools capture the current turn's outbound destination.
 
     Required ``output`` methods are ``event(event)`` and ``error(text)``.
     ``info(text)`` is optional and only receives one-time notices (for
@@ -753,6 +810,69 @@ async def open_core_session(
         forge_capability = ForgeCapability(coordinator, client=client)
         instructions = _instructions(config)
         notice = getattr(output, "info", None)
+        runtimes = SessionRuntimes(service, selected)
+        session = None
+
+        def tool_selection(session_id):
+            if session is None:
+                return runtimes.get(session_id)
+            return session.tool_selection(session_id)
+
+        async def notify_subagent(session_id, turn_id, text):
+            if notice is not None:
+                notice(f"Subagent result [{session_id}, {turn_id}]:\n{text}")
+
+        def subagent_notifier(context):
+            binding = routes.get(context.session_id) if routes is not None else None
+            if binding is None or send is None:
+                return notify_subagent if notice is not None else None
+            # A child may finish after the parent turn or a session switch.
+            # Capture its destination now, while this turn owns the binding.
+            channel, chat_id = binding.channel, binding.chat_id
+            reply_to = binding.reply_to
+            metadata = copy.deepcopy(dict(binding.metadata))
+
+            async def notify(session_id, turn_id, text):
+                await send(OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=text,
+                    reply_to=reply_to,
+                    metadata={**metadata, "parent_session_id": session_id, "parent_turn_id": turn_id},
+                ))
+
+            return notify
+
+        general_capability = GeneralToolsCapability(config)
+        resources.push_async_callback(general_capability.aclose)
+        image_capability = ImageCapability(
+            config, provider_resolver=tool_selection, routes=routes, send=send
+        )
+        resources.push_async_callback(image_capability.aclose)
+        mode_capability = AgentModeCapability(provider_resolver=tool_selection)
+        resources.push_async_callback(mode_capability.aclose)
+        mcp_capability = MCPCapability(
+            config.tools.mcp_servers, workspace=config.workspace_path
+        )
+        resources.push_async_callback(mcp_capability.aclose)
+        await mcp_capability.open()
+        for name, failure in mcp_capability.failures.items():
+            output.error(
+                f"MCP server {name!r} could not initialize ({type(failure).__name__}); "
+                "its tools are unavailable. Check the configured transport."
+            )
+        spawn_capability = SpawnCapability(
+            config,
+            provider_resolver=tool_selection,
+            store=store,
+            notify=notify_subagent if notice is not None else None,
+            notify_factory=subagent_notifier,
+        )
+        resources.push_async_callback(spawn_capability.aclose)
+        tool_capabilities = (
+            general_capability, image_capability, mode_capability,
+            mcp_capability, spawn_capability, *tuple(additional_capabilities),
+        )
 
         def build(selection: RuntimeSelection) -> AgentAssembly:
             return _compose_for_selection(
@@ -764,7 +884,7 @@ async def open_core_session(
                 instructions=instructions,
                 skill_capability=skill_capability,
                 forge_capability=forge_capability,
-                additional_capabilities=additional_capabilities,
+                additional_capabilities=tool_capabilities,
                 notice=notice,
             )
 
@@ -777,7 +897,7 @@ async def open_core_session(
                 selected,
                 build=build,
                 store=display_store,
-                sessions=SessionRuntimes(service, selected),
+                sessions=runtimes,
                 output=output,
                 raw_store=store,
             )
@@ -801,12 +921,16 @@ def _project_request_messages(messages):
 
 def _last_request_tools(events):
     tools = None
+    reverted = reverted_turn_ids(events)
     for event in reversed(events):
-        if event.type is EventType.REQUEST_PREPARED:
-            payload = event.payload
-            raw = payload.get("tools")
-            tools = [dict(item) for item in raw] if isinstance(raw, list) else None
-            break
+        if event.type is not EventType.REQUEST_PREPARED:
+            continue
+        if event.turn_id is not None and event.turn_id in reverted:
+            continue
+        payload = event.payload
+        raw = payload.get("tools")
+        tools = [dict(item) for item in raw] if isinstance(raw, list) else None
+        break
     return tools
 
 
@@ -818,8 +942,11 @@ def _last_request_system(events):
     same input the model actually received; using it keeps compaction and the
     status line on one system/tool overhead.
     """
+    reverted = reverted_turn_ids(events)
     for event in reversed(events):
         if event.type is not EventType.REQUEST_PREPARED:
+            continue
+        if event.turn_id is not None and event.turn_id in reverted:
             continue
         messages = event.payload.get("messages")
         if isinstance(messages, list):
@@ -907,11 +1034,18 @@ class _ContextStatus:
             )
 
     async def refresh(self, session_id: str) -> None:
-        """Refresh the checkpoint-aware projection once, at a turn boundary."""
+        """Refresh the projection and its event source once, at a turn boundary.
+
+        Events are re-read as well: a ``turn.reverted`` marker is written by
+        the store itself, not through the observed ``append`` path, so a cached
+        log would keep showing the withdrawn request. The usage ledger is only
+        seeded by :meth:`load`, never here, so re-reading cannot double-count.
+        """
         raw = getattr(self._session, "raw_store", None)
         if raw is None:
             return
         try:
+            self._events[session_id] = list(await raw.read_session(session_id))
             self._conversation[session_id] = tuple(await raw.read_conversation(session_id))
             reader = getattr(raw, "read_checkpoint", None)
             checkpoint = await reader(session_id) if callable(reader) else None
@@ -1170,7 +1304,7 @@ async def run_core_agent(
 
         output.info(
             "Local commands: /help · /tools · /new · /session · /compact · "
-            "/model · /effort · /status · exit. "
+            "/undo · /model · /effort · /status · exit. "
             "Press Esc twice while a turn runs to stop it locally. "
             "Accepted or running is not task success."
         )
@@ -1400,6 +1534,55 @@ async def run_core_agent(
                 message_text += "\nWarnings: " + "; ".join(result.warnings)
             return message_text
 
+        async def undo_command(binding) -> str | None:
+            target = binding.session_id or binding.fallback or active_session_id
+            if not target:
+                return "No active session to undo."
+            outcome = await session.undo(target)
+            # Keep the status-bar estimate on the projection the store now
+            # returns, so a reverted request is not counted twice.
+            await context.refresh(target)
+            refresh_label(target)
+            if outcome is None:
+                return "No earlier request to undo in this session."
+            text = outcome.request_text
+            if text is not None and terminal.prefill(text):
+                placement = (
+                    "Its text is back in the input line; edit it or press Enter "
+                    "to send it again."
+                )
+            elif text is not None:
+                placement = (
+                    "No input line is available to refill; the request text is:\n"
+                    f"{text}"
+                )
+            else:
+                placement = (
+                    "The original request text is not available, so nothing was "
+                    "refilled."
+                )
+            warning = (
+                "Tool side effects (robot actions, file changes) are not undone."
+            )
+            if outcome.block_reason == "checkpoint":
+                return (
+                    f"Request {outcome.turn_id} is covered by a compaction summary "
+                    "and cannot be removed from the context used by later turns. "
+                    f"{placement} {warning}"
+                )
+            if outcome.context_reverted:
+                return (
+                    f"Request {outcome.turn_id} was removed from the context used "
+                    f"by later turns. {placement} {warning}"
+                )
+            if outcome.status.rsplit(".", 1)[-1] in {"failed", "interrupted"}:
+                return (
+                    f"Request {outcome.turn_id} never entered the context "
+                    f"({outcome.status}), so only the input was refilled. "
+                    f"{placement} {warning}"
+                )
+            return f"Request {outcome.turn_id} was withdrawn. {placement} {warning}"
+
         async def on_turn_settled(target: str) -> None:
             await context.refresh(target)
             refresh_label(target)
@@ -1414,6 +1597,7 @@ async def run_core_agent(
                 model_command=model_command,
                 session_command=session_command,
                 compact_command=compact_command,
+                undo_command=undo_command,
                 name_session=name_session,
                 on_active_session=on_active_session,
                 on_turn_settled=on_turn_settled,

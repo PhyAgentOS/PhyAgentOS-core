@@ -427,6 +427,7 @@ async def run_core_gateway(
         selected=selected,
         capabilities=(cron_capability, message_capability),
         routes=routes,
+        send=send,
         output=_ConsoleOutput(console_out),
     ) as runtime:
         hb_cfg = config.gateway.heartbeat

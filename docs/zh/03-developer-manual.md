@@ -22,7 +22,8 @@
 |:-----|:-----|
 | `agent/core/` | 七个 Core 组件（入口壳、回合、循环驱动、模型适配、提示组装、工具执行、SQLite 事件存储）；契约在 `types.py`、`events.py`、`protocols.py` |
 | `agent/composition.py` | `compose_agent`：用注入的协作对象装配 Core，并固定能力顺序 |
-| `agent/capabilities/` | Forge 工具的原生定义与操作、到 Core `ToolOutcome` 的映射，以及 `activate_skill` |
+| `agent/capabilities/` | Forge、Skill、通用工具、图片、MCP、子代理、cron 与 message 的 Core 能力适配 |
+| `tooling/` | 不依赖 Agent 运行时的共用工具实现；旧工具路径保留兼容导出 |
 | `agent/services/skill_documents.py`、`agent/services/turn_activation.py` | Skill 文档发现与按回合的激活身份 |
 | `agent/bootstrap.py`、`agent/services/forge_verifier.py` | 共享的 Forge 构造工厂与语义验证器；`agent_legacy/session_verifier.py` 只保留别名 |
 | `agent/services/session_catalog.py` | `core.db` 中的会话 id、标题、按天序号与按会话的 provider/model/effort 选择 |
@@ -206,7 +207,7 @@ legacy 路径的生命周期留在 `legacy/legacy_agent.py`：建 `AgentLoop`，
 4. 在这个 coordinator 上做一次 Forge 未知 Action/Session 恢复，且在任何一个回合被提交之前完成。`reconcile_nonterminal()` 只发 Gateway GET 查询；不重发 Action 或 Session 的 POST，也不把仍未确认的 unknown 改成终态。Core 没有交互 supervisor，因此这里不会请求机器人停止。恢复本身失败时会报告一次并继续打开会话；未解决的 unknown 仍然阻塞新任务。
 5. 创建 `SkillDocumentLoader` 与 `TurnSkillActivationManager`，把激活管理器注册给 coordinator，使 `forge_task_create` 能校验 `activation_id`。
 6. 打开会话存储 `<workspace>/sessions/core.db`。
-7. 用 `compose_agent` 建种子装配；`SkillAccessCapability` 在前，`ForgeCapability` 在后。
+7. 建立共用工具能力，在装配前完成 MCP 发现，再用 `compose_agent` 建种子装配；Skill 访问在前，通用工具、图片、条件模式管理、MCP、spawn 与入口能力居中，Forge 在后。
 8. 跑单条消息或交互循环。每回合在真正开始时读取该 session 的选择并新建面向模型的装配；这份装配只服务一个回合，回合结束立即 `runtime.stop()`（不关 host），不再等下次 submit。store、Forge coordinator/client 与激活管理器保持共享。同一 session 的提交按登记顺序串行，不同 session 可并发；`cancel` 只取消当前装配，排队中的回合不会继承这次取消。
 9. 只关闭一次：先拒绝新提交并让排队中的提交在开回合前退出，再停仍可能持有回合的 runtime，等已进入本 session 的提交返回，对每个已接受的 session 通知各能力，关闭规范能力一次，最后关 store。Forge client 与验证器由资源栈在会话之后关闭。
 
@@ -283,6 +284,22 @@ step 级 `model.response.delta` 事件持久化；`reasoning_content` 从不流�
 重发。预算错误在第一个事件之前抛出，从而记为一次干净的失败尝试。失败或中断的 attempt 只带
 provider 确实发来的 usage 键。
 
+### 撤回
+
+`/undo` 是 CLI 本地命令，不会发给模型。`CoreAgentSession.undo` 在回合运行或排队、压缩进行中时
+拒绝，然后调用可选存储能力 `UndoTurnStore.undo_last_turn`（见
+`PhyAgentOS/agent/core/protocols.py`）。store 选出最新一个未被撤回的已结束回合，追加一条
+session 作用域的 `turn.reverted` 事件，`payload["reverted_turn_id"]` 记录目标回合（标记本身不带
+`turn_id`，因此不进 `read_turn`，也不参与恢复），不删除或改写任何行。目标选择、校验与插入在同
+一个 session 锁和同一个 `BEGIN IMMEDIATE` 事务里完成。`_conversation_from_events` 跳过被撤回的
+回合，投影因此回落到更早 completed 回合的请求快照。已被 checkpoint 覆盖的回合返回
+`block_reason="checkpoint"` 且不写标记；失败或中断的回合以 `context_reverted=False` 记录，使下一次
+undo 能继续往上。`UndoOutcome.request_text` 从该回合最新的 `request.prepared` 快照读回
+（`input.accepted` 只存字符数），`TerminalInput.prefill` 把它作为下一次 prompt 的默认文本。状态栏
+遵循同一规则：`events.py` 的 `reverted_turn_ids` 被投影、`estimate_context` 与
+`_last_request_tools` / `_last_request_system` 共用；`_ContextStatus.refresh` 会重读已存事件，
+因此能看到 store 自己写入的撤回标记（用量 ledger 仍只由 `load` 播种）。
+
 ### 手动压缩
 
 手动压缩把 checkpoint 追加到会话独立的 checkpoint 投影表，不改写 `session_events`，原始事件
@@ -327,10 +344,24 @@ service 的 cycle lock 串行，两个周期不会重叠。同一 session 的回
 
 ### Core 路径未覆盖的部分
 
-通用工具、`/correct`、memory 与 evolution、managed interaction Sessions 以及 fleet 模式都还没
-迁移。Forge interaction supervisor 没有接进 Core CLI，因此不能把交互迁移说成已完成。旧 JSONL
+`/correct`、长期 memory、experience/evolution、managed interaction Sessions 以及 fleet 模式
+作为独立后续任务保留。Forge interaction supervisor 没有接进 Core CLI，因此不能把交互迁移说成已完成。旧 JSONL
 会话不导入；Core 使用独立的 SQLite 文件。Provider 错误只给简短的脱敏诊断：保留异常类型和
 HTTP 状态，不回显响应体与凭证。
+
+### 通用工具与旧入口
+
+Core CLI 与 gateway 共用 `open_core_session()` 注册文件、Shell、网页搜索/抓取、场景图、
+图片、MCP 和 `spawn` 能力。共用实现放在 `tooling/`，不得 import 新旧 Agent 运行时；
+`agent_legacy/tools/` 的对应模块只保留兼容导出。旧入口显式保留用于回归对照，不要求本轮删除。
+`agent_mode` 仅面向支持原有模式管理的 Provider；普通单 Provider 不提供虚假的模式管理工具。
+图片模型与子代理在调用时读取本回合冻结的 provider/model 选择，路由使用显式会话身份。
+MCP 在装配前发现工具并持有连接，进程关闭时释放；工具错误不能记录为成功。
+单个 MCP 服务初始化失败会显示不含凭证的诊断，其余工具仍可用；超时或派发后断线返回
+`unknown`，不自动重放。通用工具、图片分析与 MCP 大结果保留完整文件并向模型返回限长文本及路径。
+`spawn` 使用独立子会话与现有 Core 组件，不运行旧的模型循环；子代理不递归派生子代理，
+不注册 Forge 物理执行工具。子代理完成通知使用创建时的父会话与回复目标；完成摘要仅在所属
+父会话后续请求中提供，通知失败不改变子代理实际状态。关闭会取消等待中的通知并保留结果。
 
 ### 测试
 

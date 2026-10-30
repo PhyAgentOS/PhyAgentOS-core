@@ -47,6 +47,14 @@ fabricates a finished turn or a success, never marks work for retry, and
 never calls a model or tool handler. ``unfinished_turns`` is left for the
 runtime to close.
 
+Undo is append-only. ``undo_last_turn`` marks the newest terminal turn that
+is not already reverted with one session-scoped ``turn.reverted`` event; no row
+is deleted or rewritten, and the conversation projection simply skips reverted
+turns, so it falls back to the previous completed turn. Undo is refused while
+the session has an unfinished turn, and a turn already covered by a context
+checkpoint cannot be removed from the summary, so it is reported as blocked
+instead of pretending the context changed.
+
 Async surface, synchronous core: every public coroutine runs the SQLite work
 on a worker thread via :func:`asyncio.to_thread`. A per-session reentrant lock
 serializes writers of one session, and a connection lock serializes use of the
@@ -67,7 +75,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .events import CallKind, EventType, RecoveryReport, RuntimeEvent, UnfinishedCall
+from .events import (
+    CallKind,
+    EventType,
+    RecoveryReport,
+    RuntimeEvent,
+    UnfinishedCall,
+    reverted_turn_ids,
+)
 from .protocols import SessionSnapshot
 from .types import require_non_empty
 
@@ -79,6 +94,7 @@ __all__ = [
     "RecoveryConflictError",
     "SessionStoreClosedError",
     "SQLiteSessionStore",
+    "UndoOutcome",
 ]
 
 # The summary is stored as an assistant message because leading system messages
@@ -330,6 +346,48 @@ class CompactionAttempt:
                 raise ValueError(f"{name} must be timezone-aware")
 
 
+@dataclass(frozen=True, slots=True)
+class UndoOutcome:
+    """What one :meth:`SQLiteSessionStore.undo_last_turn` call did.
+
+    ``turn_id`` and ``status`` are read from the stored log, never inferred
+    from the request: ``status`` is the turn's terminal event value, for
+    example ``"turn.completed"``.
+
+    ``request_text`` is the last user-content string of that turn's newest
+    ``request.prepared`` snapshot, or ``None`` when the log has no such text.
+    It is read back, never reconstructed from ``input.accepted`` (that event
+    stores only a character count).
+
+    ``context_reverted`` is true only when the stored conversation no longer
+    shows the turn. ``block_reason`` is ``None`` for a plain undo and
+    ``"checkpoint"`` when a context checkpoint already folded the turn into a
+    summary: the marker is not written there, because skipping the turn would
+    not remove it from the projected context. A failed or interrupted turn is
+    marked as reverted with ``context_reverted=False``: it never entered the
+    context, but the request is still withdrawn so the next undo moves further
+    back.
+    """
+
+    session_id: str
+    turn_id: str
+    status: str
+    request_text: str | None = None
+    context_reverted: bool = False
+    block_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        require_non_empty("session_id", self.session_id)
+        require_non_empty("turn_id", self.turn_id)
+        require_non_empty("status", self.status)
+        if self.request_text is not None and not isinstance(self.request_text, str):
+            raise TypeError("request_text must be a string or None")
+        if not isinstance(self.context_reverted, bool):
+            raise TypeError("context_reverted must be a bool")
+        if self.block_reason is not None and not isinstance(self.block_reason, str):
+            raise TypeError("block_reason must be a string or None")
+
+
 def _plain(value: Any) -> Any:
     """Convert read-only mappings into plain containers for JSON encoding.
 
@@ -499,13 +557,16 @@ def _conversation_from_events(
     """Project the newest completed turn into a message history.
 
     Only a ``TURN_COMPLETED`` event whose ``turn.started`` is present counts;
-    failed, interrupted and unfinished turns contribute nothing. The newest
-    such turn is the last one in ``sequence`` order. Its history is the
-    ``messages`` snapshot of that turn's last ``request.prepared``, copied,
-    with leading system messages dropped, plus the ``turn.completed`` reply as
-    an assistant message when a string reply exists. Nothing is invented: a
-    completed turn without a request snapshot is a broken log and raises.
+    failed, interrupted and unfinished turns contribute nothing. A turn named
+    by a ``turn.reverted`` marker is skipped as well, so undo falls back to the
+    previous completed turn without deleting anything. The newest such turn is
+    the last one in ``sequence`` order. Its history is the ``messages``
+    snapshot of that turn's last ``request.prepared``, copied, with leading
+    system messages dropped, plus the ``turn.completed`` reply as an assistant
+    message when a string reply exists. Nothing is invented: a completed turn
+    without a request snapshot is a broken log and raises.
     """
+    reverted = reverted_turn_ids(events)
     started: set[str] = set()
     completed: RuntimeEvent | None = None
     for event in events:
@@ -514,7 +575,11 @@ def _conversation_from_events(
             continue
         if event.type is EventType.TURN_STARTED:
             started.add(turn_id)
-        elif event.type is EventType.TURN_COMPLETED and turn_id in started:
+        elif (
+            event.type is EventType.TURN_COMPLETED
+            and turn_id in started
+            and turn_id not in reverted
+        ):
             completed = event
     if completed is None:
         return ()
@@ -547,6 +612,62 @@ def _conversation_from_events(
     if isinstance(reply, str):
         messages.append({"role": "assistant", "content": reply})
     return tuple(messages)
+
+
+def _last_user_text(events: Sequence[RuntimeEvent], turn_id: str) -> str | None:
+    """Return the last user-content string of a turn's newest request snapshot.
+
+    Only stored text counts: ``input.accepted`` keeps a character count, not
+    the request, so the snapshot is the single source. ``None`` means the log
+    has no snapshot or no user text, and the caller must not fill it in.
+    """
+    snapshot: RuntimeEvent | None = None
+    for event in events:
+        if event.type is EventType.REQUEST_PREPARED and event.turn_id == turn_id:
+            snapshot = event
+    if snapshot is None:
+        return None
+    messages = snapshot.payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, Mapping) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        return content if isinstance(content, str) else None
+    return None
+
+
+def _undo_target(events: Sequence[RuntimeEvent]) -> tuple[str, EventType, int] | None:
+    """Pick the newest terminal turn that is not already reverted.
+
+    ``TURN_STARTED`` is required as well: the caller compares the turn's start
+    sequence with a checkpoint's coverage, and a terminal event without a start
+    is a broken log, not a turn to undo. The returned sequence is that of
+    ``turn.started``.
+    """
+    reverted = reverted_turn_ids(events)
+    started: dict[str, int] = {}
+    terminal: dict[str, tuple[EventType, int]] = {}
+    for event in events:
+        turn_id = event.turn_id
+        if turn_id is None:
+            continue
+        sequence = event.sequence if event.sequence is not None else 0
+        if event.type is EventType.TURN_STARTED:
+            started.setdefault(turn_id, sequence)
+        elif event.type in _TERMINAL_TURN_EVENTS:
+            terminal.setdefault(turn_id, (event.type, sequence))
+
+    target: tuple[str, EventType, int] | None = None
+    newest = -1
+    for turn_id, (event_type, sequence) in terminal.items():
+        if turn_id in reverted or turn_id not in started:
+            continue
+        if sequence > newest:
+            newest = sequence
+            target = (turn_id, event_type, started[turn_id])
+    return target
 
 
 def _checkpoint_from_row(row: tuple[Any, ...]) -> ContextCheckpoint:
@@ -823,6 +944,35 @@ class SQLiteSessionStore:
         require_non_empty("session_id", session_id)
         self._raise_if_closed()
         return await asyncio.to_thread(self._conversation_sync, session_id)
+
+    async def undo_last_turn(self, session_id: str) -> UndoOutcome | None:
+        """Withdraw the newest terminal turn that is not already reverted.
+
+        This appends one session-scoped ``turn.reverted`` event and never
+        deletes or rewrites history; the conversation projection skips the
+        named turn, so the next turn starts from the previous completed turn's
+        snapshot. The turn is chosen from the stored log, not from the caller,
+        and the read, the checks, and the write run in one session lock and one
+        write transaction so two undos cannot target the same turn.
+
+        Returns ``None`` when no terminal turn is left to revert. Raises
+        ``RuntimeError`` while the session still has an unfinished turn: the
+        running turn is not the last request yet, and marking anything now
+        would race the turn that is writing it.
+
+        A failed or interrupted turn is marked as withdrawn with
+        ``context_reverted=False`` because it never entered the context. A
+        completed turn already folded into a context checkpoint cannot be
+        removed from the summary, so it is reported with
+        ``block_reason="checkpoint"`` and no marker is written; skipping it
+        would leave the context unchanged and the marker would lie.
+
+        The returned ``request_text`` is read back from the turn's newest
+        ``request.prepared`` snapshot.
+        """
+        require_non_empty("session_id", session_id)
+        self._raise_if_closed()
+        return await asyncio.to_thread(self._undo_last_turn_sync, session_id)
 
     async def read_startup_snapshot(self, session_id: str) -> SessionSnapshot:
         """Return recovery and the next conversation from one consistent read.
@@ -1207,6 +1357,82 @@ class SQLiteSessionStore:
             if projected:
                 return projected
         return _checkpoint_conversation(checkpoint)
+
+    def _undo_last_turn_sync(self, session_id: str) -> UndoOutcome | None:
+        """Read, validate, and mark one turn inside one write transaction.
+
+        The write transaction is opened before the read, so a concurrent
+        ``append`` from another process waits and the turn chosen here cannot
+        become a different turn before the marker is durable.
+        """
+        self._raise_if_closed()
+        with self._session_lock(session_id):
+            with self._conn_lock:
+                self._raise_if_closed()
+                conn = self._conn
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    events = self._select_sync(session_id, None, 0)
+                    unfinished_turns, _open_calls = _unfinished_state(session_id, events)
+                    if unfinished_turns:
+                        raise RuntimeError(
+                            f"session {session_id!r} still has unfinished turn(s) "
+                            f"{', '.join(unfinished_turns)}; undo only between turns"
+                        )
+                    target = _undo_target(events)
+                    if target is None:
+                        conn.execute("ROLLBACK")
+                        return None
+                    turn_id, status, start_sequence = target
+                    request_text = _last_user_text(events, turn_id)
+                    checkpoint = self._latest_checkpoint_sync(session_id)
+                    if (
+                        status is EventType.TURN_COMPLETED
+                        and checkpoint is not None
+                        and checkpoint.covers_sequence >= start_sequence
+                    ):
+                        # The summary already contains this turn; skipping it
+                        # would change nothing, so nothing is written.
+                        conn.execute("ROLLBACK")
+                        return UndoOutcome(
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            status=status.value,
+                            request_text=request_text,
+                            context_reverted=False,
+                            block_reason="checkpoint",
+                        )
+                    marker = RuntimeEvent(
+                        type=EventType.TURN_REVERTED,
+                        session_id=session_id,
+                        payload={"reverted_turn_id": turn_id},
+                    )
+                    payload_json = _encode_payload(marker.payload)
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM session_events"
+                        " WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    _insert_event_row(
+                        conn,
+                        marker,
+                        int(row[0]) + 1,
+                        payload_json,
+                        marker.recorded_at.astimezone(timezone.utc).isoformat(),
+                    )
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+                conn.execute("COMMIT")
+        return UndoOutcome(
+            session_id=session_id,
+            turn_id=turn_id,
+            status=status.value,
+            request_text=request_text,
+            context_reverted=status is EventType.TURN_COMPLETED,
+            block_reason=None,
+        )
 
     def _head_sequence_sync(self, session_id: str) -> int:
         with self._conn_lock:

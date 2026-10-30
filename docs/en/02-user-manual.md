@@ -474,6 +474,19 @@ from the newest checkpoint; a compacted session does not fall back to the full h
 status keeps its post-compaction window. If recovery repeatedly loses to an active writer, the turn
 fails closed instead of continuing with incomplete or stale history.
 
+### Undoing the last request
+
+`/undo` recalls the newest settled request of the current session and puts its text back into the
+input line so it can be edited and resent; with redirected input there is no input line, so the text
+is printed instead. It appends one session-scoped `turn.reverted` event and deletes nothing: later
+turns no longer see that request, and the withdrawal survives a restart. Repeating `/undo` moves
+further back. It only runs between turns and is refused while a turn or a command is running or
+input is still queued. A failed or interrupted request never entered the context, so it is only
+refilled; a request already folded into a `/compact` summary cannot be removed from that summary
+and is only refilled as well. The status-bar estimate and the offered-tool snapshot skip reverted
+turns too, so both drop back to the earlier request. Tool side effects (robot actions, file edits)
+are never undone.
+
 ### Gateway background entries
 
 `paos gateway` uses the same Core runtime for cron, heartbeat and chat channels by default.
@@ -495,6 +508,13 @@ rescheduled is preserved. Keep one scheduler owner (one `paos gateway`); this is
 exactly-once guarantee across multiple gateways. Channels that are not configured are not started
 automatically. Media bytes are not forwarded to the model in this version: the reference is kept
 in the turn text and the model is told the bytes were not forwarded.
+
+Core includes filesystem read/write/edit, directory listing, shell, web search/fetch, image,
+scene-graph queries, MCP and `spawn` tools. Existing tool configuration applies; MCP only connects
+to explicitly configured servers. Gateway message/image delivery uses the current turn's destination;
+a CLI without a delivery channel does not claim a message was sent. Child results return to their
+parent session/channel; closing the owning process stops its children. The legacy entry remains
+available for regression comparisons.
 
 The Core runtime is still experimental: `/correct` is unavailable. On a
 terminal, `/model` and `/effort` without an argument open the same inline selector as the legacy

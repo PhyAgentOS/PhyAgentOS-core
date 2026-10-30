@@ -2,9 +2,9 @@
 
 The reader stays alive during turns. Ordinary input, model commands and
 session switches share one FIFO; local commands (stop, help, tools, correct,
-unknown slash commands) bypass it so a running turn never delays them. Every
-queued ordinary message carries the session binding that was current when it
-was read, so a switch cannot move an already queued message to another
+undo, unknown slash commands) bypass it so a running turn never delays them.
+Every queued ordinary message carries the session binding that was current
+when it was read, so a switch cannot move an already queued message to another
 session.
 
 Session switches take effect at their FIFO position, which is a turn boundary.
@@ -32,7 +32,7 @@ _MODEL_COMMANDS = frozenset({"/provider", "/model", "/effort", "/status"})
 _SESSION_COMMANDS = frozenset({"/new", "/session"})
 _COMPACT_COMMANDS = frozenset({"/compact"})
 _LOCAL_COMMANDS = (
-    frozenset({"/help", "/stop", "/tools", "/correct"})
+    frozenset({"/help", "/stop", "/tools", "/correct", "/undo"})
     | _MODEL_COMMANDS
     | _SESSION_COMMANDS
     | _COMPACT_COMMANDS
@@ -52,6 +52,8 @@ Local commands (handled by the CLI; none of them is sent to the model):
   /effort ...      Change reasoning effort (menu on a terminal; text otherwise).
   /status          Show the current session, model and effort.
   /correct         Not supported; no turn is submitted.
+  /undo            Revert the last request; refill the input line with it.
+                   Tool side effects (robot actions, file edits) are not undone.
   exit | quit      Leave after earlier queued input.
 
 To stop a running turn, press Esc twice within 2 seconds. The first Esc shows a
@@ -118,7 +120,8 @@ class InteractiveAgent:
     ``KeyboardInterrupt`` to exit immediately. Exit commands instead wait for
     earlier queued input. Model and session commands are only called between
     turns; local commands are answered by the reader at once, in arrival
-    order, so a slow turn never holds them behind ordinary text.
+    order, so a slow turn never holds them behind ordinary text. ``/undo`` is
+    local but refused while a turn, a command or queued input is in flight.
     """
 
     def __init__(
@@ -131,6 +134,7 @@ class InteractiveAgent:
         model_command: Callable[[str], Awaitable[str | None]] | None = None,
         session_command: Callable[[str, _Binding], Awaitable[str | None]] | None = None,
         compact_command: Callable[[str, _Binding], Awaitable[str | None]] | None = None,
+        undo_command: Callable[[_Binding], Awaitable[str | None]] | None = None,
         name_session: Callable[[str, str], Awaitable[None]] | None = None,
         on_active_session: Callable[[str | None], None] | None = None,
         on_turn_settled: Callable[[str], Awaitable[None]] | None = None,
@@ -143,6 +147,7 @@ class InteractiveAgent:
         self._model_command = model_command
         self._session_command = session_command
         self._compact_command = compact_command
+        self._undo_command = undo_command
         self._name_session = name_session
         self._on_active_session = on_active_session
         self._on_turn_settled = on_turn_settled
@@ -225,6 +230,8 @@ class InteractiveAgent:
             self._output.error(
                 "/correct is not supported by this CLI; no model turn was submitted."
             )
+        elif command == "/undo":
+            await self._undo(argument)
         elif command in _EXIT_COMMANDS:
             self._pending.put_nowait(_Queued(text, self._binding))
         elif command in _SESSION_COMMANDS:
@@ -253,6 +260,48 @@ class InteractiveAgent:
             waiting = max(0, self._pending.qsize() - 1)
             suffix = f"; {waiting} more waiting." if waiting else "."
             self._output.info(f"Queued message {self._sequence}{suffix}")
+
+    async def _undo(self, argument: str) -> None:
+        """Revert the last request locally, at a turn boundary only.
+
+        The command is answered by the reader, so it still needs the boundary
+        guarantee the queued commands get: a running turn, a running command
+        task and queued input all hold context the store cannot revert
+        safely. ``/undo`` never waits for them; it reports why it did nothing.
+        """
+        if argument:
+            self._output.error("/undo takes no arguments; nothing was reverted.")
+            return
+        if self._undo_command is None:
+            self._output.error("/undo is not available in this session.")
+            return
+        if self._active is not None and not self._active.done():
+            self._output.error(
+                "/undo is not available while a turn is running; "
+                "wait for it to finish."
+            )
+            return
+        if self._command is not None and not self._command.done():
+            self._output.error(
+                "/undo is not available while a command is running; "
+                "wait for it to finish."
+            )
+            return
+        if not self._pending.empty():
+            self._output.error(
+                "/undo is not available while queued input is waiting; "
+                "wait for it to be processed."
+            )
+            return
+        try:
+            message = await self._undo_command(self._binding)
+        except Exception as exc:
+            # The reader task must keep running: a failed undo is reported and
+            # the next line is still read.
+            self._output.error(f"Undo failed: {exc}")
+            return
+        if message:
+            self._output.info(message)
 
     async def _abort(self) -> None:
         self._aborting = True

@@ -96,6 +96,7 @@ async def _open_gateway(tmp_path, monkeypatch, provider, *, config=None, heartbe
             MessageCapability(routes, send),
         ),
         routes=routes,
+        send=send,
     )
     return config, bus, telegram, channels, cron, heartbeat, runtime_cm, coordinator
 
@@ -116,6 +117,44 @@ def _gateway(runtime, bus, channels, cron, heartbeat, workspace=None) -> CoreGat
         heartbeat=heartbeat,
         workspace=workspace,
     )
+
+
+async def test_image_tool_delivers_path_and_thread_through_gateway_bus(
+    tmp_path, monkeypatch,
+) -> None:
+    async def responder(index, messages, tools):
+        if index == 1:
+            return tool_call(
+                "image-call", "image",
+                {"mode": "display", "image_path": "frame.png", "text": "camera"},
+            )
+        assert "Image displayed successfully" in messages[-1]["content"]
+        return response("image ready")
+
+    opened = await _open_gateway(tmp_path, monkeypatch, ScriptedProvider(responder))
+    config, bus, telegram, channels, cron, heartbeat, runtime_cm, _ = opened
+    frame = config.workspace_path / "frame.png"
+    frame.write_bytes(b"local-image-payload")
+    async with runtime_cm as runtime:
+        gateway = _gateway(runtime, bus, channels, cron, heartbeat)
+        serve = asyncio.create_task(gateway.serve())
+        try:
+            await wait_for(lambda: channels.started)
+            await publish_inbound(
+                bus, "telegram", "42", "show image",
+                metadata={"message_id": 5, "message_thread_id": 7, "reply_to": "5"},
+            )
+            await wait_for(lambda: len(telegram.sent) == 2)
+            image, final = telegram.sent
+            assert image.media == [str(frame)]
+            assert image.reply_to == "5"
+            assert image.metadata["message_thread_id"] == 7
+            assert final.content == "image ready"
+            assert final.metadata["_turn_final"] is True
+        finally:
+            await gateway.aclose()
+            serve.cancel()
+            await asyncio.gather(serve, return_exceptions=True)
 
 
 async def test_thread_history_is_kept_and_other_sessions_are_isolated(

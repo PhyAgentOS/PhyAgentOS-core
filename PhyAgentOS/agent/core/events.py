@@ -20,7 +20,8 @@ twice:
   events, and ``session.snapshot.created``;
 * ``LoopDriver``: ``request.prepared``, ``model.attempt.*``, and
   ``context.compacted`` (it owns the message history being compacted);
-* ``ToolExecutor``: ``tool.intent``, ``tool.dispatched``, ``tool.settled``.
+* ``ToolExecutor``: ``tool.intent``, ``tool.dispatched``, ``tool.settled``;
+* the session store: ``turn.reverted``.
 
 One event must not claim more than was observed. In particular:
 
@@ -35,7 +36,7 @@ One event must not claim more than was observed. In particular:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -51,6 +52,7 @@ __all__ = [
     "RecoveryReport",
     "RuntimeEvent",
     "UnfinishedCall",
+    "reverted_turn_ids",
 ]
 
 
@@ -61,6 +63,12 @@ class EventType(str, Enum):
     tool events belong to a turn; request/model/tool events also belong to one
     step. ``model.attempt.interrupted`` is the recovery-only terminal state
     for an attempt that was started but never finished.
+
+    ``turn.reverted`` is session-scoped and carries no ``turn_id`` of its own:
+    the reverted turn is named in ``payload["reverted_turn_id"]``. It is not a
+    lifecycle event of that turn, so a terminal ``turn.*`` event still stands
+    on its own and recovery never reads the marker as an open or closed turn.
+    It only changes what the conversation projection selects.
     """
 
     INPUT_ACCEPTED = "input.accepted"
@@ -68,6 +76,7 @@ class EventType(str, Enum):
     TURN_COMPLETED = "turn.completed"
     TURN_FAILED = "turn.failed"
     TURN_INTERRUPTED = "turn.interrupted"
+    TURN_REVERTED = "turn.reverted"
     REQUEST_PREPARED = "request.prepared"
     MODEL_ATTEMPT_STARTED = "model.attempt.started"
     MODEL_RESPONSE_DELTA = "model.response.delta"
@@ -81,7 +90,16 @@ class EventType(str, Enum):
     SESSION_SNAPSHOT_CREATED = "session.snapshot.created"
 
 
-_SESSION_SCOPE = frozenset({EventType.INPUT_ACCEPTED, EventType.SESSION_SNAPSHOT_CREATED})
+_SESSION_SCOPE = frozenset(
+    {
+        EventType.INPUT_ACCEPTED,
+        EventType.SESSION_SNAPSHOT_CREATED,
+        # Session-scoped on purpose: the marker names the reverted turn in its
+        # payload instead of claiming that turn's identity, so it stays out of
+        # ``read_turn`` and out of the unfinished-work fold.
+        EventType.TURN_REVERTED,
+    }
+)
 _TURN_SCOPE = frozenset(
     {
         EventType.TURN_STARTED,
@@ -117,6 +135,24 @@ _SUCCESS_EVENTS = frozenset({EventType.TURN_COMPLETED, EventType.MODEL_ATTEMPT_C
 def _payload_text(payload: Mapping[str, Any], key: str) -> str | None:
     value = payload.get(key)
     return value if isinstance(value, str) and value.strip() else None
+
+
+def reverted_turn_ids(events: Sequence[RuntimeEvent]) -> frozenset[str]:
+    """Turn ids named by stored ``turn.reverted`` markers.
+
+    The marker is session-scoped, so a turn id only comes from its payload. An
+    unreadable payload marks nothing: a broken marker must not silently hide a
+    turn. Every reader that replays the log for display or projection uses this
+    one definition, so a reverted turn disappears from all of them at once.
+    """
+    reverted: set[str] = set()
+    for event in events:
+        if event.type is not EventType.TURN_REVERTED:
+            continue
+        turn_id = event.payload.get("reverted_turn_id")
+        if isinstance(turn_id, str) and turn_id.strip():
+            reverted.add(turn_id)
+    return frozenset(reverted)
 
 
 @dataclass(frozen=True, slots=True)

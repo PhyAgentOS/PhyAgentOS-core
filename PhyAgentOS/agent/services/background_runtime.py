@@ -460,9 +460,8 @@ async def _open_core_session_with_entry_state(config, **kwargs):
     """Open the CLI Core session with the gateway's extra capabilities.
 
     ``open_core_session`` owns the store, Forge recovery, per-turn assembly and
-    shutdown. The gateway only adds ``service``/``selected`` (the provider it
-    already resolved) and ``additional_capabilities`` (cron and message), which
-    are registered after Skill and before Forge in every turn.
+    shutdown. The gateway adds its resolved provider, cron/message capabilities,
+    and frozen routes/outbound publisher for image and subagent delivery.
     """
     from PhyAgentOS.cli.command_groups import agent_commands
 
@@ -477,6 +476,7 @@ async def open_background_core(
     selected: RuntimeSelection,
     capabilities: Sequence[Capability] = (),
     routes: TurnRoutes | None = None,
+    send=None,
     output=None,
 ):
     """Open one shared Core session for the gateway's background sources.
@@ -492,6 +492,8 @@ async def open_background_core(
         additional_capabilities=tuple(capabilities),
         service=service,
         selected=selected,
+        routes=routes,
+        send=send,
     )
     async with session as core:
         defaults = config.agents.defaults

@@ -199,6 +199,20 @@ class TerminalInput:
         finally:
             self._reading = False
 
+    def prefill(self, text: str) -> bool:
+        """Stage text as the next prompt's default input.
+
+        The running prompt already took its default, so this only takes effect
+        when it is called after a prompt returned and before the next
+        :meth:`read`; it never rewrites the prompt that is currently reading.
+        Returns False when there is no prompt session (redirected input), where
+        nothing can be refilled.
+        """
+        if self.prompt is None:
+            return False
+        self._draft = text
+        return True
+
     async def _read_plain(self) -> str:
         def read_line() -> str:
             sys.stdout.write("You: ")
