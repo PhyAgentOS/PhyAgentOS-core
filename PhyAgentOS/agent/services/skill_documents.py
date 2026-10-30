@@ -42,6 +42,7 @@ class SkillDocumentLoader:
         # Reading the same SKILL.md 2-4 times per prompt build is the dominant
         # cost. Cache by (mtime_ns, size) so edits are still visible.
         self._content_cache: dict[str, tuple[tuple[int, int], str]] = {}
+        self._summary_cache: dict[tuple, str] = {}
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
@@ -181,6 +182,12 @@ class SkillDocumentLoader:
         This is used for progressive loading - the agent can read the full
         skill content using read_file when needed.
 
+        The rendered string is cached against the directory/file mtimes and the
+        evaluated availability/missing-requirement tuples, so a changed Skill
+        file or a changed environment/runtime answer invalidates it. The
+        availability checks themselves still run on every call: they depend on
+        the current environment and must not be frozen.
+
         Returns:
             XML-formatted skills summary.
         """
@@ -191,13 +198,30 @@ class SkillDocumentLoader:
         def escape_xml(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+        entries = []
+        for skill in all_skills:
+            meta = self._get_skill_meta(skill["name"])
+            available = self._check_requirements(meta, skill_name=skill["name"])
+            missing = "" if available else self._get_missing_requirements(
+                meta, skill_name=skill["name"]
+            )
+            entries.append((skill, available, missing))
+
+        key = (
+            self._skills_fingerprint(),
+            tuple((s["name"], available, missing) for s, available, missing in entries),
+        )
+        cached = self._summary_cache.get(key)
+        if cached is not None:
+            return cached
+        if len(self._summary_cache) > 8:
+            self._summary_cache.clear()
+
         lines = ["<skills>"]
-        for s in all_skills:
+        for s, available, missing in entries:
             name = escape_xml(s["name"])
             path = s["path"]
             desc = escape_xml(self._get_skill_description(s["name"]))
-            skill_meta = self._get_skill_meta(s["name"])
-            available = self._check_requirements(skill_meta, skill_name=s["name"])
 
             lines.append(f"  <skill available=\"{str(available).lower()}\">")
             lines.append(f"    <name>{name}</name>")
@@ -205,17 +229,38 @@ class SkillDocumentLoader:
             lines.append(f"    <location>{path}</location>")
 
             # Show missing requirements for unavailable skills
-            if not available:
-                missing = self._get_missing_requirements(
-                    skill_meta, skill_name=s["name"]
-                )
-                if missing:
-                    lines.append(f"    <requires>{escape_xml(missing)}</requires>")
+            if missing:
+                lines.append(f"    <requires>{escape_xml(missing)}</requires>")
 
             lines.append("  </skill>")
         lines.append("</skills>")
 
-        return "\n".join(lines)
+        summary = "\n".join(lines)
+        self._summary_cache[key] = summary
+        return summary
+
+    def _skills_fingerprint(self) -> tuple:
+        """Directory and SKILL.md identity for cache invalidation."""
+        parts: list[tuple] = []
+        for root in (self.workspace_skills, self.installed_skills, self.builtin_skills):
+            if root is None or not root.exists():
+                parts.append((str(root), None))
+                continue
+            try:
+                root_stat = root.stat()
+                entries = []
+                for skill_dir in sorted(root.iterdir()):
+                    if not skill_dir.is_dir():
+                        continue
+                    skill_file = skill_dir / "SKILL.md"
+                    if not skill_file.exists():
+                        continue
+                    stat = skill_file.stat()
+                    entries.append((skill_dir.name, stat.st_mtime_ns, stat.st_size))
+                parts.append((str(root), root_stat.st_mtime_ns, tuple(entries)))
+            except OSError:
+                parts.append((str(root), None))
+        return tuple(parts)
 
     def _get_missing_requirements(
         self, skill_meta: dict, *, skill_name: str | None = None

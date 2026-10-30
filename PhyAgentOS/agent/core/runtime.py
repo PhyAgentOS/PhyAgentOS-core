@@ -11,14 +11,19 @@ Invariants this module enforces:
 * One session has at most one active turn. A second ``submit`` for the same
   session waits for the active turn; different sessions run concurrently.
   Because of that, ``cancel(session_id)`` has exactly one target.
-* Every ``submit`` first calls ``SessionStore.recover`` for its session. The
-  store contract makes recovery idempotent; recovery always completes before
-  the new turn's ``input.accepted`` event is written. Unfinished turns that
-  the store only reports are closed by the runtime with ``turn.interrupted``,
-  because the runtime owns terminal ``turn.*`` events.
-* After recovery and before ``input.accepted``, ``submit`` loads
-  ``SessionStore.read_conversation`` into ``TurnStart.history``. The store owns
-  that projection; the runtime never trims, merges, or generates messages. A
+* Every ``submit`` first recovers its session. A store that implements
+  ``read_startup_snapshot`` returns the recovery report and the conversation
+  from one consistent read; other stores keep the explicit ``recover`` then
+  ``read_conversation`` pair. Recovery always completes before the new turn's
+  ``input.accepted`` event is written. Unfinished turns that the store only
+  reports are closed by the runtime with ``turn.interrupted``, because the
+  runtime owns terminal ``turn.*`` events. When the snapshot reports the head
+  it was folded at, that close is conditional on the head: a concurrent
+  terminal event makes the runtime fold a new snapshot instead of closing an
+  already-completed turn.
+* After recovery and before ``input.accepted``, ``submit`` loads the
+  conversation projection into ``TurnStart.history``. The store owns that
+  projection; the runtime never trims, merges, or generates messages. A
   failed read is a storage failure: no turn is opened and the driver is not
   called.
 * Each turn gets a freshly minted ``turn_id``, :class:`CancellationToken`,
@@ -49,8 +54,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .events import EventType, RuntimeEvent
-from .protocols import LoopDriver, SessionStore
+from .events import EventType, RecoveryReport, RuntimeEvent
+from .protocols import LoopDriver, SessionSnapshot, SessionStore
 from .types import (
     Budget,
     CancellationToken,
@@ -66,6 +71,7 @@ from .types import (
 __all__ = ["AgentRuntime", "AgentRuntimeImpl", "RuntimeStorageError"]
 
 CANCEL_STEP_ID = "runtime/cancel"
+_STARTUP_ATTEMPTS = 4
 """Scope name used by the context returned from :meth:`AgentRuntime.cancel`.
 
 It is intentionally not shaped like a model step id: the context only exists
@@ -214,11 +220,7 @@ class AgentRuntime:
                 if self._stopped:
                     raise RuntimeError("agent runtime is stopped")
 
-                await self._recover(request.session_id)
-                if self._stopped:
-                    raise RuntimeError("agent runtime is stopped")
-
-                history = await self._read_history(request.session_id)
+                history = await self._startup(request.session_id)
                 if self._stopped:
                     raise RuntimeError("agent runtime is stopped")
 
@@ -376,43 +378,112 @@ class AgentRuntime:
     # ------------------------------------------------------------------
     # turn execution
     # ------------------------------------------------------------------
-    async def _recover(self, session_id: str) -> None:
-        """Recover the session and close its unfinished turns.
+    async def _startup(self, session_id: str) -> tuple[Mapping[str, Any], ...]:
+        """Recover the session and return the next turn's stored history.
 
-        The store appends the recovery events for unfinished model/tool calls.
-        Unfinished *turns* are only reported, so the runtime — the owner of
-        terminal ``turn.*`` events — records them as ``turn.interrupted``
-        before opening a new turn. This keeps the reading rule intact: every
-        stored ``turn.started`` gets one terminal event, and recovery never
-        claims a crashed turn was completed.
+        A store exposing ``read_startup_snapshot`` is asked for both values.
+        Unfinished turns are closed against the head sequence the report was
+        folded at; if another process changed the log first, the snapshot is
+        read and folded again instead of closing an already-terminal turn.
+        Any other store keeps the explicit recover-then-read path.
         """
+        snapshot_reader = getattr(self._store, "read_startup_snapshot", None)
+        if callable(snapshot_reader):
+            for _attempt in range(_STARTUP_ATTEMPTS):
+                try:
+                    snapshot = await snapshot_reader(session_id)
+                except Exception as exc:  # noqa: BLE001 - re-raised as a storage error
+                    raise RuntimeStorageError(
+                        None,
+                        f"startup snapshot failed for session {session_id!r}: "
+                        f"{_describe(exc)}",
+                    ) from exc
+                if not isinstance(snapshot, SessionSnapshot):
+                    raise RuntimeStorageError(
+                        None,
+                        "read_startup_snapshot returned "
+                        f"{type(snapshot).__name__}, expected SessionSnapshot",
+                    )
+                closed = await self._close_unfinished_turns(
+                    session_id, snapshot.recovery, snapshot.head_sequence
+                )
+                if closed:
+                    return tuple(snapshot.conversation)
+            # A live writer kept moving the head. Fail closed: no new turn may
+            # start while the report has not been persisted stably. Nothing
+            # was written for this startup; the next submit retries.
+            raise RuntimeStorageError(
+                None,
+                f"recovery conflict for session {session_id!r}: the session "
+                f"head kept moving during {_STARTUP_ATTEMPTS} startup attempts; "
+                "no turn was opened",
+            )
+
+        report = await self._store_recovery(session_id)
+        await self._close_unfinished_turns(session_id, report)
+        return await self._read_history(session_id)
+
+    async def _store_recovery(self, session_id: str) -> RecoveryReport:
+        """Ask a plain store for its recovery report (closing calls only)."""
         try:
-            report = await self._store.recover(session_id)
+            return await self._store.recover(session_id)
         except Exception as exc:  # noqa: BLE001 - re-raised as a storage error
             raise RuntimeStorageError(
                 None,
                 f"recover failed for session {session_id!r}: {_describe(exc)}",
             ) from exc
 
-        for turn_id in report.unfinished_turns:
+    async def _close_unfinished_turns(
+        self,
+        session_id: str,
+        report: RecoveryReport,
+        head_sequence: int | None = None,
+    ) -> bool:
+        """Close turns the store only reported; the runtime owns ``turn.*``.
+
+        This keeps the reading rule intact: every stored ``turn.started`` gets
+        one terminal event, and recovery never claims a crashed turn was
+        completed. When the store exposes ``append_recovery`` and the snapshot
+        reports its head, the close is conditional on that head: ``False``
+        means another process changed the log first, so the caller must fold a
+        fresh snapshot instead of closing a turn that may already be terminal.
+        """
+        events = [
+            RuntimeEvent(
+                type=EventType.TURN_INTERRUPTED,
+                session_id=session_id,
+                turn_id=turn_id,
+                payload={
+                    "recovered": True,
+                    "reason": "turn was unfinished when the session reopened",
+                },
+            )
+            for turn_id in report.unfinished_turns
+        ]
+        if not events:
+            return True
+        batch = getattr(self._store, "append_recovery", None)
+        if callable(batch) and head_sequence is not None:
             try:
-                await self._store.append(
-                    RuntimeEvent(
-                        type=EventType.TURN_INTERRUPTED,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        payload={
-                            "recovered": True,
-                            "reason": "turn was unfinished when the session reopened",
-                        },
-                    )
+                saved = await batch(
+                    session_id, events, expected_head=head_sequence
                 )
             except Exception as exc:  # noqa: BLE001 - re-raised as a storage error
                 raise RuntimeStorageError(
                     EventType.TURN_INTERRUPTED,
-                    f"recovered turn {turn_id!r} in session {session_id!r}: "
-                    f"{_describe(exc)}",
+                    f"recovered turn in session {session_id!r}: {_describe(exc)}",
                 ) from exc
+            return saved is not None
+        for event in events:
+            try:
+                await self._store.append(event)
+            except Exception as exc:  # noqa: BLE001 - re-raised as a storage error
+                raise RuntimeStorageError(
+                    EventType.TURN_INTERRUPTED,
+                    f"recovered turn {event.turn_id!r} in session "
+                    f"{session_id!r}: {_describe(exc)}",
+                ) from exc
+        return True
 
     async def _read_history(
         self, session_id: str

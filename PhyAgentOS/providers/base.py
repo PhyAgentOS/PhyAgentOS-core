@@ -775,7 +775,11 @@ class LLMProvider(ABC):
     def get_context_window(self, model: str | None = None) -> int | None:
         """Return the model's input window when the provider knows it.
 
-        Providers that cannot report model metadata return ``None`` so the
-        caller keeps its configured window.
+        This is a local metadata lookup, never an API request. Return a value
+        only when it is exact for this provider and model: a gateway, a local
+        deployment, a custom endpoint, or a deployment alias has no trustworthy
+        window, so return ``None`` and let the caller apply its configured cap
+        or documented fallback. Callers treat ``None`` as "unknown", not as a
+        reason to probe the endpoint.
         """
         return None

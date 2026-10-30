@@ -240,10 +240,37 @@ Core 把事件与目录元数据放在同一个 `core.db`。`SessionCatalog`
 tokens 内，都不再加进输入、输出或合计。`total_tokens` 优先用 provider 的值，没有才用输入加
 输出。只有每个计入的调用都同时报告 prompt 与 cached 时才显示缓存命中率。`estimate_context()`
 以最新的持久化 `request.prepared` 快照为起点，补上其后的 assistant 与 tool 消息；只有
-provider 报告的 prompt 大小仍对应未变化的请求时才标记为 `exact`。容量取有效窗口：配置的
-`context_window_tokens` 与已知模型容量中较小的一个。模型轮次统计 provider 调用次数，不是
-内部推理步数，也不伪造推理步数。会话累计行从已存事件重建，重新载入后仍可用。脚注只是终端
-渲染，绝不插入发给 provider 的消息历史。
+provider 报告的 prompt 大小仍对应未变化的请求时才标记为 `exact`。`ProviderService.resolve`
+组合有效窗口：可靠的模型元数据优先，显式 `context_window_tokens` 只在上限更小时覆盖；元数据
+未知时先看显式 cap；有 cap 用 configured 值。只有既无可靠元数据也无显式 cap 时才用文档化的
+65,536 fallback，并记录 source=`fallback`。模型原始值与 effective guard 分开保存。模型轮次统计 provider 调用次数，不是内部推理步数，也不伪造推理步数。会话累计行
+从已存事件重建，重新载入后仍可用。脚注只是终端渲染，绝不插入发给 provider 的消息历史。
+
+### Prompt 投影、工具阶段与启动读取
+
+发送请求前有三种只改请求副本的投影；持久事件不被改写。
+
+- `project_skill_documents()` 按 `(Skill 名, 精确内容 sha256)` 建键。每个版本在请求里只保留
+  一份完整文档；旧副本保留 activation metadata、内容 hash、字符数与省略标记。正文很短、去掉
+  后净省不足 128 字符时保留副本。compact 摘要不是文档副本，投影只去重 history 里已有的全文；
+  再次 `activate_skill` 会按新回合授权返回完整正文，不会自动读本地文档。tool-call id 与消息
+  顺序保持不变。
+- `project_forge_tool_results()` 只去重**完全相同且成功**的 Forge 读取结果，保留最新一份全文，
+  旧副本换成 hash/reference 标记；标记不写旧 notes。只有序列化后净省至少 128 字符才折叠，
+  短结果原样保留。错误、unknown/running/accepted/pending、非 JSON 文本和非成功结果原样
+  保留；`phase`/`cancel_status` 不是已知 terminal 时不得当成功去重。受保护字段包括 task/invocation/action/session id、status、evidence、image/artifact
+  引用和 unknown 语义。
+- `PromptAssemblerImpl` 接受 `ToolVisibility` 钩子；`composition.py` 接入 Forge 工具阶段：
+  primary Skill 激活前只显示读取/取消类工具，激活后才显示任务创建类工具；注册目录本身不变。
+  阶段隐藏不能从注册目录删除工具。
+- `SQLiteSessionStore.read_startup_snapshot()` 在一次 SQLite 读事务里同时读 recovery 与
+  conversation；store 子类覆盖 `recover()` 时退回 `recover()` + `read_conversation()`。
+  `SessionSnapshot` 保证两项来自同一视图。连续 4 次 CAS 都输给活跃 writer 时，本回合以
+  `RuntimeStorageError` 失败关闭，不开新回合、也不带着可能过旧的 recovery history 继续。
+  没有 lease 时活跃 writer 仍可能与读取竞争；保证的是不接收不完整历史，不是完全互斥。
+- `utils/helpers.py` 按内容 hash 缓存 prompt 估算，使用有界映射；tokenizer 重新加载和
+  `clear_prompt_estimate_cache()` 会清空对应条目，编辑过的 System/tool/message 不会复用旧计数。
+  缓存是估算，不是 provider 账单。
 
 ### 流式契约
 

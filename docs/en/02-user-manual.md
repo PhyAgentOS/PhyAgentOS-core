@@ -434,10 +434,19 @@ reports is added when the call ends; fields it did not report stay unknown. A pr
 streaming support still produces a normal one-shot reply.
 
 The session line shows `context ...`: the estimated size of the current request (system prompt,
-tool schemas and history) as a share of the effective window, which is the smaller of the
-configured window and the known model capacity. `≈` marks an estimate, `exact` marks a
-provider-reported value, and `--%` means the size or capacity is unknown. A request above capacity
-stays above 100% instead of being clamped.
+tool schemas and history) as a share of the effective window. Model metadata is preferred; an
+explicit `contextWindowTokens` value is only an upper cap and is never rewritten at runtime. The
+documented 65,536 fallback applies only when there is **neither reliable metadata nor an explicit
+cap**. With an explicit cap, that configured value is used (never silently raised to 1M), and the
+status shows the source (model/configured/fallback). `≈` marks an estimate; a provider-reported
+value has no `≈` and no literal `exact` text; an unknown context size shows `context --` or
+`used/--`, not `--%`. A request above capacity stays above 100% instead of being clamped. Tools are
+stage-gated: task creation/change tools are not offered before a Skill is activated; registered
+definitions still exist, they are just not visible on that step. One exact Skill content version
+normally keeps one full document per request; if the body is short and dropping it would save fewer
+than 128 characters, the duplicate stays unchanged without a marker. Durable events keep the full text. A compact
+summary is not a Skill-document copy; a later `activate_skill` call re-authorizes that turn and
+returns the full body, not an automatic local-file injection after compaction.
 
 After each turn the footer reports elapsed time, model rounds, tool calls, input and output
 tokens, cache hit ratio, and, only when the provider reports it, reasoning tokens; it then shows
@@ -460,7 +469,10 @@ context stays unchanged, while the attempt and any reported usage are still reco
 checkpoint is a projection over the append-only event history; original events are not rewritten or
 deleted, and the usage copied onto the checkpoint is not counted again. Compaction
 never dispatches a tool call, so it cannot create, cancel or resolve a Forge Action or Session, and
-an unresolved `unknown` stays unresolved.
+an unresolved `unknown` stays unresolved. After a restart, the status line still projects history
+from the newest checkpoint; a compacted session does not fall back to the full history, and the
+status keeps its post-compaction window. If recovery repeatedly loses to an active writer, the turn
+fails closed instead of continuing with incomplete or stale history.
 
 ### Gateway background entries
 

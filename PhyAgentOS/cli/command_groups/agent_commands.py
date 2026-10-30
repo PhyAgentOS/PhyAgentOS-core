@@ -33,6 +33,10 @@ from PhyAgentOS.agent.composition import AgentAssembly, compose_agent
 from PhyAgentOS.agent.core import SQLiteSessionStore, TurnRequest, TurnStatus
 from PhyAgentOS.agent.core.events import EventType
 from PhyAgentOS.agent.core.host import AgentHostCloseError
+from PhyAgentOS.agent.core.prompt import (
+    project_forge_tool_results,
+    project_skill_documents,
+)
 from PhyAgentOS.agent.core.session import CHECKPOINT_SUMMARY_NOTICE
 from PhyAgentOS.agent.services.context_compaction import compact_session
 from PhyAgentOS.agent.services.session_catalog import (
@@ -57,7 +61,7 @@ from PhyAgentOS.providers.service import (
     RuntimeSelection,
     SessionRuntimes,
 )
-from PhyAgentOS.utils.helpers import estimate_prompt_tokens_chain
+from PhyAgentOS.utils.helpers import estimate_prompt_tokens_chain, warm_token_encoder
 
 
 def load_agent_config(config_path: str | None, workspace: str | None):
@@ -77,32 +81,19 @@ def load_agent_config(config_path: str | None, workspace: str | None):
 
 def _instructions(config) -> str:
     parts = [
-        "You are PhyAgentOS. Use the registered tools and report only observed results. "
-        "Physical execution must use Forge Tool API. For physical work first activate "
-        "a primary Skill in the current turn, then create an AgentTask with its activation_id. "
-        "Do not create tasks for ordinary conversation. Query tool definitions and context "
-        "rather than guessing tool ids or arguments. Accepted/running is not success. "
-        "Poll an admitted action to a terminal result before finalizing its task. "
-        "Unknown remote state must not cause an automatic resubmission. "
-        "Local cancellation is not confirmation that remote execution stopped.",
-        "When the Gateway's execution timeout limit is unknown, omit the optional "
-        "timeout_ms argument and let the Gateway apply its default. Never hard-code a "
-        "timeout, and never treat an HTTP client timeout as the remote execution timeout.",
-        "Only use tools declared by an activated Skill document or a ToolSpec you fetched "
-        "in this process. If the current end-effector pose or robot state is unavailable, "
-        "do not report a relative displacement as done and do not send a guessed absolute "
-        "target.",
-        "An unresolved remote blocker is authoritative even when it belongs to another "
-        "session: keep its task and invocation identity, write None when the invocation "
-        "was never confirmed, do not invent an id, do not resend the old Action/Session, "
-        "do not call forge_task_create again while it is unchanged, and do not cancel "
-        "another session's task to get around it. Never present a blocker as resolved.",
-        "The existing task contract defaults to verification off (execution facts only). "
-        "Verification modes are off, audit, enforce, and recovery. Respect the user's "
-        "verification requirement; never silently turn it off. Semantic verification "
-        "requires its service, a goal, success criteria and evidence. Use only available "
-        "evidence and explain missing evidence rather than inventing it. Execution success "
-        "without semantic verification does not establish a user-level goal was achieved.",
+        "You are PhyAgentOS. Report only observed results; never invent ids, state or "
+        "success. Physical execution goes only through the Forge Tool API: activate a "
+        "primary Skill in the current turn, then create an AgentTask with its "
+        "activation_id. Ordinary conversation needs no task. Accepted/running is not "
+        "success; poll an admitted action to a terminal result before finalizing. Unknown "
+        "remote state is never resent automatically, and local cancellation is not "
+        "evidence that remote work stopped.",
+        "Query Forge context, ToolSpecs and status instead of guessing. An unresolved "
+        "remote blocker is authoritative across sessions: keep its task/invocation "
+        "identity (None when unconfirmed), do not resend, and do not cancel another "
+        "session's task to bypass it. Omit timeout_ms when the Gateway limit is unknown. "
+        "Respect the user's verification requirement and explain missing evidence; "
+        "execution facts alone do not prove the user's goal.",
     ]
     # Workspace instructions are data for the model; they cannot affect runtime
     # authorization or move the Forge execution path out of registered tools.
@@ -146,6 +137,40 @@ class _DisplayStore:
         return getattr(self.store, name)
 
 
+def _effective_window(config, selection) -> tuple[int | None, str]:
+    """One window definition for guard, status and compaction.
+
+    The provider service composes model metadata with the configured cap. When
+    that answer and its source are present, trust them. Older selections and
+    external embeddings may lack the source (``source=None``): then an explicit
+    configured cap and a model capacity are combined with ``min`` (the old
+    guard behaviour) and the source names the winner; a lone capacity is
+    treated as model metadata.
+    """
+    capacity = getattr(selection, "context_window_tokens", None)
+    source = getattr(selection, "context_window_source", None)
+    if capacity:
+        capacity = int(capacity)
+        if source in {"model", "configured", "fallback"}:
+            return capacity, source
+        defaults = getattr(getattr(config, "agents", None), "defaults", None)
+        configured = getattr(defaults, "context_window_tokens", None)
+        if configured:
+            configured = int(configured)
+            if configured <= capacity:
+                return configured, "configured"
+            return capacity, "model"
+        return capacity, "model"
+    defaults = getattr(getattr(config, "agents", None), "defaults", None)
+    configured = getattr(defaults, "context_window_tokens", None)
+    if configured:
+        return int(configured), "configured"
+    model_window = getattr(selection, "model_context_window_tokens", None)
+    if model_window:
+        return int(model_window), "model"
+    return None, "unknown"
+
+
 class _SelectedProvider:
     """Forward a turn to its frozen selection; leave SDK retries to the provider.
 
@@ -160,11 +185,10 @@ class _SelectedProvider:
     connection that never produced a stream.
     """
 
-    def __init__(self, selection, context_window, max_tokens, *, notice=None):
+    def __init__(self, selection, context_window, max_tokens, *, notice=None, window_source="configured"):
         self.selection = selection
-        self.context_window = min(
-            context_window, selection.context_window_tokens or context_window
-        )
+        self.context_window = context_window
+        self.window_source = window_source
         self.max_tokens = max_tokens
         self._notice = notice
         self._fallback_notified = False
@@ -179,6 +203,8 @@ class _SelectedProvider:
         )
 
     def _check_budget(self, *, messages, tools, model) -> None:
+        if not self.context_window:
+            return
         estimated, _ = estimate_prompt_tokens_chain(
             self.selection.provider, model, messages, tools
         )
@@ -499,16 +525,8 @@ class CoreAgentSession:
             )
         defaults = getattr(getattr(self.config, "agents", None), "defaults", None)
         reply_budget = getattr(defaults, "max_tokens", None)
-        default_window = getattr(defaults, "context_window_tokens", None)
-        # Use the same capacity the request guard and status line use: the
-        # smaller of the configured window and the one the selected model
-        # reports. A larger default must not let compaction exceed the next
-        # request's real limit.
-        window = (
-            min(default_window, selection.context_window_tokens or default_window)
-            if default_window
-            else selection.context_window_tokens
-        )
+        # Same effective window the request guard and status line use.
+        window, _window_source = _effective_window(self.config, selection)
 
         events = list(await self.raw_store.read_session(session_id))
         system_text = _last_request_system(events) or self.instructions or None
@@ -528,6 +546,7 @@ class CoreAgentSession:
                 [{"role": "system", "content": system_text}] if system_text else []
             )
             request_messages.extend(dict(message) for message in messages)
+            request_messages = _project_request_messages(request_messages)
             tokens, _source = estimate_prompt_tokens_chain(
                 selection.provider, selection.model, request_messages, tools
             )
@@ -642,8 +661,9 @@ def _compose_for_selection(
     with the rest.
     """
     defaults = config.agents.defaults
+    window, window_source = _effective_window(config, selection)
     provider = _SelectedProvider(
-        selection, defaults.context_window_tokens, defaults.max_tokens, notice=notice
+        selection, window, defaults.max_tokens, notice=notice, window_source=window_source
     )
     return compose_agent(
         provider=provider,
@@ -694,6 +714,7 @@ async def open_core_session(
     config.agents.defaults.model = selected.model
     config.agents.defaults.reasoning_effort = selected.effort
     async with AsyncExitStack() as resources:
+        warm_token_encoder()
         client, _, coordinator, availability = build_forge_components(
             config, selected.provider, write_legacy_lessons=False, resources=resources
         )
@@ -770,6 +791,14 @@ async def open_core_session(
         yield session
 
 
+def _project_request_messages(messages):
+    """Apply the same request-side projections the assembler uses."""
+    projected = [dict(message) for message in messages]
+    project_forge_tool_results(projected)
+    project_skill_documents(projected)
+    return projected
+
+
 def _last_request_tools(events):
     tools = None
     for event in reversed(events):
@@ -825,6 +854,10 @@ class _ContextStatus:
         self._tools: dict[str, list | None] = {}
         self._system: dict[str, str | None] = {}
         self._loaded: set[str] = set()
+        # Newest checkpoint coverage per session: events at or below this
+        # sequence are represented by the checkpoint projection, not by an old
+        # prepared request snapshot.
+        self._checkpoint_covers: dict[str, int] = {}
 
     async def load(self, session_id: str) -> None:
         if session_id in self._loaded:
@@ -835,6 +868,15 @@ class _ContextStatus:
         events = list(await raw.read_session(session_id))
         self._events[session_id] = events
         self._conversation[session_id] = tuple(await raw.read_conversation(session_id))
+        try:
+            reader = getattr(raw, "read_checkpoint", None)
+            checkpoint = await reader(session_id) if callable(reader) else None
+        except Exception:
+            checkpoint = None
+        if checkpoint is not None:
+            self._checkpoint_covers[session_id] = checkpoint.covers_sequence
+        else:
+            self._checkpoint_covers.pop(session_id, None)
         self._tools[session_id] = _last_request_tools(events)
         self._system[session_id] = self._system_text(events)
         self._loaded.add(session_id)
@@ -871,8 +913,13 @@ class _ContextStatus:
             return
         try:
             self._conversation[session_id] = tuple(await raw.read_conversation(session_id))
+            reader = getattr(raw, "read_checkpoint", None)
+            checkpoint = await reader(session_id) if callable(reader) else None
         except Exception:
             self._conversation.pop(session_id, None)
+            checkpoint = None
+        if checkpoint is not None:
+            self._checkpoint_covers[session_id] = checkpoint.covers_sequence
         events = self._events.get(session_id, [])
         self._tools[session_id] = _last_request_tools(events)
         self._system[session_id] = self._system_text(events)
@@ -904,35 +951,59 @@ class _ContextStatus:
         self._tools[session_id] = _last_request_tools(events)
         self._system[session_id] = self._system_text(events)
         self._loaded.add(session_id)
+        covers = getattr(checkpoint, "covers_sequence", None)
+        if not isinstance(covers, int):
+            # Test/legacy checkpoint objects may omit coverage; treat the whole
+            # current log as covered so the pre-compaction snapshot is dropped
+            # and only a later prepared request can supersede the checkpoint.
+            covers = max((event.sequence or 0) for event in events) if events else 0
+        self._checkpoint_covers[session_id] = covers
 
     def snapshot(self, session_id: str) -> ContextSnapshot:
         selection = self._session.sessions.get(session_id)
-        defaults = getattr(getattr(self._session, "config", None), "agents", None)
-        configured = getattr(getattr(defaults, "defaults", None), "context_window_tokens", None)
-        model_capacity = getattr(selection, "context_window_tokens", None)
-        capacity = (
-            min(configured, model_capacity or configured)
-            if configured
-            else model_capacity
-        )
+        capacity, window_source = _effective_window(getattr(self._session, "config", None), selection)
         system_text = self._system.get(session_id)
         if system_text is None:
             system_text = self._system_text(self._events.get(session_id, []))
+        events = self._events.get(session_id, [])
+        # Prefer the exact prepared request: it already carries the assembler's
+        # request projection (deduplicated Skill docs, projected tool results)
+        # and the visible tool set. Raw events remain the replay source.
+        prepared_sequences = [
+            event.sequence
+            for event in events
+            if event.type is EventType.REQUEST_PREPARED and event.sequence is not None
+        ]
+        covers = self._checkpoint_covers.get(session_id)
+        prepared_is_current = bool(prepared_sequences) and (
+            covers is None or max(prepared_sequences) > covers
+        )
+        if prepared_is_current:
+            return estimate_context(
+                events,
+                provider=selection.provider,
+                model=selection.model,
+                capacity=capacity,
+                capacity_source=window_source,
+                instructions=system_text,
+            )
         conversation = self._conversation.get(session_id)
         if conversation is not None:
             return estimate_context_from_conversation(
-                conversation,
+                _project_request_messages(conversation),
                 self._tools.get(session_id),
                 instructions=system_text,
                 provider=selection.provider,
                 model=selection.model,
                 capacity=capacity,
+                capacity_source=window_source,
             )
         return estimate_context(
-            self._events.get(session_id, []),
+            events,
             provider=selection.provider,
             model=selection.model,
             capacity=capacity,
+            capacity_source=window_source,
             instructions=system_text,
         )
 

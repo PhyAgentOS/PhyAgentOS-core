@@ -473,11 +473,20 @@ def _format_tokens(value: int | None) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ContextSnapshot:
-    """Current prompt size and the model capacity it is measured against."""
+    """Current prompt size, the model capacity, and where both came from.
+
+    ``tokens`` is the estimate or provider-reported prompt size for the next
+    request. ``capacity`` is the effective input window the request guard and
+    compaction use. ``capacity_source`` says whether that window is the model's
+    metadata, the user's explicit cap, or the assumed fallback; the label marks
+    the fallback so an assumed number is not read as a model fact.
+    """
 
     tokens: int | None
     capacity: int | None
     exact: bool = False
+    capacity_source: str | None = None
+    tokens_source: str | None = None
 
     @property
     def percent(self) -> float | None:
@@ -487,12 +496,28 @@ class ContextSnapshot:
         return self.tokens / self.capacity * 100.0
 
     def label(self) -> str:
+        if self.tokens is None:
+            return "context --"
+        used = _compact_tokens(self.tokens)
+        if not self.capacity or self.capacity <= 0:
+            return f"context {used}/--"
         percent = self.percent
-        if percent is None:
-            return "context --%"
+        if percent is None:  # pragma: no cover - capacity checked above
+            return f"context {used}/--"
+        effective = _compact_tokens(self.capacity)
         prefix = "" if self.exact else "≈"
-        marker = " exact" if self.exact else ""
-        return f"context {prefix}{percent:.0f}%{marker}"
+        assumed = " (assumed)" if self.capacity_source == "fallback" else ""
+        return f"context {used}/{effective} {prefix}{percent:.0f}%{assumed}"
+
+
+def _compact_tokens(value: int) -> str:
+    if value < 1_000:
+        return str(value)
+    if value < 1_000_000:
+        text = f"{value / 1_000:.1f}".rstrip("0").rstrip(".")
+        return f"{text}k"
+    text = f"{value / 1_000_000:.1f}".rstrip("0").rstrip(".")
+    return f"{text}M"
 
 
 def format_context_label(snapshot: ContextSnapshot) -> str:
@@ -550,6 +575,7 @@ def estimate_context(
     provider: Any = None,
     model: str | None = None,
     capacity: int | None = None,
+    capacity_source: str | None = None,
     instructions: str | None = None,
 ) -> ContextSnapshot:
     """Estimate the next request from the newest durable snapshot.
@@ -566,6 +592,7 @@ def estimate_context(
             provider=provider,
             model=model,
             capacity=capacity,
+            capacity_source=capacity_source,
         )
 
     last_request_index = _last_index(
@@ -590,6 +617,7 @@ def estimate_context(
                 provider=provider,
                 model=model,
                 capacity=capacity,
+                capacity_source=capacity_source,
             )
 
     if last_request_index is not None:
@@ -599,6 +627,7 @@ def estimate_context(
             provider=provider,
             model=model,
             capacity=capacity,
+            capacity_source=capacity_source,
         )
 
     return _estimate_messages(
@@ -607,6 +636,7 @@ def estimate_context(
         provider=provider,
         model=model,
         capacity=capacity,
+        capacity_source=capacity_source,
     )
 
 
@@ -618,6 +648,7 @@ def estimate_context_from_conversation(
     provider: Any = None,
     model: str | None = None,
     capacity: int | None = None,
+    capacity_source: str | None = None,
 ) -> ContextSnapshot:
     """Estimate the next request from a checkpoint-aware conversation."""
     messages: list[dict[str, Any]] = []
@@ -630,6 +661,7 @@ def estimate_context_from_conversation(
         provider=provider,
         model=model,
         capacity=capacity,
+        capacity_source=capacity_source,
     )
 
 
@@ -648,6 +680,7 @@ def _estimate_completed_turn(
     provider: Any,
     model: str | None,
     capacity: int | None,
+    capacity_source: str | None,
 ) -> ContextSnapshot:
     request = events[request_index]
     messages = _message_list(request.payload.get("messages"))
@@ -655,7 +688,14 @@ def _estimate_completed_turn(
     reply = completed.payload.get("reply")
     if isinstance(reply, str):
         messages.append({"role": "assistant", "content": reply})
-    return _estimate_messages(messages, tools, provider=provider, model=model, capacity=capacity)
+    return _estimate_messages(
+        messages,
+        tools,
+        provider=provider,
+        model=model,
+        capacity=capacity,
+        capacity_source=capacity_source,
+    )
 
 
 def _estimate_live_request(
@@ -665,6 +705,7 @@ def _estimate_live_request(
     provider: Any,
     model: str | None,
     capacity: int | None,
+    capacity_source: str | None,
 ) -> ContextSnapshot:
     request = events[request_index]
     messages = _message_list(request.payload.get("messages"))
@@ -689,10 +730,21 @@ def _estimate_live_request(
     ):
         usage = parse_usage(last.payload.get("usage"))
         if usage.prompt_tokens is not None:
-            return ContextSnapshot(tokens=usage.prompt_tokens, capacity=capacity, exact=True)
+            return ContextSnapshot(
+                tokens=usage.prompt_tokens,
+                capacity=capacity,
+                exact=True,
+                capacity_source=capacity_source,
+                tokens_source="provider_usage",
+            )
 
     return _estimate_messages(
-        messages + additions, tools, provider=provider, model=model, capacity=capacity
+        messages + additions,
+        tools,
+        provider=provider,
+        model=model,
+        capacity=capacity,
+        capacity_source=capacity_source,
     )
 
 
@@ -703,14 +755,19 @@ def _estimate_messages(
     provider: Any,
     model: str | None,
     capacity: int | None,
+    capacity_source: str | None,
 ) -> ContextSnapshot:
     if not messages and not tools:
-        return ContextSnapshot(tokens=None, capacity=capacity, exact=False)
-    tokens, _source = estimate_prompt_tokens_chain(provider, model, messages, tools)
+        return ContextSnapshot(
+            tokens=None, capacity=capacity, exact=False, capacity_source=capacity_source
+        )
+    tokens, source = estimate_prompt_tokens_chain(provider, model, messages, tools)
     return ContextSnapshot(
         tokens=tokens or None,
         capacity=capacity,
         exact=False,
+        capacity_source=capacity_source,
+        tokens_source=source if tokens else None,
     )
 
 

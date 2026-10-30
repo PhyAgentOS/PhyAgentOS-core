@@ -225,7 +225,11 @@ async def test_real_core_can_recover_from_historical_activation_id(tmp_path):
                     }
                 )], finish_reason="tool_calls")
             if self.calls == 4:
-                assert "call activate_skill" in messages[-1]["content"]
+                # The stale activation id is not authorization. With stage
+                # gating, forge_task_create is not even offered before a fresh
+                # primary activation, so the rejection is the policy one; the
+                # turn must still activate first and then create.
+                assert "forge_task_create" in messages[-1]["content"]
                 return LLMResponse(content=None, tool_calls=[ToolCallRequest(
                     id="new", name="activate_skill", arguments={"name": "primary"}
                 )], finish_reason="tool_calls")

@@ -23,6 +23,12 @@ Storage rules:
   checkpoint (summary plus the retained recent messages) and only reads events
   after ``covers_sequence``; a completed turn after that point still wins with
   its own request snapshot, so the full log is not replayed on every turn;
+* ``read_startup_snapshot`` reads recovery-relevant events, the newest
+  checkpoint, and the head in one transaction. It omits streaming delta rows
+  (neither recovery nor conversation projection consumes them) and writes
+  recovery interruptions only through a head compare-and-swap. A concurrent
+  append, or a checkpoint change at an unchanged head, makes it fold a fresh
+  view instead of returning a stale report or writing a stale interruption;
 * context checkpoints are a separate, append-only projection table. They never
   rewrite ``session_events`` and they are not ``context.compacted`` events:
   that event type belongs to the loop driver's turn, while a checkpoint is a
@@ -62,6 +68,7 @@ from pathlib import Path
 from typing import Any
 
 from .events import CallKind, EventType, RecoveryReport, RuntimeEvent, UnfinishedCall
+from .protocols import SessionSnapshot
 from .types import require_non_empty
 
 __all__ = [
@@ -69,6 +76,7 @@ __all__ = [
     "CheckpointConflictError",
     "CompactionAttempt",
     "ContextCheckpoint",
+    "RecoveryConflictError",
     "SessionStoreClosedError",
     "SQLiteSessionStore",
 ]
@@ -148,6 +156,25 @@ class SessionStoreClosedError(RuntimeError):
     def __init__(self, path: str) -> None:
         self.path = path
         super().__init__(f"session store is closed: {path}")
+
+
+class RecoveryConflictError(RuntimeError):
+    """Turn startup could not fold and persist a stable recovery view.
+
+    The session head kept moving through every bounded retry, so no recovery
+    snapshot can be returned without risking a stale interruption or a stale
+    report. Nothing was written by the failed attempts; the caller must not
+    open a new turn and should retry on the next submit.
+    """
+
+    def __init__(self, session_id: str, attempts: int) -> None:
+        self.session_id = session_id
+        self.attempts = attempts
+        super().__init__(
+            f"recovery conflict for session {session_id!r}: the session head "
+            f"moved during {attempts} startup attempts; no recovery event was "
+            "written and no turn may start"
+        )
 
 
 class CheckpointConflictError(RuntimeError):
@@ -350,6 +377,31 @@ def _row_to_event(session_id: str, row: tuple[Any, ...]) -> RuntimeEvent:
     )
 
 
+def _insert_event_row(
+    conn: sqlite3.Connection,
+    event: RuntimeEvent,
+    sequence: int,
+    payload_json: str,
+    recorded_at: str,
+) -> None:
+    """Insert one already-encoded row inside the caller's transaction."""
+    conn.execute(
+        "INSERT INTO session_events"
+        " (session_id, sequence, turn_id, step_id, event_type,"
+        "  payload, recorded_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.session_id,
+            sequence,
+            event.turn_id,
+            event.step_id,
+            event.type.value,
+            payload_json,
+            recorded_at,
+        ),
+    )
+
+
 def _call_payload(payload: Mapping[str, Any], key: str) -> str | None:
     value = payload.get(key)
     return value if isinstance(value, str) and value.strip() else None
@@ -427,6 +479,18 @@ def _unfinished_state(
                 open_calls.pop((CallKind.TOOL, turn_id, event.step_id, call_id), None)
 
     return tuple(open_turns), open_calls
+
+
+def _recovery_report(
+    session_id: str, events: Sequence[RuntimeEvent]
+) -> RecoveryReport:
+    """Fold one already-read event view into a recovery report."""
+    unfinished_turns, open_calls = _unfinished_state(session_id, events)
+    return RecoveryReport(
+        session_id=session_id,
+        unfinished_turns=unfinished_turns,
+        unfinished_calls=tuple(open_calls.values()),
+    )
 
 
 def _conversation_from_events(
@@ -560,9 +624,42 @@ def _checkpoint_conversation(
     return tuple(messages)
 
 
+def _project_with_checkpoint(
+    events: Sequence[RuntimeEvent],
+    checkpoint: ContextCheckpoint | None,
+) -> tuple[Mapping[str, Any], ...]:
+    """Project conversation from already-read events and the newest checkpoint.
+
+    This is the same rule ``read_conversation`` applies: a completed turn after
+    the checkpoint wins with its own request snapshot; otherwise the checkpoint
+    projection is used.
+    """
+    if checkpoint is None:
+        return _conversation_from_events(events)
+    tail = tuple(
+        event
+        for event in events
+        if (event.sequence if event.sequence is not None else 0)
+        > checkpoint.covers_sequence
+    )
+    if tail:
+        projected = _conversation_from_events(tail)
+        if projected:
+            return projected
+    return _checkpoint_conversation(checkpoint)
+
+
+def _checkpoint_identity(checkpoint: ContextCheckpoint | None) -> tuple[int | None, int] | None:
+    """Identity used to notice a checkpoint change at an unchanged head."""
+    if checkpoint is None:
+        return None
+    return (checkpoint.checkpoint_id, checkpoint.covers_sequence)
+
+
 _INIT_RETRY_ATTEMPTS = 20
 _INIT_RETRY_BASE_SECONDS = 0.005
 _INIT_RETRY_MAX_SECONDS = 0.1
+_STARTUP_SNAPSHOT_ATTEMPTS = 4
 _SQLITE_BUSY_BASE_CODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 
 
@@ -727,6 +824,116 @@ class SQLiteSessionStore:
         self._raise_if_closed()
         return await asyncio.to_thread(self._conversation_sync, session_id)
 
+    async def read_startup_snapshot(self, session_id: str) -> SessionSnapshot:
+        """Return recovery and the next conversation from one consistent read.
+
+        Recovery is decided against a head sequence and its writes are
+        conditional on that head: an external process that completes a call or
+        turn between the read and the write makes the conditional append fail,
+        and the whole view is read and folded again instead of closing work
+        that is already terminal. No stale interruption is ever written.
+
+        Streaming deltas are excluded because neither ``_unfinished_state`` nor
+        conversation projection consumes them. A checkpoint change at an
+        unchanged head refreshes the conversation; it does not change recovery.
+        Across attempts this method keeps no cache.
+
+        Known limit: there is no writer lease. A terminal event committed after
+        a successful CAS can still follow the interruption. Work that was
+        already terminal before the CAS is never interrupted, and exhaustion
+        raises :class:`RecoveryConflictError` instead of returning a snapshot.
+
+        A store subclass that overrides ``recover`` keeps the public
+        recover-then-read path here. That preserves hooks such as a test or an
+        embedding that gates recovery; the base store is the fast path.
+        """
+        require_non_empty("session_id", session_id)
+        self._raise_if_closed()
+        if getattr(type(self), "recover", None) is not SQLiteSessionStore.recover:
+            report = await self.recover(session_id)
+            return SessionSnapshot(report, await self.read_conversation(session_id))
+
+        for _attempt in range(_STARTUP_SNAPSHOT_ATTEMPTS):
+            events, checkpoint, head = await asyncio.to_thread(
+                self._startup_rows_sync, session_id
+            )
+            report = _recovery_report(session_id, events)
+            pending = report.interruption_events()
+            if pending:
+                saved = await self.append_recovery(
+                    session_id, pending, expected_head=head
+                )
+                if saved is None:
+                    # An external writer moved the head: the fold above no
+                    # longer describes the log, so decide again from a new read.
+                    continue
+                head_sequence = (
+                    saved[-1].sequence if saved and saved[-1].sequence is not None else head
+                )
+                events = (*events, *saved)
+                latest = await asyncio.to_thread(
+                    self._latest_checkpoint_sync, session_id
+                )
+                if _checkpoint_identity(latest) != _checkpoint_identity(checkpoint):
+                    conversation = await self.read_conversation(session_id)
+                else:
+                    conversation = _project_with_checkpoint(events, checkpoint)
+                return SessionSnapshot(
+                    report, conversation, head_sequence=head_sequence
+                )
+
+            head_after = await asyncio.to_thread(self._head_sequence_sync, session_id)
+            latest = await asyncio.to_thread(
+                self._latest_checkpoint_sync, session_id
+            )
+            if (
+                head_after == head
+                and _checkpoint_identity(latest) == _checkpoint_identity(checkpoint)
+            ):
+                return SessionSnapshot(
+                    report,
+                    _project_with_checkpoint(events, checkpoint),
+                    head_sequence=head,
+                )
+            # Work landed after the read and before this check. Re-read rather
+            # than returning a report that may already be stale.
+
+        # A continuously moving writer exhausted the retries. Fail closed: an
+        # unwritten recovery is safer than a stale interruption, but returning
+        # an executable snapshot here would let the runtime start a new turn
+        # while this one is still unfinished.
+        raise RecoveryConflictError(session_id, _STARTUP_SNAPSHOT_ATTEMPTS)
+
+    async def append_recovery(
+        self,
+        session_id: str,
+        events: Sequence[RuntimeEvent],
+        *,
+        expected_head: int,
+    ) -> tuple[RuntimeEvent, ...] | None:
+        """Append recovery events only if the session head is still expected.
+
+        This is one SQLite write transaction: the head check and every insert
+        either all commit or none do. ``None`` means another connection moved
+        the head, so the caller must fold again; no recovery event was written.
+        Subclasses may override this public hook to observe recovery writes
+        without changing the atomicity requirement.
+        """
+        require_non_empty("session_id", session_id)
+        if not isinstance(expected_head, int) or isinstance(expected_head, bool):
+            raise TypeError("expected_head must be an int")
+        if expected_head < 0:
+            raise ValueError("expected_head must be >= 0")
+        for event in events:
+            if not isinstance(event, RuntimeEvent):
+                raise TypeError("recovery events must be RuntimeEvent instances")
+            if event.session_id != session_id:
+                raise ValueError("recovery event belongs to a different session")
+        self._raise_if_closed()
+        return await asyncio.to_thread(
+            self._append_recovery_sync, session_id, tuple(events), expected_head
+        )
+
     async def read_head_sequence(self, session_id: str) -> int:
         """Return the highest stored sequence for ``session_id`` (0 when empty)."""
         require_non_empty("session_id", session_id)
@@ -858,21 +1065,7 @@ class SQLiteSessionStore:
                         (event.session_id,),
                     ).fetchone()
                     sequence = int(row[0]) + 1
-                    conn.execute(
-                        "INSERT INTO session_events"
-                        " (session_id, sequence, turn_id, step_id, event_type,"
-                        "  payload, recorded_at)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            event.session_id,
-                            sequence,
-                            event.turn_id,
-                            event.step_id,
-                            event.type.value,
-                            payload_json,
-                            recorded_at,
-                        ),
-                    )
+                    _insert_event_row(conn, event, sequence, payload_json, recorded_at)
                 except BaseException:
                     if conn.in_transaction:
                         conn.execute("ROLLBACK")
@@ -896,6 +1089,96 @@ class SQLiteSessionStore:
             self._raise_if_closed()
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return tuple(_row_to_event(session_id, row) for row in rows)
+
+    def _startup_rows_sync(
+        self, session_id: str
+    ) -> tuple[tuple[RuntimeEvent, ...], ContextCheckpoint | None, int]:
+        """Read recovery-relevant events, the checkpoint, and the head together.
+
+        One deferred read transaction gives the three values the same snapshot.
+        ``model.response.delta`` rows are left out: recovery folds them as
+        no-ops and conversation projection never reads them, so decoding their
+        payloads only adds work.
+        """
+        self._raise_if_closed()
+        with self._session_lock(session_id):
+            with self._conn_lock:
+                self._raise_if_closed()
+                conn = self._conn
+                conn.execute("BEGIN")
+                try:
+                    rows = conn.execute(
+                        "SELECT turn_id, step_id, event_type, payload, recorded_at,"
+                        " sequence FROM session_events"
+                        " WHERE session_id = ? AND event_type != ?"
+                        " ORDER BY sequence ASC",
+                        (session_id, EventType.MODEL_RESPONSE_DELTA.value),
+                    ).fetchall()
+                    checkpoint_row = conn.execute(
+                        "SELECT checkpoint_id, session_id, covers_sequence, summary,"
+                        " retained_messages, selection, usage, created_at"
+                        " FROM session_checkpoints WHERE session_id = ?"
+                        " ORDER BY checkpoint_id DESC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    head_row = conn.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM session_events"
+                        " WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        events = tuple(_row_to_event(session_id, row) for row in rows)
+        checkpoint = None if checkpoint_row is None else _checkpoint_from_row(checkpoint_row)
+        return events, checkpoint, int(head_row[0])
+
+    def _append_recovery_sync(
+        self,
+        session_id: str,
+        events: tuple[RuntimeEvent, ...],
+        expected_head: int,
+    ) -> tuple[RuntimeEvent, ...] | None:
+        """All-or-nothing recovery append under a head compare-and-swap."""
+        self._raise_if_closed()
+        encoded = [
+            (
+                event,
+                _encode_payload(event.payload),
+                event.recorded_at.astimezone(timezone.utc).isoformat(),
+            )
+            for event in events
+        ]
+        with self._session_lock(session_id):
+            with self._conn_lock:
+                self._raise_if_closed()
+                conn = self._conn
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM session_events"
+                        " WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if int(row[0]) != expected_head:
+                        conn.execute("ROLLBACK")
+                        return None
+                    saved: list[RuntimeEvent] = []
+                    sequence = expected_head
+                    for event, payload_json, recorded_at in encoded:
+                        sequence += 1
+                        _insert_event_row(
+                            conn, event, sequence, payload_json, recorded_at
+                        )
+                        saved.append(replace(event, sequence=sequence))
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+                conn.execute("COMMIT")
+        return tuple(saved)
 
     def _recover_sync(self, session_id: str) -> RecoveryReport:
         self._raise_if_closed()

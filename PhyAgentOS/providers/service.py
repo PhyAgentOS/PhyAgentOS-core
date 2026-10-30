@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from PhyAgentOS.config.loader import config_write_lock, load_config, save_config
-from PhyAgentOS.config.schema import Config, ProviderConfig
+from PhyAgentOS.config.schema import DEFAULT_CONTEXT_WINDOW_TOKENS, Config, ProviderConfig
 from PhyAgentOS.providers.base import GenerationSettings, LLMProvider
 from PhyAgentOS.providers.errors import describe_provider_error
 from PhyAgentOS.providers.registry import PROVIDERS, ProviderSpec, find_by_name
@@ -86,7 +86,60 @@ class ProviderSelection:
 @dataclass(frozen=True)
 class RuntimeSelection(ProviderSelection):
     provider: LLMProvider = field(repr=False, compare=False)
+    # Effective input window used by the request guard, compaction and the
+    # status line. Always a positive int after ``ProviderService.resolve``.
     context_window_tokens: int | None = None
+    # How that number was obtained: "model", "configured", "fallback", or
+    # "unknown" for selections built by callers that do not resolve capacity.
+    context_window_source: str = "unknown"
+    # What the provider's local metadata reported, when it reported anything.
+    # Kept so a configured cap can be shown without re-querying the provider.
+    model_context_window_tokens: int | None = None
+
+
+_MAX_PLAUSIBLE_MODEL_CONTEXT_WINDOW = 16_000_000
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def compose_context_capacity(
+    *, reported: int | None, configured: int | None
+) -> tuple[int, str]:
+    """Pick the effective input window and say where it came from.
+
+    A reliable model window wins unless the user set a smaller explicit cap.
+    With neither, the documented fallback applies; it is marked so the status
+    line can show that the number is assumed, not the model's real limit.
+    """
+    model_window = _positive_int(reported)
+    if model_window is not None and model_window > _MAX_PLAUSIBLE_MODEL_CONTEXT_WINDOW:
+        model_window = None
+    cap = _positive_int(configured)
+    if model_window is not None and cap is not None:
+        if cap <= model_window:
+            return cap, "configured"
+        return model_window, "model"
+    if model_window is not None:
+        return model_window, "model"
+    if cap is not None:
+        return cap, "configured"
+    return DEFAULT_CONTEXT_WINDOW_TOKENS, "fallback"
+
+
+_SOURCE_LABELS = {
+    "model": "model metadata",
+    "configured": "configured cap",
+    "fallback": "assumed default, model metadata unavailable",
+    "unknown": "unknown",
+}
+
+
+def context_window_source_label(source: str | None) -> str:
+    return _SOURCE_LABELS.get(source or "unknown", "unknown")
 
 
 class ProviderService:
@@ -356,14 +409,19 @@ class ProviderService:
             max_tokens=defaults.max_tokens,
             reasoning_effort=selection.effort,
         )
+        reported = provider.get_context_window(selection.model)
+        context_window_tokens, context_window_source = compose_context_capacity(
+            reported=reported, configured=defaults.context_window_tokens
+        )
         return RuntimeSelection(
             selection.name,
             selection.model,
             selection.effort,
             selection.endpoint,
             provider,
-            provider.get_context_window(selection.model)
-            or defaults.context_window_tokens,
+            context_window_tokens,
+            context_window_source,
+            reported,
         )
 
     @staticmethod
@@ -514,9 +572,14 @@ class SessionRuntimes:
             return None
         current = self.get(key)
         if command == "/status":
+            capacity = current.context_window_tokens
+            detail = context_window_source_label(current.context_window_source)
+            if current.model_context_window_tokens is not None:
+                detail = f"{detail}; model reports {current.model_context_window_tokens}"
             return (
                 f"Session: {key}\nProvider: {current.name}\nModel: {current.model}\n"
                 f"Effort: {current.effort or 'none (model default)'}\n"
+                f"Context window: {capacity if capacity else 'unknown'} ({detail})\n"
                 f"Endpoint: {safe_endpoint(current.endpoint)} (not tested)\n"
                 "Scope: this session; changes apply to subsequent turns only."
             )

@@ -7,6 +7,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
+# Used only when neither the model metadata nor an explicit config value gives
+# a context window. It is a conservative assumption, not a model fact, and the
+# status line marks it as assumed.
+DEFAULT_CONTEXT_WINDOW_TOKENS = 65_536
+
 
 class Base(BaseModel):
     """Base model that accepts both camelCase and snake_case keys."""
@@ -238,7 +243,10 @@ class AgentDefaults(Base):
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
     max_tokens: int = 8192
-    context_window_tokens: int = 65_536
+    # None means automatic: use the selected model's reported window, capped by
+    # this value when it is set explicitly. An explicit value is never rewritten
+    # by the runtime; remove it to go back to automatic resolution.
+    context_window_tokens: int | None = Field(default=None, gt=0)
     temperature: float = 0.1
     max_tool_iterations: int = 40
     max_concurrent_turns: int = 4

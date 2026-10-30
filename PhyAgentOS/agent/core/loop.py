@@ -33,7 +33,7 @@ import inspect
 import json
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .events import EventType, RuntimeEvent
@@ -49,6 +49,7 @@ from .types import (
     ToolCall,
     ToolDefinition,
     ToolOutcome,
+    ToolPolicy,
     ToolStatus,
     TurnResult,
     TurnStart,
@@ -87,6 +88,7 @@ class _ModelStep:
 
     response: ModelResponse | None = None
     failure: TurnResult | None = None
+    policy: ToolPolicy | None = None
 
 
 def _describe(exc: BaseException) -> str:
@@ -277,7 +279,12 @@ class LoopDriverImpl:
             history.append(_assistant_message(response))
             if not response.tool_calls:
                 return _result(turn, TurnStatus.COMPLETED, reply=response.content)
-            stop = await self._run_tools(turn, context, response.tool_calls, history)
+            tool_context = (
+                context
+                if step.policy is None
+                else replace(context, policy=step.policy)
+            )
+            stop = await self._run_tools(turn, tool_context, response.tool_calls, history)
             if stop is not None:
                 return stop
             # A cancel requested while tools ran must not trigger another call.
@@ -349,10 +356,14 @@ class LoopDriverImpl:
 
         stream_factory = getattr(self._adapter, "stream", None)
         if callable(stream_factory):
-            return await self._run_streaming_model(
+            step = await self._run_streaming_model(
                 turn, context, request, stream_factory
             )
-        return await self._run_blocking_model(turn, context, request)
+        else:
+            step = await self._run_blocking_model(turn, context, request)
+        if bundle.policy is not None and step.policy is None:
+            return replace(step, policy=bundle.policy)
+        return step
 
     async def _run_streaming_model(
         self,

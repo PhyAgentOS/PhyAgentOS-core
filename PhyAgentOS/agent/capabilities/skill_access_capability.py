@@ -91,6 +91,16 @@ class SkillAccessCapability:
             parts.append(documents.load_skills_for_context(always))
         return "\n\n".join(part for part in parts if part)
 
+    def has_primary_activation(self, session_id: str, turn_id: str) -> bool:
+        """Authoritative check for this turn's primary Skill activation."""
+        try:
+            return any(
+                activation.role == "primary"
+                for activation in self.activations.current(session_id, turn_id)
+            )
+        except Exception:
+            return False
+
     async def cancel(self, session_id: str, context: ExecutionContext | None) -> None:
         # Forge owns remote cancellation. Document activation has no remote effect.
         pass

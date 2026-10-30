@@ -99,9 +99,12 @@ async def test_cron_tool_add_uses_the_turn_target_and_shared_store(
     assert jobs[0].payload.message == "water the plants"
     assert jobs[0].payload.deliver is True
     assert (jobs[0].payload.channel, jobs[0].payload.to) == ("telegram", "42")
-    # The tool really was offered to the model in the Core request.
+    # The tool really was offered to the model in the Core request. Before a
+    # primary Skill activation, only read/recovery Forge tools are visible, so
+    # forge_task_create is intentionally absent at this stage.
     tool_names = {tool["function"]["name"] for tool in provider.calls[0]["tools"]}
-    assert {"cron", "message", "forge_task_create", "activate_skill"} <= tool_names
+    assert {"cron", "message", "activate_skill"} <= tool_names
+    assert "forge_task_create" not in tool_names
 
 
 async def test_cron_tool_refuses_to_schedule_inside_a_cron_turn(

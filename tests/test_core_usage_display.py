@@ -259,12 +259,13 @@ def test_context_is_exact_only_while_the_measured_request_is_the_last_event():
         payload={"model_call_id": "m1", "content": "hello", "usage": {"prompt_tokens": 500}},
     )
     assert estimate_context([request, completed], capacity=1000).exact is True
-    assert estimate_context([request, completed], capacity=1000).label() == "context 50% exact"
+    assert estimate_context([request, completed], capacity=1000).label() == "context 500/1k 50%"
 
     terminal = _event(EventType.TURN_COMPLETED, payload={"reply": "hello"})
     snapshot = estimate_context([request, completed, terminal], capacity=1000)
     assert snapshot.exact is False
-    assert snapshot.label().startswith("context ≈")
+    assert snapshot.label().startswith("context ")
+    assert "≈" in snapshot.label() and snapshot.label().endswith("%")
 
 
 def test_context_over_100_percent_is_not_clamped():
@@ -278,12 +279,14 @@ def test_context_over_100_percent_is_not_clamped():
     )
     snapshot = estimate_context([request], capacity=100)
     assert snapshot.percent is not None and snapshot.percent > 100
-    assert "%" in snapshot.label() and "100" not in snapshot.label().split("%")[0][-3:]
+    label = snapshot.label()
+    assert "≈" in label and "%" in label
+    assert int(label.rsplit("≈", 1)[-1].split("%")[0]) > 100
 
 
 def test_context_capacity_unknown_prints_double_dash():
-    assert ContextSnapshot(tokens=None, capacity=None).label() == "context --%"
-    assert ContextSnapshot(tokens=10, capacity=None).label() == "context --%"
+    assert ContextSnapshot(tokens=None, capacity=None).label() == "context --"
+    assert ContextSnapshot(tokens=10, capacity=None).label() == "context 10/--"
 
 
 async def test_reload_from_the_store_keeps_cumulative_usage(tmp_path):

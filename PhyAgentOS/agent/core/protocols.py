@@ -46,12 +46,16 @@ ordering rules are what make a crashed turn recoverable: ``append`` assigns
 appended before the session is served as recovered. The store also answers
 one derived read, ``read_conversation``: a read-only projection of completed
 turns for the runtime to hand to the loop driver. There is no other
-conversation state in the core.
+conversation state in the core. A store may additionally implement
+``read_startup_snapshot`` (see :class:`StartupSnapshotStore`) to return the
+recovery report and that projection from one consistent read; the runtime uses
+it when present and otherwise keeps the explicit recover-then-read pair.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from .events import RecoveryReport, RuntimeEvent
@@ -78,9 +82,53 @@ __all__ = [
     "ModelAdapter",
     "PromptAssembler",
     "SessionStore",
+    "SessionSnapshot",
+    "StartupSnapshotStore",
     "StreamingModelAdapter",
     "ToolExecutor",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSnapshot:
+    """One consistent startup read: recovery plus the next turn's history.
+
+    ``recovery`` is the report the runtime would otherwise get from
+    :meth:`SessionStore.recover`, and ``conversation`` is the projection
+    :meth:`SessionStore.read_conversation` would return. Both come from the
+    same stored view, so a turn cannot read a conversation older than the
+    recovery it just performed.
+    """
+
+    recovery: RecoveryReport
+    conversation: tuple[Mapping[str, Any], ...]
+    head_sequence: int | None = None
+
+
+@runtime_checkable
+class StartupSnapshotStore(Protocol):
+    """Optional ``SessionStore`` extension for one-read turn startup.
+
+    Implementations may return both values from one consistent read. The
+    runtime uses it when present and otherwise falls back to ``recover`` plus
+    ``read_conversation``, so a store that only implements ``SessionStore``
+    keeps working unchanged. ``head_sequence`` is the session head the report
+    was folded at; the runtime uses it to close unfinished turns conditionally.
+    The returned conversation must reflect work visible at the same read,
+    including a checkpoint that covers it; an implementation that caches across
+    calls must invalidate on a changed head sequence and on a changed checkpoint
+    identity, including another process's append.
+    """
+
+    async def read_startup_snapshot(self, session_id: str) -> SessionSnapshot: ...
+
+    async def append_recovery(
+        self,
+        session_id: str,
+        events: Sequence[RuntimeEvent],
+        *,
+        expected_head: int,
+    ) -> tuple[RuntimeEvent, ...] | None: ...
 
 
 @runtime_checkable

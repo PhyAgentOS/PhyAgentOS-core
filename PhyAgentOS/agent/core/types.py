@@ -782,10 +782,13 @@ class PromptBundle:
 
     messages: tuple[Mapping[str, Any], ...]
     tools: tuple[ToolDefinition, ...] = ()
+    policy: ToolPolicy | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "messages", _freeze_messages(self.messages))
         object.__setattr__(self, "tools", _freeze_tools(self.tools))
+        if self.policy is not None and not isinstance(self.policy, ToolPolicy):
+            raise TypeError("policy must be a ToolPolicy or None")
 
     def to_messages(self) -> list[dict[str, Any]]:
         return [copy.deepcopy(dict(message)) for message in self.messages]

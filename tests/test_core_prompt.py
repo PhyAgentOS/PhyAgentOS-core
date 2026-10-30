@@ -275,5 +275,7 @@ def test_module_imports_only_core_types() -> None:
         elif isinstance(node, ast.ImportFrom):
             imports.add("." * node.level + (node.module or ""))
 
-    unexpected = imports - {"__future__", "copy", "collections.abc", "typing", ".types"}
+    unexpected = imports - {
+        "__future__", "copy", "hashlib", "json", "collections.abc", "typing", ".types"
+    }
     assert unexpected == set()

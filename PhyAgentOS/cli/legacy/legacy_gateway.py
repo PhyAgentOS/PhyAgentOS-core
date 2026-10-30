@@ -14,6 +14,7 @@ from rich.console import Console
 
 from PhyAgentOS import __logo__
 from PhyAgentOS.config.paths import get_cron_dir
+from PhyAgentOS.config.schema import DEFAULT_CONTEXT_WINDOW_TOKENS
 from PhyAgentOS.utils.helpers import sync_workspace_templates
 
 from ..command_groups.gateway_commands import _deliver_cron_response
@@ -100,7 +101,9 @@ def run_gateway(
         workspace=config_obj.workspace_path,
         model=config_obj.agents.defaults.model,
         max_iterations=config_obj.agents.defaults.max_tool_iterations,
-        context_window_tokens=config_obj.agents.defaults.context_window_tokens,
+        context_window_tokens=(
+            config_obj.agents.defaults.context_window_tokens or DEFAULT_CONTEXT_WINDOW_TOKENS
+        ),
         max_concurrent_turns=config_obj.agents.defaults.max_concurrent_turns,
         per_session_queue_limit=config_obj.agents.defaults.per_session_queue_limit,
         brave_api_key=config_obj.tools.web.search.api_key or None,

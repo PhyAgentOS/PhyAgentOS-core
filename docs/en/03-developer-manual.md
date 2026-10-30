@@ -333,11 +333,47 @@ total. `total_tokens` uses the provider value when present and otherwise prompt 
 The cache hit ratio is shown only when every counted call reports both prompt and cached tokens.
 `estimate_context()` starts from the newest durable `request.prepared` snapshot, adds assistant and
 tool messages after it, and marks the number `exact` only while the provider-reported prompt size
-still describes the unchanged request. Its capacity is the effective window: the smaller of the
-configured `context_window_tokens` and the known model capacity. Model rounds count provider calls,
-not internal reasoning steps, and no reasoning step count is fabricated. The session cumulative
+still describes the unchanged request. `ProviderService.resolve` composes the effective window:
+reliable model metadata wins unless an explicit `context_window_tokens` cap is smaller; unknown
+metadata uses an explicit cap when present; only when there is neither reliable metadata nor an
+explicit cap does it use the documented 65,536 fallback and record source `fallback`. The raw model
+value and the effective guard stay separate. Model rounds count provider calls, not internal reasoning steps,
+and no reasoning step count is fabricated. The session cumulative
 line is rebuilt from stored events, so it survives a reload. The footer is a terminal rendering
 only; it is never inserted into the message history sent to a provider.
+
+### Prompt projection, tool staging and startup read
+
+Three request-only projections run before a prompt is sent; durable events are never rewritten.
+
+- `project_skill_documents()` keys Skill results by `(skill name, exact content sha256)`. One full
+  document per version stays in the request; older copies keep activation metadata, content hash,
+  character count and an omission marker. A very short body stays duplicated when collapsing would
+  save fewer than 128 characters. A compact summary is not a document copy: the projection only
+  deduplicates full texts already in history. A later `activate_skill` re-authorizes the turn and
+  returns the full body; it does not read a local file automatically after compaction. Tool-call ids
+  and message order are untouched.
+- `project_forge_tool_results()` only deduplicates **identical successful** Forge read results,
+  keeping the newest full result and replacing older copies with a hash/reference marker. The
+  marker carries no old notes. Collapse only when the serialized result saves at least 128
+  characters; short results stay verbatim. Errors, unknown/running/accepted/pending results,
+  non-JSON text and non-success payloads are left intact; a non-terminal `phase`/`cancel_status`
+  is never treated as success for deduplication. The
+  protected fields include task/invocation/action/session id, status, evidence, image/artifact
+  references and unknown semantics.
+- `PromptAssemblerImpl` accepts a `ToolVisibility` hook. `composition.py` wires Forge tool stages:
+  before a primary Skill activation only read/cancel tools are visible; after activation task
+  creation tools become visible; registration itself is unchanged. `phase`-gated hiding must never
+  remove a tool from the registered catalog.
+- `SQLiteSessionStore.read_startup_snapshot()` reads recovery and conversation in one SQLite read
+  transaction. It falls back to `recover()` plus `read_conversation()` for stores or subclasses that
+  override recovery. `SessionSnapshot` keeps both values from the same view. If four consecutive
+  CAS attempts lose to a busy writer, the turn fails closed with `RuntimeStorageError`; it does not
+  open a new turn or continue with a recovery history that may be stale. Without a lease, an active
+  writer can still race a read; the guarantee is no incomplete history is accepted, not exclusion.
+- `utils/helpers.py` caches prompt estimates by content hash in bounded maps; tokenizer reload and
+  `clear_prompt_estimate_cache()` drop those entries, so an edited System/tool/message body cannot
+  reuse a stale count. Cache entries are estimates, never provider billing.
 
 ### Streaming contract
 

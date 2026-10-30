@@ -421,14 +421,53 @@ class LiteLLMProvider(LLMProvider):
         return self.default_model
 
     def get_context_window(self, model: str | None = None) -> int | None:
-        """Read the model's input window from LiteLLM's model metadata."""
-        target = model or self.default_model
-        try:
-            info = litellm.get_model_info(target)
-        except Exception:
+        """Return an exact catalog window for this provider, or ``None``.
+
+        Only a local catalog entry counts: the key must equal the model (or the
+        provider-scoped model) exactly and the entry must name the same
+        provider. A leading prefix is removed only when it is exactly this
+        provider's own name/prefix; any other prefix stays part of the key, so
+        an alias or another provider's model cannot borrow a window. Similar
+        names and suffixes are never matched. Gateways, local deployments and
+        direct endpoints return ``None`` because their real limit is not in the
+        catalog. This performs no API request and never probes the endpoint.
+        """
+        target = (model or self.default_model or "").strip()
+        if not target:
             return None
-        for key in ("max_input_tokens", "max_tokens"):
-            value = info.get(key) if isinstance(info, dict) else None
-            if isinstance(value, int) and value > 0:
+        spec = self._spec
+        if self._gateway is not None or spec is None:
+            return None
+        if spec.is_gateway or spec.is_local or spec.is_direct:
+            return None
+        owners = {spec.name}
+        prefix = spec.litellm_prefix or spec.name
+        owners.add(prefix)
+
+        def normalized(value: str) -> str:
+            return value.lower().replace("-", "_")
+
+        bare = target
+        head, separator, rest = target.partition("/")
+        if separator and rest and normalized(head) in {
+            normalized(spec.name),
+            normalized(prefix),
+        }:
+            # Strip this provider's own prefix exactly once. Any other prefix
+            # (a gateway alias, another vendor) is left intact and misses.
+            bare = rest
+
+        candidates = [bare]
+        scoped = f"{prefix}/{bare}"
+        if scoped != bare:
+            candidates.append(scoped)
+        for key in candidates:
+            entry = litellm.model_cost.get(key)
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("litellm_provider") not in owners:
+                continue
+            value = entry.get("max_input_tokens")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 return value
         return None

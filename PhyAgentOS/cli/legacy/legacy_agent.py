@@ -13,6 +13,7 @@ from rich.text import Text
 from PhyAgentOS import __logo__
 from PhyAgentOS.agent.bootstrap import build_forge_components
 from PhyAgentOS.bus.agent_events import AgentEventType
+from PhyAgentOS.config.schema import DEFAULT_CONTEXT_WINDOW_TOKENS
 from PhyAgentOS.utils.helpers import sync_workspace_templates
 
 from ..configuration import (
@@ -458,7 +459,9 @@ def agent(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
+        context_window_tokens=(
+            config.agents.defaults.context_window_tokens or DEFAULT_CONTEXT_WINDOW_TOKENS
+        ),
         max_concurrent_turns=config.agents.defaults.max_concurrent_turns,
         per_session_queue_limit=config.agents.defaults.per_session_queue_limit,
         brave_api_key=config.tools.web.search.api_key or None,

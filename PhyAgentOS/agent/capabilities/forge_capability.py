@@ -28,7 +28,7 @@ Outcome rules:
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from PhyAgentOS.agent.core.types import (
@@ -456,6 +456,17 @@ def _outcome(
     return _outcome_for_success(call, data, arguments)
 
 
+_STAGE_HIDE_BEFORE_ACTIVATION = frozenset(
+    {"forge_task_create", "forge_task_begin_revision", "forge_task_finalize",
+     "forge_tool_start_action", "forge_tool_start_session"}
+)
+_STAGE_HIDE_BEFORE_TASK = frozenset(
+    {"forge_task_begin_revision", "forge_task_finalize",
+     "forge_tool_start_action", "forge_tool_start_session"}
+)
+_TERMINAL_TASK_VALUES = frozenset({"succeeded", "failed", "cancelled"})
+
+
 class ForgeCapability:
     """Expose the Forge AgentTask and Tool API groups to the agent core.
 
@@ -473,6 +484,7 @@ class ForgeCapability:
     ) -> None:
         self._coordinator = coordinator
         self._client = client
+        self._stage_resolver: Callable[[ExecutionContext], str] | None = None
         registrations: list[ToolRegistration] = [
             ToolRegistration(
                 definition=definition,
@@ -497,8 +509,53 @@ class ForgeCapability:
     def tool_registrations(self) -> tuple[ToolRegistration, ...]:
         return self._registrations
 
+    def set_stage_resolver(self, resolver: Callable[[ExecutionContext], str] | None) -> None:
+        """Install the entry's authoritative stage resolver.
+
+        The resolver returns ``"none"`` (no primary activation), ``"activated"``
+        or ``"task"`` (an AgentTask exists for this session). Leaving it unset
+        keeps every Forge tool visible, which is the pre-existing behaviour for
+        entries that do not wire Skill activation.
+        """
+        self._stage_resolver = resolver
+
+    def stage(self, context: ExecutionContext) -> str:
+        if self._stage_resolver is None:
+            return "task"
+        return self._stage_resolver(context)
+
+    def hidden_tools(self, context: ExecutionContext) -> frozenset[str]:
+        """Forge tool names the current stage must not show.
+
+        Recovery tools (get/status/result/cancel) are never hidden. Without a
+        primary activation only ``forge_task_create`` and the mutating task /
+        action tools are hidden; before any AgentTask exists, the mutating task
+        and action tools stay hidden but every read/query tool remains.
+        """
+        stage = self.stage(context)
+        if stage == "task":
+            return frozenset()
+        if stage == "activated":
+            return _STAGE_HIDE_BEFORE_TASK
+        return _STAGE_HIDE_BEFORE_ACTIVATION
+
+    def _stage_blocked(self, call: ToolCall, context: ExecutionContext) -> ToolOutcome | None:
+        if call.name not in self.hidden_tools(context):
+            return None
+        return _failed_outcome(
+            call,
+            "tool_stage_blocked",
+            "Tool is not available at this stage. Activate a primary Skill first; "
+            "mutating action tools additionally need an existing AgentTask. "
+            "Read-only context/query/status/get/cancel tools remain available.",
+            status=ToolStatus.REJECTED,
+        )
+
     def _task_handler(self, name: str):
         async def handle(call: ToolCall, context: ExecutionContext) -> ToolOutcome:
+            blocked = self._stage_blocked(call, context)
+            if blocked is not None:
+                return blocked
             arguments = call.arguments_dict()
             # Session identity is explicit on this path and cannot come from
             # the model's arguments.
@@ -528,6 +585,9 @@ class ForgeCapability:
 
     def _tool_api_handler(self, name: str):
         async def handle(call: ToolCall, context: ExecutionContext) -> ToolOutcome:
+            blocked = self._stage_blocked(call, context)
+            if blocked is not None:
+                return blocked
             arguments = call.arguments_dict()
             assert self._client is not None
             payload = await execute_tool_api_tool(
@@ -536,6 +596,14 @@ class ForgeCapability:
             return _outcome(call, payload, arguments)
 
         return handle
+
+    def has_active_task(self, session_id: str) -> bool:
+        """Authoritative check: does this session own a non-terminal AgentTask?"""
+        record = self._coordinator.store.latest_for_session(session_id)
+        if record is None:
+            return False
+        status = getattr(record.status, "value", str(record.status))
+        return status not in _TERMINAL_TASK_VALUES
 
     def prompt_context(self, context: ExecutionContext) -> str | None:
         """Return live Forge state for this step: local task and global blockers.

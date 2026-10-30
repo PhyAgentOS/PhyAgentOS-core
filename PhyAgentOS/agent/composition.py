@@ -30,10 +30,12 @@ from PhyAgentOS.forge.task import AgentTaskCoordinator
 from PhyAgentOS.forge.tool_client import ForgeToolClient
 
 from .capabilities.forge_capability import ForgeCapability
+from .capabilities.skill_access_capability import SkillAccessCapability
 from .core import (
     AgentHostImpl,
     AgentRuntimeImpl,
     Capability,
+    ExecutionContext,
     LoopDriverImpl,
     ModelAdapterImpl,
     PromptAssemblerImpl,
@@ -98,6 +100,20 @@ def compose_agent(
     capability = forge_capability or ForgeCapability(coordinator, client=client)
     capabilities: tuple[Capability, ...] = (*additional_capabilities, capability)
 
+    skill_capability = next(
+        (item for item in additional_capabilities if isinstance(item, SkillAccessCapability)),
+        None,
+    )
+    hidden_tools = None
+    if skill_capability is not None and isinstance(capability, ForgeCapability):
+        def _stage(context: ExecutionContext) -> str:
+            if not skill_capability.has_primary_activation(context.session_id, context.turn_id):
+                return "none"
+            return "task" if capability.has_active_task(context.session_id) else "activated"
+
+        capability.set_stage_resolver(_stage)
+        hidden_tools = capability.hidden_tools
+
     registrations = tuple(
         registration
         for item in capabilities
@@ -110,6 +126,7 @@ def compose_agent(
     assembler = PromptAssemblerImpl(
         system_instructions,
         fragments=tuple(item.prompt_context for item in capabilities),
+        hidden_tools=hidden_tools,
     )
     adapter = ModelAdapterImpl(provider, stream=stream)
     executor = ToolExecutorImpl(registrations, store)
