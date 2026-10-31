@@ -26,10 +26,11 @@ Important boundaries:
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..core import (
@@ -41,19 +42,30 @@ from ..core import (
     ToolRegistration,
     ToolStatus,
 )
-from ..services.subagent_runtime import CoreSubagent, SubagentOutcome
+from ..services.subagent_runtime import (
+    CoreSubagent,
+    SubagentOutcome,
+    child_tool_is_allowed,
+)
 
 if TYPE_CHECKING:
     from ...config.schema import Config
     from ...providers.service import RuntimeSelection
 
-__all__ = ["ChildResult", "SpawnCapability", "SPAWN_TOOL"]
+__all__ = [
+    "ChildResult",
+    "SpawnCapability",
+    "SPAWN_TOOL",
+    "SUBAGENT_CANCEL_TOOL",
+    "SUBAGENT_STATUS_TOOL",
+]
 
 SPAWN_TOOL = ToolDefinition(
     name="spawn",
     description=(
-        "Spawn a subagent to handle a task in the background. "
-        "Use this for complex or time-consuming tasks that can run independently. "
+        "Spawn a subagent to handle a task in the background, or continue a "
+        "finished child of this same parent by passing its child_session_id. "
+        "A continuation reuses the child's stored conversation history. "
         "The subagent will complete the task and report back when done."
     ),
     parameters={
@@ -61,20 +73,87 @@ SPAWN_TOOL = ToolDefinition(
         "properties": {
             "task": {
                 "type": "string",
-                "description": "The task for the subagent to complete",
+                "description": (
+                    "The task for a new subagent, or the follow-up instruction "
+                    "when child_session_id is given"
+                ),
             },
             "label": {
                 "type": "string",
                 "description": "Optional short label for the task (for display)",
+            },
+            "child_session_id": {
+                "type": "string",
+                "description": (
+                    "Continue this parent's already finished child session. "
+                    "A running child cannot be replaced. Omit to start a new child."
+                ),
+            },
+            "role": {
+                "type": "string",
+                "description": (
+                    "Optional short role text for the child prompt. It never "
+                    "changes the provider, model, or tool permissions."
+                ),
+            },
+            "tool_allowlist": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional subset of the general tools the child may use. "
+                    "It can only narrow the tools already allowed; it cannot add "
+                    "spawn, Forge, or any other tool."
+                ),
             },
         },
         "required": ["task"],
     },
 )
 
+SUBAGENT_STATUS_TOOL = ToolDefinition(
+    name="subagent_status",
+    description=(
+        "Return the current state and last result of one of this session's own "
+        "child sessions. A running child is reported as running, never complete. "
+        "Another parent's child is rejected."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "child_session_id": {
+                "type": "string",
+                "description": "Child session id returned by spawn.",
+            },
+        },
+        "required": ["child_session_id"],
+    },
+)
+
+SUBAGENT_CANCEL_TOOL = ToolDefinition(
+    name="subagent_cancel",
+    description=(
+        "Stop one running child of this session and return its settled status. "
+        "This is a local stop only; it does not claim remote work stopped. "
+        "Another parent's child is rejected."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "child_session_id": {
+                "type": "string",
+                "description": "Child session id returned by spawn.",
+            },
+        },
+        "required": ["child_session_id"],
+    },
+)
+
 _Notify = Callable[[str, str, str], Awaitable[None]]
 _NotifyFactory = Callable[[ExecutionContext], _Notify | None]
+_UsageObserver = Callable[[str, str, Mapping[str, int]], None]
+_BudgetGuard = Callable[[str, str], bool]
 _RESULT_HISTORY = 256
+_CHILD_STATE_HISTORY = 512
 _PROMPT_RESULT_LIMIT = 5
 _PROMPT_RESULT_CHARS = 240
 _PROMPT_TEXT_CHARS = 1400
@@ -104,6 +183,23 @@ class ChildResult:
     unknown_work: bool
     notified: bool
     notify_error: str | None
+    usage: Mapping[str, int] = field(default_factory=dict)
+    usage_observer_error: str | None = None
+    run_index: int = 1
+
+
+@dataclass(slots=True)
+class _ChildState:
+    """Last known state of one child id, kept across finished runs."""
+
+    child_session_id: str
+    parent_session_id: str
+    label: str
+    task: str
+    status: str = "running"
+    run_count: int = 1
+    role: str | None = None
+    allowlist: frozenset[str] | None = None
 
 
 @dataclass(slots=True)
@@ -111,6 +207,7 @@ class _Child:
     outcome: SubagentOutcome
     runner: CoreSubagent
     callback: _Notify | None
+    state: _ChildState
     task: asyncio.Task[None] | None = None
     # Set synchronously by the owning stop path before cancellation. A child
     # that settles after this flag is set retains its result but must not
@@ -189,6 +286,9 @@ class SpawnCapability:
         notify: _Notify | None = None,
         notify_factory: _NotifyFactory | None = None,
         general_tools_factory: Callable[[Config], Any] | None = None,
+        usage_observer: _UsageObserver | None = None,
+        step_usage_observer: _UsageObserver | None = None,
+        budget_guard: _BudgetGuard | None = None,
     ) -> None:
         if not callable(provider_resolver):
             raise TypeError("provider_resolver must be callable")
@@ -198,6 +298,12 @@ class SpawnCapability:
             raise TypeError("notify_factory must be callable or None")
         if general_tools_factory is not None and not callable(general_tools_factory):
             raise TypeError("general_tools_factory must be callable or None")
+        if usage_observer is not None and not callable(usage_observer):
+            raise TypeError("usage_observer must be callable or None")
+        if step_usage_observer is not None and not callable(step_usage_observer):
+            raise TypeError("step_usage_observer must be callable or None")
+        if budget_guard is not None and not callable(budget_guard):
+            raise TypeError("budget_guard must be callable or None")
 
         defaults = config.agents.defaults
         self._config = config
@@ -206,6 +312,9 @@ class SpawnCapability:
         self._notify = notify
         self._notify_factory = notify_factory
         self._general_tools_factory = general_tools_factory
+        self._usage_observer = usage_observer
+        self._step_usage_observer = step_usage_observer
+        self._budget_guard = budget_guard
 
         self._max_parallel = max(1, int(defaults.max_concurrent_turns))
         self._queue_limit = max(0, int(defaults.per_session_queue_limit))
@@ -219,6 +328,8 @@ class SpawnCapability:
         self._outstanding: dict[str, _Child] = {}
         self._parent_counts: dict[str, int] = {}
         self._results: deque[ChildResult] = deque(maxlen=_RESULT_HISTORY)
+        self._child_states: dict[str, _ChildState] = {}
+        self._child_order: deque[str] = deque()
         self._notifications: dict[str, asyncio.Task[None]] = {}
         self._general_tools: Any | None = None
         self._closed = False
@@ -228,7 +339,18 @@ class SpawnCapability:
         return "spawn"
 
     def tool_registrations(self) -> tuple[ToolRegistration, ...]:
-        return (ToolRegistration(definition=SPAWN_TOOL, handler=self._handle),)
+        return (
+            ToolRegistration(definition=SPAWN_TOOL, handler=self._dispatch),
+            ToolRegistration(
+                definition=SUBAGENT_STATUS_TOOL,
+                handler=self._handle_status,
+                parallel_safe=True,
+            ),
+            ToolRegistration(
+                definition=SUBAGENT_CANCEL_TOOL,
+                handler=self._handle_cancel,
+            ),
+        )
 
     def prompt_context(self, context: ExecutionContext) -> str | None:
         """Return this parent's settled child outputs as untrusted evidence.
@@ -375,7 +497,16 @@ class SpawnCapability:
             self._general_tools = factory(self._config)
         return self._general_tools
 
-    async def _handle(
+    async def _dispatch(
+        self, call: ToolCall, context: ExecutionContext
+    ) -> ToolOutcome:
+        if call.name == "subagent_status":
+            return await self._handle_status(call, context)
+        if call.name == "subagent_cancel":
+            return await self._handle_cancel(call, context)
+        return await self._handle_spawn(call, context)
+
+    async def _handle_spawn(
         self, call: ToolCall, context: ExecutionContext
     ) -> ToolOutcome:
         arguments = call.arguments_dict()
@@ -390,6 +521,25 @@ class SpawnCapability:
             )
 
         parent_session_id = context.session_id
+        continuation_id, problem = self._continuation_id(arguments)
+        if problem is not None:
+            return self._failed(call, "spawn_child", problem)
+
+        state: _ChildState | None = None
+        if continuation_id is not None:
+            state, problem = self._own_child(
+                continuation_id, parent_session_id
+            )
+            if problem is not None:
+                return self._failed(call, "spawn_child", problem)
+            if continuation_id in self._outstanding:
+                return self._failed(
+                    call,
+                    "spawn_child",
+                    "Error: that child is still running; wait for it or cancel it "
+                    "before continuing it",
+                )
+
         limit_reason = self._limit_reason(parent_session_id)
         if limit_reason is not None:
             return self._failed(
@@ -400,7 +550,7 @@ class SpawnCapability:
 
         label = arguments.get("label")
         if not isinstance(label, str) or not label.strip():
-            label = _default_label(task)
+            label = state.label if state is not None else _default_label(task)
 
         try:
             callback = (
@@ -449,7 +599,60 @@ class SpawnCapability:
                 "Error: general tools are unavailable: " + _describe(exc),
             )
 
-        child_session_id = f"{parent_session_id}:subagent:{uuid.uuid4().hex[:12]}"
+        offered = self._offered_child_tools(general_tools)
+        previous_allowlist = state.allowlist if state is not None else None
+        problem = None
+        if "tool_allowlist" in arguments:
+            allowlist, problem = self._parse_allowlist(
+                arguments.get("tool_allowlist"), previous_allowlist, offered
+            )
+        else:
+            allowlist = previous_allowlist
+        if problem is not None:
+            return self._failed(call, "spawn_tools", problem)
+
+        if "role" in arguments:
+            role, problem = self._parse_role(arguments.get("role"))
+        else:
+            role = state.role if state is not None else None
+        if problem is not None:
+            return self._failed(call, "spawn_role", problem)
+
+        step_observer = None
+        if self._step_usage_observer is not None:
+            def step_observer(usage, _parent=parent_session_id, _turn=context.turn_id):
+                self._step_usage_observer(_parent, _turn, usage)
+
+        guard = None
+        if self._budget_guard is not None:
+            def guard(_parent=parent_session_id, _turn=context.turn_id):
+                return self._budget_guard(_parent, _turn)
+
+        child_session_id = (
+            continuation_id
+            if continuation_id is not None
+            else f"{parent_session_id}:subagent:{uuid.uuid4().hex[:12]}"
+        )
+        if state is None:
+            state = _ChildState(
+                child_session_id=child_session_id,
+                parent_session_id=parent_session_id,
+                label=label,
+                task=task,
+                status="running",
+                run_count=1,
+                role=role,
+                allowlist=allowlist,
+            )
+            self._remember_child(state)
+        else:
+            state.run_count += 1
+            state.status = "running"
+            state.label = label
+            state.task = task
+            state.role = role
+            state.allowlist = allowlist
+
         runner = CoreSubagent(
             session_id=child_session_id,
             parent_session_id=parent_session_id,
@@ -463,6 +666,12 @@ class SpawnCapability:
             max_steps=self._max_steps,
             temperature=self._temperature,
             max_tokens=self._max_tokens,
+            role=role,
+            tool_allowlist=allowlist,
+            budget_guard=guard,
+            step_usage_observer=step_observer,
+            performance=self._config.agents.defaults.performance,
+            context_window_cap=self._config.agents.defaults.context_window_tokens,
         )
         outcome = SubagentOutcome(
             session_id=child_session_id,
@@ -473,7 +682,9 @@ class SpawnCapability:
             task=task,
             status="cancelled",
         )
-        record = _Child(outcome=outcome, runner=runner, callback=callback)
+        record = _Child(
+            outcome=outcome, runner=runner, callback=callback, state=state
+        )
 
         self._outstanding[child_session_id] = record
         self._parent_counts[parent_session_id] = (
@@ -496,16 +707,18 @@ class SpawnCapability:
         )
 
         short_id = child_session_id.rsplit(":", 1)[-1]
+        continued = continuation_id is not None
+        action = "continued" if continued else "started"
         if callback is None:
             text = (
-                f"Subagent [{label}] started (id: {short_id}). "
+                f"Subagent [{label}] {action} (id: {short_id}). "
                 "No live completion callback is configured; the result will be "
                 f"stored in child session {child_session_id}."
             )
         else:
             text = (
-                f"Subagent [{label}] started (id: {short_id}). "
-                "I'll notify you when it completes."
+                f"Subagent [{label}] {action} (id: {short_id}). "
+                "I'll notify you when this run completes."
             )
         return ToolOutcome(
             tool_call_id=call.tool_call_id,
@@ -518,8 +731,231 @@ class SpawnCapability:
                 "label": label,
                 "parent_session_id": parent_session_id,
                 "parent_turn_id": context.turn_id,
+                "continued": continued,
+                "run_index": state.run_count,
             },
         )
+
+    async def _handle_status(
+        self, call: ToolCall, context: ExecutionContext
+    ) -> ToolOutcome:
+        arguments = call.arguments_dict()
+        child_id = arguments.get("child_session_id")
+        if not isinstance(child_id, str) or not child_id.strip():
+            return self._failed(
+                call,
+                "subagent_status",
+                "Error: subagent_status requires a child_session_id",
+            )
+        state, problem = self._own_child(child_id, context.session_id)
+        if problem is not None:
+            return self._failed(call, "subagent_status", problem)
+
+        active = self._outstanding.get(child_id)
+        if active is not None:
+            return self._json_outcome(
+                call,
+                {
+                    "child_session_id": child_id,
+                    "status": "running",
+                    "running": True,
+                    "label": state.label,
+                    "task": state.task,
+                    "run_index": state.run_count,
+                    "message": (
+                        "The child is still running; no result is available yet."
+                    ),
+                },
+            )
+
+        result = self._latest_result(child_id)
+        if result is None:
+            return self._json_outcome(
+                call,
+                {
+                    "child_session_id": child_id,
+                    "status": state.status,
+                    "running": False,
+                    "label": state.label,
+                    "task": state.task,
+                    "run_index": state.run_count,
+                    "message": "No retained result is available for this child.",
+                },
+            )
+        return self._json_outcome(
+            call,
+            {
+                "child_session_id": child_id,
+                "status": result.status,
+                "running": False,
+                "label": result.label,
+                "task": result.task,
+                "run_index": result.run_index,
+                "turn_id": result.turn_id,
+                "reply": result.reply,
+                "child_error": result.error,
+                "report": result.report_text,
+                "notified": result.notified,
+                "usage": dict(result.usage),
+            },
+        )
+
+    async def _handle_cancel(
+        self, call: ToolCall, context: ExecutionContext
+    ) -> ToolOutcome:
+        arguments = call.arguments_dict()
+        child_id = arguments.get("child_session_id")
+        if not isinstance(child_id, str) or not child_id.strip():
+            return self._failed(
+                call,
+                "subagent_cancel",
+                "Error: subagent_cancel requires a child_session_id",
+            )
+        state, problem = self._own_child(child_id, context.session_id)
+        if problem is not None:
+            return self._failed(call, "subagent_cancel", problem)
+
+        active = self._outstanding.get(child_id)
+        if active is None:
+            result = self._latest_result(child_id)
+            return self._json_outcome(
+                call,
+                {
+                    "child_session_id": child_id,
+                    "status": result.status if result is not None else state.status,
+                    "running": False,
+                    "message": "The child already finished; nothing was stopped.",
+                },
+            )
+
+        await self._stop_child(active)
+        result = self._latest_result(child_id)
+        return self._json_outcome(
+            call,
+            {
+                "child_session_id": child_id,
+                "status": result.status if result is not None else "interrupted",
+                "running": False,
+                "notified": result.notified if result is not None else False,
+                "message": (
+                    "Local stop only; this does not claim any remote work stopped."
+                ),
+            },
+        )
+
+    @staticmethod
+    def _json_outcome(call: ToolCall, data: dict[str, Any]) -> ToolOutcome:
+        return ToolOutcome(
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            status=ToolStatus.SUCCEEDED,
+            text=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _continuation_id(
+        self, arguments: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        child = arguments.get("child_session_id")
+        legacy = arguments.get("session_id")
+        if child is not None and legacy is not None and child != legacy:
+            return None, (
+                "Error: child_session_id and session_id name different children"
+            )
+        value = child if child is not None else legacy
+        if value is None:
+            return None, None
+        if not isinstance(value, str) or not value.strip():
+            return None, "Error: child_session_id must be a non-empty string"
+        return value, None
+
+    def _own_child(
+        self, child_id: str, parent_session_id: str
+    ) -> tuple[_ChildState, str | None]:
+        state = self._child_states.get(child_id)
+        if state is None:
+            return (
+                _ChildState(child_id, parent_session_id, "", ""),
+                "Error: no such child session for this parent",
+            )
+        if state.parent_session_id != parent_session_id:
+            return (
+                _ChildState(child_id, parent_session_id, "", ""),
+                "Error: that child session does not belong to this parent",
+            )
+        return state, None
+
+    def _latest_result(self, child_id: str) -> ChildResult | None:
+        for result in reversed(self._results):
+            if result.child_session_id == child_id:
+                return result
+        return None
+
+    @staticmethod
+    def _offered_child_tools(general_tools: Any) -> frozenset[str]:
+        return frozenset(
+            registration.definition.name
+            for registration in general_tools.tool_registrations()
+            if child_tool_is_allowed(registration.definition.name, None)
+        )
+
+    @staticmethod
+    def _parse_role(value: Any) -> tuple[str | None, str | None]:
+        if value is None:
+            return None, None
+        if not isinstance(value, str):
+            return None, "Error: role must be a string"
+        role = value.strip()
+        if not role:
+            return None, None
+        if len(role) > 500:
+            return None, "Error: role must be at most 500 characters"
+        return role, None
+
+    @staticmethod
+    def _parse_allowlist(
+        value: Any,
+        previous: frozenset[str] | None,
+        offered: frozenset[str],
+    ) -> tuple[frozenset[str] | None, str | None]:
+        if value is None:
+            return previous, None
+        if not isinstance(value, (list, tuple)):
+            return None, "Error: tool_allowlist must be an array of tool names"
+        names: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                return None, (
+                    "Error: tool_allowlist entries must be non-empty strings"
+                )
+            if not child_tool_is_allowed(item, None):
+                return None, (
+                    f"Error: tool {item!r} is never allowed for a subagent"
+                )
+            if item not in offered:
+                return None, (
+                    f"Error: tool {item!r} is not offered by the child general tools"
+                )
+            names.append(item)
+        narrowed = frozenset(names)
+        if previous is not None and not narrowed <= previous:
+            return None, (
+                "Error: a continuation tool_allowlist can only narrow the "
+                "previous child allowlist"
+            )
+        return narrowed, None
+
+    def _remember_child(self, state: _ChildState) -> None:
+        self._child_states[state.child_session_id] = state
+        self._child_order.append(state.child_session_id)
+        while len(self._child_states) > _CHILD_STATE_HISTORY:
+            for child_id in self._child_order:
+                candidate = self._child_states.get(child_id)
+                if candidate is not None and child_id not in self._outstanding:
+                    self._child_order.remove(child_id)
+                    del self._child_states[child_id]
+                    break
+            else:
+                return
 
     def _limit_reason(self, parent_session_id: str) -> str | None:
         if len(self._outstanding) >= self._max_outstanding:
@@ -577,7 +1013,23 @@ class SpawnCapability:
         The notification runs in its own task; capacity shutdown cancels it,
         which marks ``notify_error`` instead of hanging the child task.
         """
-        result = self._to_result(outcome, notified=False, notify_error=None)
+        result = self._to_result(
+            outcome,
+            notified=False,
+            notify_error=None,
+            run_index=record.state.run_count,
+        )
+        record.state.status = outcome.status
+        observer = self._usage_observer
+        if observer is not None:
+            try:
+                observer(
+                    outcome.parent_session_id,
+                    outcome.parent_turn_id,
+                    dict(outcome.usage),
+                )
+            except Exception as exc:  # noqa: BLE001 - never loses the result
+                result.usage_observer_error = _describe(exc)
         self._results.append(result)
         callback = record.callback
         if callback is None:
@@ -622,6 +1074,7 @@ class SpawnCapability:
         *,
         notified: bool,
         notify_error: str | None,
+        run_index: int,
     ) -> ChildResult:
         return ChildResult(
             child_session_id=outcome.session_id,
@@ -637,6 +1090,8 @@ class SpawnCapability:
             unknown_work=outcome.unknown_work,
             notified=notified,
             notify_error=notify_error,
+            usage=dict(outcome.usage),
+            run_index=run_index,
         )
 
     def _cancel_notifications(self, child_session_id: str | None = None) -> None:

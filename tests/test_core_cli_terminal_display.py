@@ -11,9 +11,9 @@ import asyncio
 import re
 import sys
 from io import StringIO
+from types import SimpleNamespace
 
 import pytest
-from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import create_app_session
 from prompt_toolkit.data_structures import Size
@@ -29,7 +29,11 @@ from PhyAgentOS.agent.core.events import EventType, RuntimeEvent
 from PhyAgentOS.agent.core.types import TurnResult, TurnStatus
 from PhyAgentOS.cli.interaction import terminal_input as terminal_input_module
 from PhyAgentOS.cli.interaction.interactive_session import InteractiveAgent
-from PhyAgentOS.cli.interaction.terminal_display import TerminalDisplay, safe_detail
+from PhyAgentOS.cli.interaction.terminal_display import (
+    REQUEST_PROMPT,
+    TerminalDisplay,
+    safe_detail,
+)
 from PhyAgentOS.cli.interaction.terminal_input import TerminalInput
 
 _TURN_SCOPE = {
@@ -112,7 +116,7 @@ def test_spinner_appears_switches_and_clears():
     assert display.phase == "idle"
     assert display.render_lines(width=80, rows=24) == []
     assert "session s · openai/gpt-5" in _prompt_text(display)
-    assert "You:" in _prompt_text(display)
+    assert "│" in _prompt_text(display)
 
     display.begin_turn()
     first = display.render_lines(width=80, rows=24)[0]
@@ -142,7 +146,7 @@ def test_spinner_appears_switches_and_clears():
     assert display.phase == "idle"
     assert display.render_lines(width=80, rows=24) == []
     assert "session s · openai/gpt-5" in _prompt_text(display)
-    assert "You:" in _prompt_text(display)
+    assert "│" in _prompt_text(display)
     display.end_turn()  # idempotent cleanup must not print another summary
 
 
@@ -272,8 +276,36 @@ def test_toolbar_fits_narrow_and_short_terminals(columns, rows):
         assert f"{hidden} hidden" in lines[1]
     tool_rows = [line for line in lines if line.startswith("| ")]
     assert len(tool_rows) <= limit + 1
-    fragments = display.toolbar()
-    assert max(len(text.rstrip("\n")) for _, text in fragments) <= columns
+    message = display.prompt_message()
+    assert any("5 calls" in text for _, text in message)
+    # The live rows are in the prompt message right above the session line,
+    # not in a terminal-anchored bottom toolbar.
+    assert message[-1][1].rstrip("\n").startswith("session s")
+
+
+def test_prompt_message_keeps_live_rows_directly_above_the_session_line():
+    display, _ = _display(live=True)
+    display.begin_turn()
+    display.note_event(_event(EventType.TURN_STARTED))
+    _tool(display, "turn", "c1", "first_tool", "succeeded")
+    _tool(display, "turn", "c2", "second_tool", "succeeded")
+
+    texts = [text.rstrip("\n") for _, text in display.prompt_message()]
+    # Status, hidden-count header and the limited tool rows all precede the
+    # session line, which stays directly above the input line.
+    assert texts[-1].startswith("session s")
+    assert not texts[-1].endswith(REQUEST_PROMPT)
+    dynamic = texts[:-1]
+    assert any(text.startswith("| ") for text in dynamic)
+    assert len(dynamic) >= 3
+
+    display.end_turn()
+    texts = [text.rstrip("\n") for _, text in display.prompt_message()]
+    # Ending the turn shrinks the area back to the session line and the next
+    # request marker; no stale status or tool rows remain.
+    assert texts[-1].rstrip() == REQUEST_PROMPT.rstrip()
+    assert texts[0].startswith("session s")
+    assert all("calls" not in text and "Thinking" not in text for text in texts)
 
 
 def test_plain_fallback_uses_lines_without_cursor_or_animation_codes():
@@ -299,15 +331,6 @@ class _TerminalOutput(Vt100_Output):
 
     def get_rows_below_cursor_position(self) -> int:
         return self.get_size().rows
-
-
-def _prompt_session(pipe, output, display):
-    return PromptSession(
-        input=pipe,
-        output=output,
-        bottom_toolbar=display.toolbar,
-        refresh_interval=0.1,
-    )
 
 
 async def _wait(seconds: float = 0.25) -> None:
@@ -395,7 +418,7 @@ async def test_pause_ends_prompt_menu_cancel_is_contained_and_resume_reads_again
         def result(self, result):
             displayed.append(result.turn_id)
 
-        def turn_started(self, session_id=None):
+        def turn_started(self, session_id=None, request_text=None):
             displayed.append("started")
 
         def turn_finished(self):
@@ -498,9 +521,9 @@ def test_non_tty_input_reads_plain_lines_without_escape_codes(monkeypatch):
         return await terminal.read()
 
     assert asyncio.run(read_once()) == "hello\r\n"
-    assert "You: " in stdout.getvalue()
-    assert "\x1b" not in stdout.getvalue()
-    assert "\r" not in stdout.getvalue().replace("You: ", "")
+    # No prompt marker and no escape sequence is written. On a redirected
+    # stream the permanent request block is the only place the bar appears.
+    assert stdout.getvalue() == ""
 
 
 def test_markup_like_tool_text_is_data_not_rich_markup():
@@ -620,8 +643,6 @@ def test_toolbar_width_counts_cjk_and_emoji_as_display_columns(columns, name):
     assert max(get_cwidth(line) for line in lines) <= columns
     if columns >= 30:
         assert any(name in line for line in lines)
-    fragments = display.toolbar()
-    assert max(get_cwidth(text.rstrip("\n")) for _, text in fragments) <= columns
 
 
 @pytest.mark.parametrize(
@@ -680,7 +701,7 @@ async def test_pause_preserves_a_partially_typed_line(tmp_path, monkeypatch):
             terminal.restore()
 
 
-async def test_bottom_toolbar_uses_default_background_and_keeps_tool_colours(
+async def test_live_area_is_the_prompt_message_not_a_bottom_toolbar(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -693,17 +714,86 @@ async def test_bottom_toolbar_uses_default_background_and_keeps_tool_colours(
         with create_app_session(input=pipe, output=output):
             terminal = TerminalInput(display=display, input=pipe, output=output)
             terminal.initialize()
-            style = terminal.prompt.app.style
-            base = style.get_attrs_for_style_str("class:bottom-toolbar")
-            text = style.get_attrs_for_style_str("class:bottom-toolbar.text")
-            green = style.get_attrs_for_style_str(
-                "class:bottom-toolbar class:bottom-toolbar.text fg:ansigreen"
+            # No terminal-anchored toolbar: the live rows travel with the
+            # prompt message and stay right above the input line.
+            assert terminal.prompt.bottom_toolbar is None
+            reading = asyncio.create_task(terminal.read())
+            await _wait(0.3)
+            assert display.render_lines(width=80, rows=24) == []
+
+            display.begin_turn()
+            display.note_event(_event(EventType.TURN_STARTED))
+            _tool(display, "turn", "c1", "demo_tool", "succeeded")
+            await _wait(0.4)
+
+            texts = [text.rstrip("\n") for _, text in display.prompt_message()]
+            session_index = next(
+                index for index, text in enumerate(texts)
+                if text.startswith("session s")
             )
-            for attrs in (base, text, green):
-                assert attrs.reverse is False
-                assert attrs.bgcolor == "default"
-            assert green.color == "ansigreen"
+            dynamic = texts[:session_index]
+            assert any("Thinking" in text for text in dynamic)
+            assert any(text.startswith("| ") for text in dynamic)
+            # Busy: no request marker; the session line is last in the message,
+            # so the dynamic rows sit immediately above the input line.
+            assert session_index == len(texts) - 1
+            assert "│" not in texts
+            assert "| 1 calls" in _ANSI.sub("", stream.getvalue())
+
+            display.end_turn()
+            await _wait(0.3)
+            texts = [text.rstrip("\n") for _, text in display.prompt_message()]
+            assert texts[-1].rstrip() == "│"
+            assert all("calls" not in text for text in texts)
+            assert all("Thinking" not in text for text in texts)
+
+            pipe.send_text("exit\r")
+            assert await asyncio.wait_for(reading, 2) == "exit"
             terminal.restore()
+
+
+def test_fragment_rows_counts_the_input_line_and_erase_uses_it():
+    assert terminal_input_module._fragment_rows([]) == 1
+    assert terminal_input_module._fragment_rows(
+        [("fg", "session line\n"), ("bold", REQUEST_PROMPT)]
+    ) == 2
+    # A message that ends with a newline puts the input line on its own row.
+    assert terminal_input_module._fragment_rows(
+        [("fg", "status\n"), ("fg", "session line\n")]
+    ) == 3
+
+    class Output:
+        def __init__(self):
+            self.calls = []
+
+        def cursor_up(self, amount):
+            self.calls.append(("up", amount))
+
+        def write_raw(self, data):
+            self.calls.append(("raw", data))
+
+        def erase_end_of_line(self):
+            self.calls.append(("erase",))
+
+        def flush(self):
+            self.calls.append(("flush",))
+
+    output = Output()
+    terminal = TerminalInput()
+    terminal.prompt = SimpleNamespace(app=SimpleNamespace(output=output))
+    terminal._prompt_rows = 2
+    terminal._erase_submitted_prompt()
+    assert output.calls == [
+        ("up", 1), ("raw", "\r"), ("erase",),
+        ("up", 1), ("raw", "\r"), ("erase",),
+        ("flush",),
+    ]
+
+    # A paused reader is opening a menu: keep its visible draft untouched.
+    output.calls.clear()
+    terminal._gate.clear()
+    terminal._erase_submitted_prompt()
+    assert output.calls == []
 
 
 async def test_busy_hides_marker_and_cursor_blocks_keys_and_restores_draft(
@@ -724,8 +814,8 @@ async def test_busy_hides_marker_and_cursor_blocks_keys_and_restores_draft(
             await _wait(0.3)
 
             idle = _ANSI.sub("", stream.getvalue())
-            # The session line is above the You marker, not in the toolbar.
-            assert idle.index("session s · openai/gpt-5") < idle.index("You:")
+            # The session line is above the request marker, not in the toolbar.
+            assert idle.index("session s · openai/gpt-5") < idle.index("│")
             assert display.render_lines(width=80, rows=24) == []
             assert "\x1b[?25h" in stream.getvalue()
 
@@ -738,7 +828,7 @@ async def test_busy_hides_marker_and_cursor_blocks_keys_and_restores_draft(
             display.begin_turn()
             await _wait(0.3)
             busy = stream.getvalue()[marker:]
-            assert "You:" not in _ANSI.sub("", busy)
+            assert "│" not in _ANSI.sub("", busy)
             assert "session s · openai/gpt-5" in _prompt_text(display)
             assert "\x1b[?25l" in busy and "\x1b[?25h" not in busy
             # Ordinary keys do not edit the buffer, echo text, or ring a bell.
@@ -755,7 +845,7 @@ async def test_busy_hides_marker_and_cursor_blocks_keys_and_restores_draft(
             restored = len(stream.getvalue())
             display.end_turn()
             await _wait(0.3)
-            assert "You:" in _ANSI.sub("", stream.getvalue()[restored:])
+            assert "│" in _ANSI.sub("", stream.getvalue()[restored:])
             assert "\x1b[?25h" in stream.getvalue()[restored:]
             pipe.send_text("\r")
             assert await asyncio.wait_for(reading, 2) == "kept text"
@@ -823,13 +913,13 @@ async def test_escape_hint_then_second_escape_stops_once_and_queues(
             terminal.bind_stop(agent.request_stop)
             run = asyncio.create_task(agent.run())
             try:
-                await _until(lambda: "You:" in _ANSI.sub("", stream.getvalue()))
+                await _until(lambda: "│" in _ANSI.sub("", stream.getvalue()))
                 pipe.send_text("first\r")
                 await asyncio.wait_for(_until(lambda: session.active == 0), 2)
                 await _until(lambda: agent_output.display.busy)
                 busy_marker = len(stream.getvalue())
                 await _wait(0.2)
-                assert "You:" not in _ANSI.sub("", stream.getvalue()[busy_marker:])
+                assert "│" not in _ANSI.sub("", stream.getvalue()[busy_marker:])
 
                 # First Esc: yellow hint, no cancellation.
                 pipe.send_text("\x1b")
@@ -847,7 +937,7 @@ async def test_escape_hint_then_second_escape_stops_once_and_queues(
                 assert hint_lines
                 assert "Press Esc again" in _ANSI.sub("", stream.getvalue())
                 hint_style = [
-                    style for style, text in agent_output.display.toolbar()
+                    style for style, text in agent_output.display.prompt_message()
                     if text.startswith("Press Esc again")
                 ]
                 assert hint_style and "ansiyellow" in hint_style[0]
@@ -860,7 +950,7 @@ async def test_escape_hint_then_second_escape_stops_once_and_queues(
                 assert session.cancels == 1
                 assert session.interrupted == {0}
                 await _wait(0.3)
-                assert "You:" in _ANSI.sub("", stream.getvalue()[busy_marker:])
+                assert "│" in _ANSI.sub("", stream.getvalue()[busy_marker:])
                 assert not agent_output.display.stop_hint
 
                 # The next turn starts with a clean, unarmed hint.
@@ -907,6 +997,7 @@ async def test_idle_escape_does_not_arm_or_exit(tmp_path, monkeypatch):
             terminal = TerminalInput(display=display, input=pipe, output=output)
             terminal.initialize()
             terminal.prompt.app.timeoutlen = 0.05
+            terminal.prompt.app.ttimeoutlen = 0.05
             terminal.bind_stop(lambda: stops.append(1))
             reading = asyncio.create_task(terminal.read())
             await _wait(0.3)
@@ -934,6 +1025,7 @@ async def test_escape_window_expiry_other_keys_and_arrows_do_not_stop(
             terminal = TerminalInput(display=display, input=pipe, output=output)
             terminal.initialize()
             terminal.prompt.app.timeoutlen = 0.05
+            terminal.prompt.app.ttimeoutlen = 0.05
             terminal.bind_stop(lambda: stops.append(1))
             reading = asyncio.create_task(terminal.read())
             await _wait(0.3)
@@ -999,3 +1091,219 @@ def test_stream_preview_wraps_long_cjk_and_shows_the_newest_tail():
     widened = display.render_lines(width=30, rows=20)
     assert widened != narrowed
     assert any("XYZ" in line for line in widened)
+
+
+async def test_busy_ctrl_g_editor_returns_local_correction_and_restores_draft(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        terminal_input_module, "get_cli_history_path", lambda: tmp_path / "history"
+    )
+    stream = StringIO()
+    output = _TerminalOutput(stream, lambda: Size(rows=24, columns=80))
+    display, _ = _display(live=True)
+    stops: list[int] = []
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=output):
+            terminal = TerminalInput(display=display, input=pipe, output=output)
+            terminal.initialize()
+            terminal.prompt.app.timeoutlen = 0.05
+            terminal.prompt.app.ttimeoutlen = 0.05
+            terminal.bind_stop(lambda: stops.append(1))
+            reading = asyncio.create_task(terminal.read())
+            await _wait(0.3)
+
+            pipe.send_text("kept draft")
+            await _wait(0.2)
+            assert terminal.prompt.default_buffer.text == "kept draft"
+
+            busy_marker = len(stream.getvalue())
+            display.begin_turn()
+            await _wait(0.3)
+            assert "\x1b[?25l" in stream.getvalue()[busy_marker:]
+
+            # Ctrl+G must work on a real TTY even though ordinary keys and
+            # Enter are still blocked by the busy filters.
+            pipe.send_text("\x07")
+            await _wait(0.2)
+            assert terminal._correcting is True
+            assert terminal.prompt.default_buffer.text == "/correct "
+            assert "Correct:" in _ANSI.sub("", stream.getvalue())
+            assert "\x1b[?25h" in stream.getvalue()[busy_marker:]
+
+            pipe.send_text("move left\r")
+            assert await asyncio.wait_for(reading, 2) == "/correct move left"
+            assert terminal._correcting is False
+
+            # The next read is still busy and shows the saved draft again.
+            second = asyncio.create_task(terminal.read())
+            await _wait(0.3)
+            assert terminal.prompt.default_buffer.text == "kept draft"
+
+            # Esc leaves the editor without arming stop and puts the draft back.
+            pipe.send_text("\x07")
+            await _wait(0.2)
+            pipe.send_text("not this")
+            await _wait(0.1)
+            pipe.send_text("\x1b")
+            await _wait(0.4)
+            assert terminal._correcting is False
+            assert terminal.prompt.default_buffer.text == "kept draft"
+            assert not display.stop_hint and stops == []
+            assert not second.done()
+
+            # Ordinary keys are still blocked while the turn is busy.
+            pipe.send_text("blocked ordinary\r")
+            await _wait(0.3)
+            assert terminal.prompt.default_buffer.text == "kept draft"
+            assert not second.done()
+
+            display.end_turn()
+            await _wait(0.2)
+            pipe.send_text("\r")
+            assert await asyncio.wait_for(second, 2) == "kept draft"
+            terminal.restore()
+
+
+async def test_busy_correction_callback_exact_and_turn_end_race_never_submits(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        terminal_input_module, "get_cli_history_path", lambda: tmp_path / "history"
+    )
+    stream = StringIO()
+    output = _TerminalOutput(stream, lambda: Size(rows=24, columns=80))
+    display, _ = _display(live=True)
+
+    class Session:
+        def __init__(self):
+            self.requests = []
+            self.gate = asyncio.Event()
+            self.active = False
+            self.cancelled = []
+
+        async def submit(self, request):
+            self.requests.append(request)
+            self.active = True
+            try:
+                await self.gate.wait()
+            finally:
+                self.active = False
+            return TurnResult(
+                request.session_id, f"turn-{len(self.requests)}", TurnStatus.COMPLETED
+            )
+
+        async def cancel(self, session_id):
+            self.cancelled.append(session_id)
+            self.gate.set()
+
+    class Output:
+        def __init__(self):
+            self.infos = []
+            self.errors = []
+            self.results = []
+
+        def info(self, text):
+            self.infos.append(text)
+
+        def error(self, text):
+            self.errors.append(text)
+
+        def result(self, result):
+            self.results.append(result)
+
+        def turn_started(self, session_id=None, request_text=None):
+            display.begin_turn()
+
+        def turn_finished(self):
+            display.end_turn()
+
+        def cancel_requested(self):
+            pass
+
+        def tool_view(self, argument):
+            return "tool view"
+
+    session = Session()
+    session_output = Output()
+    corrections: list[str] = []
+
+    async def correct_command(text, binding):
+        corrections.append(text)
+        return "Correction accepted for the next safe step."
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=output):
+            terminal = TerminalInput(display=display, input=pipe, output=output)
+            terminal.initialize()
+            terminal.prompt.app.timeoutlen = 0.05
+            terminal.prompt.app.ttimeoutlen = 0.05
+            agent = InteractiveAgent(
+                session,
+                session_id="cli:test",
+                output=session_output,
+                read_input=terminal.read,
+                correct_command=correct_command,
+            )
+            terminal.bind_stop(agent.request_stop)
+            run = asyncio.create_task(agent.run())
+            try:
+                await _until(lambda: "│" in _ANSI.sub("", stream.getvalue()))
+                pipe.send_text("first\r")
+                await asyncio.wait_for(_until(lambda: session.active), 2)
+                await _until(lambda: display.busy)
+                await asyncio.wait_for(_until(lambda: terminal.prompt_active), 2)
+                await asyncio.wait_for(
+                    _until(lambda: terminal.prompt.default_buffer.text == ""), 2
+                )
+
+                # Ordinary input remains blocked; the read must not return it.
+                pipe.send_text("ordinary blocked\r")
+                await _wait(0.3)
+                assert len(session.requests) == 1
+                assert "ordinary blocked" not in terminal.prompt.default_buffer.text
+
+                pipe.send_text("\x07")
+                await _wait(0.2)
+                pipe.send_text("go to the blue box\r")
+                await asyncio.wait_for(_until(lambda: corrections == ["go to the blue box"]), 2)
+                assert corrections == ["go to the blue box"]
+                assert len(session.requests) == 1
+                assert any("Correction accepted" in item for item in session_output.infos)
+
+                await asyncio.wait_for(_until(lambda: terminal.prompt_active), 2)
+                await _wait(0.3)
+                assert terminal.prompt.default_buffer.text == ""
+                # Start another correction, then let the turn finish before
+                # Enter. The line must still be treated as /correct, never as
+                # a new ordinary task.
+                pipe.send_text("\x07")
+                await _wait(0.2)
+                pipe.send_text("too late for a step")
+                await _wait(0.2)
+                assert terminal.prompt.default_buffer.text == "/correct too late for a step"
+                session.gate.set()
+                await asyncio.wait_for(_until(lambda: not display.busy), 3)
+                assert terminal._correcting is True
+
+                pipe.send_text("\r")
+                await asyncio.wait_for(
+                    _until(lambda: corrections == ["go to the blue box", "too late for a step"]),
+                    2,
+                )
+                await _wait(0.2)
+                assert len(session.requests) == 1
+                assert corrections == ["go to the blue box", "too late for a step"]
+
+                await asyncio.wait_for(_until(lambda: terminal.prompt_active), 2)
+                await _wait(0.2)
+                assert terminal.prompt.default_buffer.text == ""
+                await _wait(0.2)
+                pipe.send_text("exit\r")
+                await asyncio.wait_for(run, 3)
+            finally:
+                session.gate.set()
+                if not run.done():
+                    run.cancel()
+                await asyncio.gather(run, return_exceptions=True)
+            terminal.restore()

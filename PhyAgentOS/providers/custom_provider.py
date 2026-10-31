@@ -11,7 +11,7 @@ import json_repair
 from PhyAgentOS.providers._openai_client import build_async_openai_client
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, StreamEvent, ToolCallRequest
 from PhyAgentOS.providers.effort import is_openai_reasoning_model
-from PhyAgentOS.providers.errors import describe_provider_error
+from PhyAgentOS.providers.errors import describe_provider_error, extract_error_code
 
 
 class CustomProvider(LLMProvider):
@@ -65,8 +65,16 @@ class CustomProvider(LLMProvider):
                 try:
                     return self._parse(await self._client.chat.completions.create(**kwargs))
                 except Exception as e2:
-                    return LLMResponse(content=describe_provider_error(e2), finish_reason="error")
-            return LLMResponse(content=describe_provider_error(e), finish_reason="error")
+                    return LLMResponse(
+                        content=describe_provider_error(e2),
+                        finish_reason="error",
+                        error_code=extract_error_code(e2),
+                    )
+            return LLMResponse(
+                content=describe_provider_error(e),
+                finish_reason="error",
+                error_code=extract_error_code(e),
+            )
 
     async def chat_stream(
         self,

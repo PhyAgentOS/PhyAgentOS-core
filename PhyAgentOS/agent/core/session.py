@@ -55,6 +55,15 @@ the session has an unfinished turn, and a turn already covered by a context
 checkpoint cannot be removed from the summary, so it is reported as blocked
 instead of pretending the context changed.
 
+Explicit continuation is a read-only projection, not a retry. ``read_resume_history``
+selects one failed or interrupted turn that undo has not withdrawn, refuses to
+resume while the session has an unfinished turn or after a context checkpoint
+covered the turn, and rebuilds balanced messages from that turn's last
+``request.prepared`` snapshot plus later completed assistant/tool exchanges.
+Unsettled, unknown and cancelled tool calls are reported as warnings and never
+replayed; successful settled results recorded after the snapshot are kept. The
+method writes nothing and does not claim that a remote action can be repeated.
+
 Async surface, synchronous core: every public coroutine runs the SQLite work
 on a worker thread via :func:`asyncio.to_thread`. A per-session reentrant lock
 serializes writers of one session, and a connection lock serializes use of the
@@ -73,6 +82,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from .events import (
@@ -84,7 +94,7 @@ from .events import (
     reverted_turn_ids,
 )
 from .protocols import SessionSnapshot
-from .types import require_non_empty
+from .types import ToolStatus, require_non_empty
 
 __all__ = [
     "CHECKPOINT_SUMMARY_NOTICE",
@@ -92,6 +102,8 @@ __all__ = [
     "CompactionAttempt",
     "ContextCheckpoint",
     "RecoveryConflictError",
+    "ResumeHistory",
+    "ResumeUnavailableError",
     "SessionStoreClosedError",
     "SQLiteSessionStore",
     "UndoOutcome",
@@ -164,6 +176,19 @@ _MODEL_CALL_EVENTS = frozenset(
     }
 )
 _TOOL_START_EVENTS = frozenset({EventType.TOOL_INTENT, EventType.TOOL_DISPATCHED})
+
+# The same model-facing prefixes ToolOutcome.for_model uses. The resume
+# projection rebuilds a tool message from the durable settled payload, so it
+# must not turn an unknown or cancelled call into a success.
+_TOOL_STATUS_PREFIX = {
+    ToolStatus.SUCCEEDED: "",
+    ToolStatus.FAILED: "Tool failed: ",
+    ToolStatus.REJECTED: "Tool call rejected: ",
+    ToolStatus.CANCELLED: (
+        "Tool call cancelled locally; remote side effects are unconfirmed. "
+    ),
+    ToolStatus.UNKNOWN: "Tool call result is unknown; do not retry automatically. ",
+}
 
 
 class SessionStoreClosedError(RuntimeError):
@@ -354,10 +379,10 @@ class UndoOutcome:
     from the request: ``status`` is the turn's terminal event value, for
     example ``"turn.completed"``.
 
-    ``request_text`` is the last user-content string of that turn's newest
-    ``request.prepared`` snapshot, or ``None`` when the log has no such text.
-    It is read back, never reconstructed from ``input.accepted`` (that event
-    stores only a character count).
+    ``request_text`` is the original input recorded on ``turn.started``, with
+    the first ``request.prepared`` snapshot as a fallback for older logs. It
+    is ``None`` when neither source has text, never reconstructed from the
+    character count stored on ``input.accepted``.
 
     ``context_reverted`` is true only when the stored conversation no longer
     shows the turn. ``block_reason`` is ``None`` for a plain undo and
@@ -386,6 +411,101 @@ class UndoOutcome:
             raise TypeError("context_reverted must be a bool")
         if self.block_reason is not None and not isinstance(self.block_reason, str):
             raise TypeError("block_reason must be a string or None")
+
+
+class ResumeUnavailableError(RuntimeError):
+    """No legal resume snapshot can be built for the requested session.
+
+    The store raises this before returning messages when the session still has
+    an unfinished turn, the target turn is not failed/interrupted, a completed
+    turn still present after the target would make resume branch the
+    conversation, the target was withdrawn by undo, a context checkpoint
+    already covers it, or the log has no ``request.prepared`` snapshot to
+    rebuild the user request from. Nothing is written and no model request is
+    made.
+    """
+
+    def __init__(self, session_id: str, reason: str) -> None:
+        self.session_id = session_id
+        self.reason = reason
+        super().__init__(f"resume unavailable for session {session_id!r}: {reason}")
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeHistory:
+    """Balanced messages rebuilt from a failed or interrupted turn.
+
+    ``source_turn_id`` is the turn read from the log, never invented by the
+    caller. ``messages`` is the conversation prefix: the last request snapshot
+    of that turn (leading system messages removed) plus any completed assistant
+    and tool exchanges recorded after that snapshot. The new user instruction
+    is deliberately absent; the loop driver appends the current
+    ``TurnRequest.text`` itself.
+
+    ``warnings`` describes what could not be carried forward: an unknown,
+    cancelled or unsettled tool call, a model failure, or a partial streamed
+    reply that never became a terminal model response. Warnings never stand in
+    for a tool result or a complete assistant answer, and no failed call is
+    replayed automatically.
+    """
+
+    source_turn_id: str
+    messages: tuple[Mapping[str, Any], ...]
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        require_non_empty("source_turn_id", self.source_turn_id)
+        messages: list[Mapping[str, Any]] = []
+        for message in self.messages:
+            if not isinstance(message, Mapping):
+                raise TypeError("messages must contain mappings")
+            role = message.get("role")
+            require_non_empty("message role", role)
+            messages.append(MappingProxyType(copy.deepcopy(dict(message))))
+        object.__setattr__(self, "messages", tuple(messages))
+        warnings: list[str] = []
+        for warning in self.warnings:
+            if not isinstance(warning, str) or not warning.strip():
+                raise ValueError("warnings must be non-empty strings")
+            warnings.append(warning)
+        object.__setattr__(self, "warnings", tuple(warnings))
+
+
+def _is_runtime_context(message: Mapping[str, Any]) -> bool:
+    """True for the live-state tail the cache-stable assembler appends.
+
+    The prompt layer owns the exact marker and exports
+    ``is_runtime_context_message``; the local check is only a fallback for a
+    build that predates that helper. A real user message is never matched, so
+    dropping these entries cannot delete authored text.
+    """
+    try:
+        from .prompt import is_runtime_context_message
+    except ImportError:
+        content = message.get("content")
+        return (
+            message.get("role") == "user"
+            and message.get("name") == "paos_runtime_context"
+            and isinstance(content, str)
+            and content.startswith(
+                "--- Runtime context for this step (live environment state; "
+                "this is not a user message and asks for no new task) ---"
+            )
+            and "[PhyAgentOS runtime context]" in content
+            and content.endswith("--- End runtime context ---")
+        )
+    return bool(is_runtime_context_message(message))
+
+
+def _without_runtime_context(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Copy messages while dropping generated live-state tails."""
+    return [
+        dict(message)
+        for message in messages
+        if isinstance(message, Mapping) and not _is_runtime_context(message)
+    ]
 
 
 def _plain(value: Any) -> Any:
@@ -551,6 +671,561 @@ def _recovery_report(
     )
 
 
+def _resume_message_list(
+    session_id: str,
+    source_turn_id: str,
+    raw_messages: Any,
+    label: str,
+) -> list[Mapping[str, Any]]:
+    """Validate, copy, and clean one stored message list for resume."""
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raise ResumeUnavailableError(
+            session_id,
+            f"turn {source_turn_id!r} {label} has no messages snapshot",
+        )
+    messages: list[Mapping[str, Any]] = []
+    for message in copy.deepcopy(raw_messages):
+        if not isinstance(message, Mapping):
+            raise ResumeUnavailableError(
+                session_id,
+                f"turn {source_turn_id!r} {label} contains a non-mapping message",
+            )
+        role = message.get("role")
+        if not isinstance(role, str) or not role.strip():
+            raise ResumeUnavailableError(
+                session_id,
+                f"turn {source_turn_id!r} {label} has a message without a role",
+            )
+        if _is_runtime_context(message):
+            continue
+        messages.append(dict(message))
+    while messages and messages[0]["role"] == "system":
+        messages.pop(0)
+    return messages
+
+
+def _resume_history(
+    session_id: str,
+    events: Sequence[RuntimeEvent],
+    checkpoint: ContextCheckpoint | None,
+    requested_turn_id: str | None,
+) -> ResumeHistory:
+    """Rebuild balanced messages for explicit continuation.
+
+    The base is the turn's last ``request.prepared`` snapshot: that is the only
+    stored place with the real user text (``input.accepted`` has a character
+    count only). Completed model responses after that snapshot are added as
+    assistant messages, and settled tool calls are paired with them. A tool
+    call with no terminal settlement is never put in an assistant message:
+    the provider would receive an unmatched call, and replaying it would be an
+    automatic retry. Such calls are reported in ``warnings`` instead.
+
+    Successful tool results recorded after the base snapshot are kept. If an
+    assistant response has a mix of settled and unsettled calls, only the
+    settled call/result pairs are carried; the omitted calls are named in a
+    warning. Partial stream text without a completed response is never treated
+    as a finished assistant answer.
+
+    Two events can follow the last snapshot without a new one: a
+    ``context.compacted`` replacement and an ``input.steered`` correction. The
+    newest compaction after the snapshot replaces the message prefix, so stale
+    pre-compaction messages are not reintroduced. Corrections after that point
+    are appended as user messages in sequence order and warned as accepted but
+    unconfirmed at the provider; a correction already inside the compacted
+    messages is warned but not appended twice.
+    """
+    reverted = reverted_turn_ids(events)
+    started: dict[str, int] = {}
+    terminal: dict[str, RuntimeEvent] = {}
+    for event in events:
+        turn_id = event.turn_id
+        if turn_id is None:
+            continue
+        sequence = event.sequence if event.sequence is not None else 0
+        if event.type is EventType.TURN_STARTED:
+            started.setdefault(turn_id, sequence)
+        elif event.type in _TERMINAL_TURN_EVENTS:
+            terminal[turn_id] = event
+
+    unfinished_turns, _open_calls = _unfinished_state(session_id, events)
+    if unfinished_turns:
+        raise ResumeUnavailableError(
+            session_id,
+            "the session still has unfinished turn(s) "
+            f"{', '.join(unfinished_turns)}; resume only between turns",
+        )
+
+    if requested_turn_id is None:
+        candidates = [
+            turn_id
+            for turn_id, event in terminal.items()
+            if event.type in (EventType.TURN_FAILED, EventType.TURN_INTERRUPTED)
+            and turn_id not in reverted
+            and turn_id in started
+        ]
+        if not candidates:
+            raise ResumeUnavailableError(
+                session_id,
+                "no failed or interrupted turn is available to resume",
+            )
+        source_turn_id = max(
+            candidates,
+            key=lambda turn_id: terminal[turn_id].sequence or 0,
+        )
+    else:
+        source_turn_id = requested_turn_id
+        if source_turn_id not in started:
+            raise ResumeUnavailableError(
+                session_id, f"turn {source_turn_id!r} does not exist in this session"
+            )
+        if source_turn_id in reverted:
+            raise ResumeUnavailableError(
+                session_id,
+                f"turn {source_turn_id!r} was withdrawn by undo and cannot be resumed",
+            )
+        source_terminal = terminal.get(source_turn_id)
+        if source_terminal is None:
+            raise ResumeUnavailableError(
+                session_id,
+                f"turn {source_turn_id!r} has no terminal event and is not resumable",
+            )
+        if source_terminal.type is EventType.TURN_COMPLETED:
+            raise ResumeUnavailableError(
+                session_id,
+                f"turn {source_turn_id!r} completed; only failed or interrupted "
+                "turns can be resumed",
+            )
+
+    start_sequence = started[source_turn_id]
+    later_completed = [
+        other
+        for other, event in terminal.items()
+        if event.type is EventType.TURN_COMPLETED
+        and other not in reverted
+        and started.get(other, -1) > start_sequence
+    ]
+    if later_completed:
+        newest = max(later_completed, key=lambda other: started[other])
+        raise ResumeUnavailableError(
+            session_id,
+            f"turn {source_turn_id!r} is followed by completed turn {newest!r}; "
+            "resuming would branch the conversation, which is not supported. "
+            "Start a new session instead; fork is not supported",
+        )
+    if checkpoint is not None and checkpoint.covers_sequence >= start_sequence:
+        raise ResumeUnavailableError(
+            session_id,
+            f"turn {source_turn_id!r} is covered by a context checkpoint; its "
+            "original messages were compacted and cannot be reintroduced",
+        )
+
+    snapshots = [
+        event
+        for event in events
+        if event.turn_id == source_turn_id
+        and event.type is EventType.REQUEST_PREPARED
+    ]
+    if not snapshots:
+        raise ResumeUnavailableError(
+            session_id,
+            f"turn {source_turn_id!r} has no request.prepared snapshot; the "
+            "original user request cannot be reconstructed",
+        )
+    base = snapshots[-1]
+    base_sequence = base.sequence if base.sequence is not None else 0
+    snapshot_sequence = base_sequence
+    messages = _resume_message_list(
+        session_id,
+        source_turn_id,
+        base.payload.get("messages"),
+        "request.prepared",
+    )
+
+    # A compaction after the last request snapshot replaces the message list
+    # even though no later request was prepared. Using the older snapshot would
+    # reintroduce content the compaction deliberately dropped, so the recorded
+    # replacement is the current safe context.
+    compactions = [
+        event
+        for event in events
+        if event.turn_id == source_turn_id
+        and event.type is EventType.CONTEXT_COMPACTED
+        and (event.sequence if event.sequence is not None else 0) > base_sequence
+    ]
+    context_event = compactions[-1] if compactions else None
+    if context_event is not None:
+        messages = _resume_message_list(
+            session_id,
+            source_turn_id,
+            context_event.payload.get("messages"),
+            "context.compacted",
+        )
+        base_sequence = context_event.sequence or base_sequence
+
+    warnings: list[str] = []
+    if context_event is not None:
+        warnings.append(
+            "a context.compacted event after the last request snapshot replaced "
+            "the message history; its recorded messages were used as the current "
+            "safe context"
+        )
+    warned_calls: set[tuple[str, str]] = set()
+
+    def warn_call(step_id: str | None, call_id: str, message: str) -> None:
+        key = (step_id or "", call_id)
+        if key in warned_calls:
+            return
+        warned_calls.add(key)
+        warnings.append(message)
+
+    # Unknown or cancelled results may already be inside the base snapshot:
+    # they are still not replayable, so the warning covers the whole source
+    # turn, not only events after the last request. The same scan finds a call
+    # that started but never settled anywhere in the turn.
+    all_starts: dict[tuple[str, str], RuntimeEvent] = {}
+    all_settled: dict[tuple[str, str], RuntimeEvent] = {}
+    for event in events:
+        if event.turn_id != source_turn_id or event.step_id is None:
+            continue
+        call_id = _call_payload(event.payload, "tool_call_id")
+        if call_id is None:
+            continue
+        key = (event.step_id, call_id)
+        if event.type in _TOOL_START_EVENTS:
+            previous = all_starts.get(key)
+            all_starts[key] = event
+            if (
+                previous is not None
+                and previous.type is EventType.TOOL_DISPATCHED
+                and event.type is EventType.TOOL_INTENT
+            ):
+                # A later intent must not downgrade a durable dispatch.
+                all_starts[key] = previous
+        elif event.type is EventType.TOOL_SETTLED:
+            all_settled[key] = event
+    for (step_id, call_id), event in all_settled.items():
+        status_value = event.payload.get("status")
+        try:
+            status = (
+                status_value
+                if isinstance(status_value, ToolStatus)
+                else ToolStatus(status_value)
+            )
+        except (TypeError, ValueError):
+            continue
+        name = _tool_name(event.payload)
+        if status is ToolStatus.UNKNOWN:
+            warn_call(
+                step_id,
+                call_id,
+                f"tool call {call_id} ({name}) is settled as unknown; remote "
+                "side effects are unconfirmed and it was not replayed",
+            )
+        elif status is ToolStatus.CANCELLED:
+            warn_call(
+                step_id,
+                call_id,
+                f"tool call {call_id} ({name}) was cancelled locally; remote "
+                "side effects are unconfirmed and it was not replayed",
+            )
+    for (step_id, call_id), event in all_starts.items():
+        if (step_id, call_id) in all_settled:
+            continue
+        name = _tool_name(event.payload)
+        if event.type is EventType.TOOL_DISPATCHED:
+            detail = "was dispatched but has no settled result; its outcome is unknown"
+        else:
+            detail = "reached only tool.intent; the handler was not called"
+        warn_call(
+            step_id,
+            call_id,
+            f"tool call {call_id} ({name}) {detail} and it was not replayed",
+        )
+
+    after = [
+        event
+        for event in events
+        if event.turn_id == source_turn_id
+        and (event.sequence if event.sequence is not None else 0) > base_sequence
+    ]
+
+    # Corrections after the last prepared request were accepted but never
+    # reached a provider. They are added to the resumed history in sequence
+    # order; one already folded into a later context.compacted replacement is
+    # not appended again, and every such correction gets an explicit warning.
+    for event in events:
+        if event.turn_id != source_turn_id or event.type is not EventType.INPUT_STEERED:
+            continue
+        if (event.sequence if event.sequence is not None else 0) <= snapshot_sequence:
+            continue
+        correction = event.payload.get("text")
+        if not isinstance(correction, str) or not correction.strip():
+            continue
+        shown = correction if len(correction) <= 200 else correction[:197] + "..."
+        if (event.sequence or 0) <= base_sequence:
+            warnings.append(
+                "correction was accepted before a context.compacted replacement "
+                "and no later request.prepared followed; it remains in the "
+                "recorded compacted messages but is not confirmed as sent to the "
+                f"model: {shown}"
+            )
+        else:
+            warnings.append(
+                "correction was accepted after the last request snapshot and no "
+                "later request.prepared covered it; it was added as a user message "
+                "for resume and is not confirmed as sent to the model: "
+                f"{shown}"
+            )
+
+    step_order: list[str] = []
+    completed: dict[str, RuntimeEvent] = {}
+    settled: dict[str, dict[str, RuntimeEvent]] = {}
+    started_calls: dict[str, dict[str, RuntimeEvent]] = {}
+    delta_chars: dict[str, int] = {}
+    failures: dict[str, list[str]] = {}
+    for event in after:
+        step_id = event.step_id
+        if step_id is None:
+            continue
+        if step_id not in step_order:
+            step_order.append(step_id)
+        if event.type is EventType.MODEL_ATTEMPT_COMPLETED:
+            completed[step_id] = event
+        elif event.type is EventType.TOOL_SETTLED:
+            call_id = _call_payload(event.payload, "tool_call_id")
+            if call_id is not None:
+                settled.setdefault(step_id, {})[call_id] = event
+        elif event.type in _TOOL_START_EVENTS:
+            call_id = _call_payload(event.payload, "tool_call_id")
+            if call_id is not None:
+                started_calls.setdefault(step_id, {})[call_id] = event
+        elif event.type is EventType.MODEL_RESPONSE_DELTA:
+            content = event.payload.get("content")
+            if isinstance(content, str):
+                delta_chars[step_id] = delta_chars.get(step_id, 0) + len(content)
+        elif event.type in (
+            EventType.MODEL_ATTEMPT_FAILED,
+            EventType.MODEL_ATTEMPT_INTERRUPTED,
+        ):
+            failures.setdefault(step_id, []).append(_attempt_failure_text(event))
+
+    timeline: list[tuple[int, str, Any]] = []
+    for step_id in step_order:
+        settled_calls = settled.get(step_id, {})
+        started_step = started_calls.get(step_id, {})
+        response_event = completed.get(step_id)
+        if response_event is None:
+            for call_id, event in settled_calls.items():
+                name = _tool_name(event.payload)
+                warn_call(
+                    step_id,
+                    call_id,
+                    f"tool call {call_id} ({name}) has a settled result but no "
+                    "completed assistant response before it; the result cannot "
+                    "form a complete call/result pair and was not included",
+                )
+            for failure in failures.get(step_id, ()):
+                warnings.append(failure)
+            if delta_chars.get(step_id, 0):
+                warnings.append(
+                    "a partial streamed reply "
+                    f"({delta_chars[step_id]} characters) was recorded without a "
+                    "completed model response; it was not included as an assistant "
+                    "answer"
+                )
+            continue
+
+        payload = response_event.payload
+        content = payload.get("content")
+        if content is not None and not isinstance(content, str):
+            warnings.append(
+                "a completed model response contained non-text content; only its "
+                "valid message parts were kept"
+            )
+            content = None
+        raw_calls = payload.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            raw_calls = []
+
+        assistant: dict[str, Any] = {"role": "assistant", "content": content}
+        included_calls: list[dict[str, Any]] = []
+        tool_messages: list[dict[str, Any]] = []
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, Mapping):
+                warnings.append(
+                    "a completed assistant response contained a malformed tool "
+                    "call; it was not included"
+                )
+                continue
+            call_id = raw_call.get("id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                warnings.append(
+                    "a completed assistant response contained a tool call without "
+                    "an id; it was not included"
+                )
+                continue
+            name = _tool_call_name(raw_call)
+            settled_event = settled_calls.get(call_id)
+            if settled_event is None:
+                start_event = started_step.get(call_id)
+                if start_event is not None and start_event.type is EventType.TOOL_DISPATCHED:
+                    detail = "was dispatched but has no settled result; its outcome is unknown"
+                elif start_event is not None:
+                    detail = "reached only tool.intent; the handler was not called"
+                else:
+                    detail = "has no recorded start or settled event; its outcome is unknown"
+                warn_call(
+                    step_id,
+                    call_id,
+                    f"tool call {call_id} ({name}) {detail} and it was not replayed",
+                )
+                continue
+            status_value = settled_event.payload.get("status")
+            try:
+                status = (
+                    status_value
+                    if isinstance(status_value, ToolStatus)
+                    else ToolStatus(status_value)
+                )
+            except (TypeError, ValueError):
+                warn_call(
+                    step_id,
+                    call_id,
+                    f"tool call {call_id} ({name}) has an unreadable settled status "
+                    "and was not included",
+                )
+                continue
+            if status is ToolStatus.RUNNING:
+                warn_call(
+                    step_id,
+                    call_id,
+                    f"tool call {call_id} ({name}) is still running; it was not "
+                    "included and it was not replayed",
+                )
+                continue
+            included_calls.append(copy.deepcopy(dict(raw_call)))
+            tool_messages.append(_resume_tool_message(settled_event.payload, name))
+            if status is ToolStatus.UNKNOWN:
+                warn_call(
+                    step_id,
+                    call_id,
+                    f"tool call {call_id} ({name}) is settled as unknown; remote "
+                    "side effects are unconfirmed and it was not replayed",
+                )
+            elif status is ToolStatus.CANCELLED:
+                warn_call(
+                    step_id,
+                    call_id,
+                    f"tool call {call_id} ({name}) was cancelled locally; remote "
+                    "side effects are unconfirmed and it was not replayed",
+                )
+
+        if included_calls:
+            assistant["tool_calls"] = included_calls
+        if "tool_calls" in assistant or content is not None:
+            reasoning = payload.get("reasoning_content")
+            if isinstance(reasoning, str):
+                assistant["reasoning_content"] = reasoning
+            thinking = payload.get("thinking_blocks")
+            if isinstance(thinking, list):
+                assistant["thinking_blocks"] = copy.deepcopy(thinking)
+            timeline.append(
+                (
+                    response_event.sequence or 0,
+                    "exchange",
+                    (assistant, tool_messages),
+                )
+            )
+        elif not raw_calls:
+            warnings.append(
+                "a completed model response had no text and no tool calls; it was "
+                "not included as an assistant answer"
+            )
+
+        for failure in failures.get(step_id, ()):
+            warnings.append(failure)
+
+    for event in after:
+        if event.type is not EventType.INPUT_STEERED:
+            continue
+        correction = event.payload.get("text")
+        if isinstance(correction, str) and correction.strip():
+            timeline.append((event.sequence or 0, "user", correction))
+    timeline.sort(key=lambda item: item[0])
+    for _sequence, kind, item in timeline:
+        if kind == "exchange":
+            assistant, tool_messages = item
+            messages.append(assistant)
+            messages.extend(tool_messages)
+        else:
+            messages.append({"role": "user", "content": item})
+
+    source_terminal = terminal.get(source_turn_id)
+    if source_terminal is not None:
+        if source_terminal.type is EventType.TURN_FAILED:
+            error = source_terminal.payload.get("error")
+            if isinstance(error, str) and error.strip():
+                warnings.append(f"the source turn failed: {error}")
+        elif source_terminal.type is EventType.TURN_INTERRUPTED:
+            warnings.append(
+                "the source turn was interrupted locally; remote work may not "
+                "have stopped and no tool was replayed"
+            )
+
+    if not messages:
+        raise ResumeUnavailableError(
+            session_id,
+            f"turn {source_turn_id!r} has no usable message history to resume from",
+        )
+    return ResumeHistory(
+        source_turn_id=source_turn_id,
+        messages=tuple(messages),
+        warnings=tuple(warnings),
+    )
+
+
+def _attempt_failure_text(event: RuntimeEvent) -> str:
+    step = event.step_id or "(unknown step)"
+    error = event.payload.get("error")
+    if event.type is EventType.MODEL_ATTEMPT_INTERRUPTED:
+        return f"model attempt {step} was interrupted before it completed"
+    if isinstance(error, str) and error.strip():
+        return f"model attempt {step} failed: {error}"
+    return f"model attempt {step} failed without a stored error"
+
+
+def _tool_name(payload: Mapping[str, Any]) -> str:
+    name = payload.get("tool_name")
+    return name if isinstance(name, str) and name.strip() else "tool"
+
+
+def _tool_call_name(call: Mapping[str, Any]) -> str:
+    function = call.get("function")
+    if isinstance(function, Mapping):
+        name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            return name
+    return "tool"
+
+
+def _resume_tool_message(payload: Mapping[str, Any], fallback_name: str) -> dict[str, Any]:
+    status_value = payload.get("status")
+    status = status_value if isinstance(status_value, ToolStatus) else ToolStatus(status_value)
+    text = payload.get("text")
+    body = text if isinstance(text, str) and text else "(no output)"
+    call_id = payload.get("tool_call_id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        # A settled row is validated elsewhere; this branch only exists so a
+        # broken read never invents an id.
+        raise ValueError("settled tool payload has no tool_call_id")
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "name": _tool_name(payload) if _tool_name(payload) != "tool" else fallback_name,
+        "content": f"{_TOOL_STATUS_PREFIX[status]}{body}",
+    }
+
+
 def _conversation_from_events(
     events: Sequence[RuntimeEvent],
 ) -> tuple[Mapping[str, Any], ...]:
@@ -603,6 +1278,8 @@ def _conversation_from_events(
         role = message.get("role")
         if not isinstance(role, str) or not role.strip():
             raise ValueError("request.prepared messages require a non-empty role")
+        if _is_runtime_context(message):
+            continue
         messages.append(dict(message))
 
     while messages and messages[0]["role"] == "system":
@@ -615,16 +1292,23 @@ def _conversation_from_events(
 
 
 def _last_user_text(events: Sequence[RuntimeEvent], turn_id: str) -> str | None:
-    """Return the last user-content string of a turn's newest request snapshot.
+    """Return the original input, with a first-snapshot fallback for older logs.
 
-    Only stored text counts: ``input.accepted`` keeps a character count, not
-    the request, so the snapshot is the single source. ``None`` means the log
-    has no snapshot or no user text, and the caller must not fill it in.
+    New logs keep the original text on ``turn.started``. Older logs only keep
+    a character count on ``input.accepted``, so use the first snapshot there.
+    ``None`` means no source contains user text; callers must not invent it. Later
+    snapshots may end in an applied correction rather than the original input.
     """
+    for event in events:
+        if event.type is EventType.TURN_STARTED and event.turn_id == turn_id:
+            original = event.payload.get("request_text")
+            if isinstance(original, str):
+                return original
     snapshot: RuntimeEvent | None = None
     for event in events:
         if event.type is EventType.REQUEST_PREPARED and event.turn_id == turn_id:
             snapshot = event
+            break
     if snapshot is None:
         return None
     messages = snapshot.payload.get("messages")
@@ -632,6 +1316,8 @@ def _last_user_text(events: Sequence[RuntimeEvent], turn_id: str) -> str | None:
         return None
     for message in reversed(messages):
         if not isinstance(message, Mapping) or message.get("role") != "user":
+            continue
+        if _is_runtime_context(message):
             continue
         content = message.get("content")
         return content if isinstance(content, str) else None
@@ -741,7 +1427,7 @@ def _checkpoint_conversation(
         "content": f"{CHECKPOINT_SUMMARY_NOTICE}\n\n{checkpoint.summary}",
     }
     messages: list[Mapping[str, Any]] = [summary_message]
-    messages.extend(copy.deepcopy(dict(message)) for message in checkpoint.retained_messages)
+    messages.extend(_without_runtime_context(checkpoint.retained_messages))
     return tuple(messages)
 
 
@@ -967,12 +1653,44 @@ class SQLiteSessionStore:
         ``block_reason="checkpoint"`` and no marker is written; skipping it
         would leave the context unchanged and the marker would lie.
 
-        The returned ``request_text`` is read back from the turn's newest
-        ``request.prepared`` snapshot.
+        The returned ``request_text`` uses the stored original input, with
+        the first ``request.prepared`` snapshot as an older-log fallback.
         """
         require_non_empty("session_id", session_id)
         self._raise_if_closed()
         return await asyncio.to_thread(self._undo_last_turn_sync, session_id)
+
+    async def read_resume_history(
+        self, session_id: str, turn_id: str | None = None
+    ) -> ResumeHistory:
+        """Build balanced messages for one failed or interrupted turn.
+
+        With ``turn_id=None`` the store picks the newest terminal turn that is
+        failed or interrupted and not withdrawn by undo. A completed turn is
+        not a resume source. The session must have no unfinished turn, a
+        completed turn that is still present after the source must not exist,
+        and a turn covered by a context checkpoint is refused: its original
+        messages were already compacted, so replaying them would reintroduce
+        content the projection deliberately dropped. Refusing the later
+        completed case keeps ordinary history and resume from silently
+        branching into two conversations.
+
+        The base is the turn's last ``request.prepared`` snapshot (the only
+        stored source of the user text). If a ``context.compacted`` event
+        follows it, that event's recorded messages replace the base so current
+        safe context is kept. Completed assistant responses and settled tool
+        results recorded after it are appended as a legal call/result sequence.
+        Corrections accepted after the base but never covered by another
+        snapshot are appended as user messages in order and flagged as
+        unconfirmed. Unsettled, unknown and cancelled calls are reported in
+        ``warnings`` and never replayed. Missing snapshots raise
+        :class:`ResumeUnavailableError`; nothing is written.
+        """
+        require_non_empty("session_id", session_id)
+        if turn_id is not None:
+            require_non_empty("turn_id", turn_id)
+        self._raise_if_closed()
+        return await asyncio.to_thread(self._resume_history_sync, session_id, turn_id)
 
     async def read_startup_snapshot(self, session_id: str) -> SessionSnapshot:
         """Return recovery and the next conversation from one consistent read.
@@ -1357,6 +2075,26 @@ class SQLiteSessionStore:
             if projected:
                 return projected
         return _checkpoint_conversation(checkpoint)
+
+    def _resume_history_sync(
+        self, session_id: str, turn_id: str | None
+    ) -> ResumeHistory:
+        """Read events and the checkpoint in one view, then build resume history."""
+        self._raise_if_closed()
+        with self._session_lock(session_id):
+            with self._conn_lock:
+                self._raise_if_closed()
+                conn = self._conn
+                conn.execute("BEGIN")
+                try:
+                    events = self._select_sync(session_id, None, 0)
+                    checkpoint = self._latest_checkpoint_sync(session_id)
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        return _resume_history(session_id, events, checkpoint, turn_id)
 
     def _undo_last_turn_sync(self, session_id: str) -> UndoOutcome | None:
         """Read, validate, and mark one turn inside one write transaction.

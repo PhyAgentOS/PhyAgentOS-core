@@ -234,6 +234,20 @@ class ChannelsConfig(Base):
     wecom: WecomConfig = Field(default_factory=WecomConfig)
 
 
+class CorePerformanceConfig(Base):
+    """Core execution controls; model selection and legacy behaviour stay separate."""
+
+    max_parallel_tools: int = Field(default=4, ge=1, le=32)
+    cache_stable_prompts: bool = True
+    auto_compact: bool = True
+    compaction_threshold: float = Field(default=0.8, gt=0, lt=1)
+    lazy_mcp_tools: bool = True
+    code_mode: bool = True
+    max_turn_tokens: int | None = Field(default=None, gt=0)
+    repeated_call_limit: int = Field(default=3, ge=2)
+    reserve_steps: int = Field(default=1, ge=0, le=1)
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -251,6 +265,7 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     max_concurrent_turns: int = 4
     per_session_queue_limit: int = 8
+    performance: CorePerformanceConfig = Field(default_factory=CorePerformanceConfig)
     # Deprecated compatibility field: accepted from old configs but ignored at runtime.
     memory_window: int | None = Field(default=None, exclude=True)
     reasoning_effort: str | None = None  # Model-supported level; validated by ProviderService.

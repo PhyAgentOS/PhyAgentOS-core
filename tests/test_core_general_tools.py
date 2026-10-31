@@ -51,6 +51,9 @@ EXPECTED_TOOLS = {
     "web_search": ["query"],
     "web_fetch": ["url"],
     "query_scene_graph": ["query_type"],
+    "job_status": [],
+    "job_wait": ["job_id"],
+    "job_cancel": ["job_id"],
 }
 
 
@@ -151,7 +154,7 @@ def test_tool_set_and_schemas_are_preserved(tmp_path: Path) -> None:
         assert registration.parallel_safe is (
             definition.name in {
                 "read_file", "list_dir", "web_search", "web_fetch",
-                "query_scene_graph",
+                "query_scene_graph", "job_status",
             }
         )
 

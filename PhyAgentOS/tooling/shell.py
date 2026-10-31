@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import signal
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,19 @@ _EXEC_LAUNCH_ERROR_PREFIXES = (
     "Error executing command:",
 )
 _EXIT_CODE_RE = re.compile(r"(?:^|\n)Exit code: (-?\d+)\s*\Z")
+
+
+def format_exec_result(
+    stdout: str | None, stderr: str | None, returncode: int
+) -> str:
+    """Build the legacy ``exec`` result text from already-decoded output."""
+    parts: list[str] = []
+    if stdout:
+        parts.append(stdout)
+    if stderr and stderr.strip():
+        parts.append(f"STDERR:\n{stderr}")
+    parts.append(f"\nExit code: {returncode}")
+    return "\n".join(parts) if parts else "(no output)"
 
 
 def exec_failure_message(result: str) -> str | None:
@@ -65,6 +79,24 @@ class _ActiveExec:
         self.spawned = asyncio.Event()
         self.cancelled = False
         self.terminate_lock = asyncio.Lock()
+
+
+@dataclass(slots=True)
+class BackgroundExec:
+    """One detached shell already started but not awaited by ``ExecTool``.
+
+    The handle keeps the process and its registration record together so the
+    job manager can wait, terminate, and release it through the same process
+    group and cancellation machinery as a foreground ``exec``. The process is
+    tracked under its owning session until :meth:`ExecTool.release_background`
+    is called, so session cancellation and capability shutdown still reap it.
+    """
+
+    command: str
+    cwd: str
+    process: asyncio.subprocess.Process
+    record: _ActiveExec
+    timeout: int
 
 
 class ExecTool(Tool):
@@ -139,10 +171,20 @@ class ExecTool(Tool):
                     "type": "integer",
                     "description": (
                         "Timeout in seconds. Increase for long-running commands "
-                        "like compilation or installation (default 60, max 600)."
+                        "like compilation or installation (default 60, max 600). "
+                        "For a background job the timeout applies once the job starts."
                     ),
                     "minimum": 1,
                     "maximum": 600,
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, start the command as a tracked background job "
+                        "and return a job handle immediately. The handle is not a "
+                        "result; use job_status, job_wait, or job_cancel to inspect "
+                        "or stop it. Default false keeps the old blocking behavior."
+                    ),
                 },
             },
             "required": ["command"],
@@ -216,19 +258,11 @@ class ExecTool(Tool):
                     "Error: Command cancelled because its session was stopped"
                 )
 
-            output_parts = []
-
-            if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
-
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
-                if stderr_text.strip():
-                    output_parts.append(f"STDERR:\n{stderr_text}")
-
-            output_parts.append(f"\nExit code: {process.returncode}")
-
-            result = "\n".join(output_parts) if output_parts else "(no output)"
+            result = format_exec_result(
+                stdout.decode("utf-8", errors="replace") if stdout else None,
+                stderr.decode("utf-8", errors="replace") if stderr else None,
+                process.returncode,
+            )
 
             # Legacy callers keep the fixed head+tail bound. A tracked Core
             # call leaves the full body to ToolResultLimiter, which saves the
@@ -277,6 +311,118 @@ class ExecTool(Tool):
             if process is not None:
                 self._cancelled_processes.discard(process)
                 self._process_groups.pop(process, None)
+
+    async def start_background(
+        self,
+        command: str,
+        working_dir: str | None = None,
+        timeout: int | None = None,
+        *,
+        session_id: str,
+    ) -> BackgroundExec | str:
+        """Start one tracked command and return without waiting for it.
+
+        This is the same guard, environment, cwd resolution, process group,
+        and session registration as :meth:`execute`; only the wait is removed.
+        A returned string means the command was rejected or could not start.
+        The caller owns the handle and must call :meth:`release_background`
+        after the process settles.
+        """
+        if self._closed:
+            return "Error: Exec tool is closed"
+        cwd = working_dir or self.working_dir or os.getcwd()
+        guard_error = self._guard_command(command, cwd)
+        if guard_error:
+            return guard_error
+
+        effective_timeout = min(timeout or self.timeout, self._MAX_TIMEOUT)
+        env = os.environ.copy()
+        if self.path_append:
+            env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
+
+        record = _ActiveExec(asyncio.current_task())
+        self._active.setdefault(str(session_id), set()).add(record)
+        process: asyncio.subprocess.Process | None = None
+        spawn_task: asyncio.Task[asyncio.subprocess.Process] | None = None
+
+        try:
+            spawn_task = asyncio.create_task(
+                asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                    env=env,
+                    start_new_session=os.name == "posix",
+                )
+            )
+            record.spawn_task = spawn_task
+            process = await asyncio.shield(spawn_task)
+            self._track_process(session_id, process, record)
+            record.spawned.set()
+
+            if record.cancelled:
+                self._cancelled_processes.add(process)
+                await self._terminate_record(record)
+                self.release_background(session_id, record, process)
+                return "Error: Command cancelled because its session was stopped"
+
+            return BackgroundExec(
+                command=command,
+                cwd=cwd,
+                process=process,
+                record=record,
+                timeout=effective_timeout,
+            )
+        except asyncio.CancelledError:
+            if process is None and spawn_task is not None:
+                process = await self._spawn_result(spawn_task)
+                if process is not None:
+                    self._track_process(session_id, process, record)
+            record.spawned.set()
+            await self._terminate_record(record)
+            self.release_background(session_id, record, process)
+            raise
+        except Exception as exc:  # noqa: BLE001 - report a launch failure
+            record.spawned.set()
+            self.release_background(session_id, record, process)
+            return f"Error executing command: {exc}"
+
+    def bind_background_task(
+        self, handle: BackgroundExec, task: asyncio.Task[Any]
+    ) -> None:
+        """Let session cancellation wait for the job task that owns the handle."""
+        handle.record.task = task
+
+    def background_cancelled(self, handle: BackgroundExec) -> bool:
+        """True when session cancellation already asked this job to stop."""
+        return (
+            handle.record.cancelled
+            or handle.process in self._cancelled_processes
+        )
+
+    async def terminate_background(self, handle: BackgroundExec) -> None:
+        """Terminate the job's process group under the existing bounded rules."""
+        await self._terminate_record(handle.record)
+
+    def release_background(
+        self,
+        session_id: str,
+        record: _ActiveExec,
+        process: asyncio.subprocess.Process | None,
+    ) -> None:
+        """Drop the job's registration after its process has settled."""
+        self._active.get(str(session_id), set()).discard(record)
+        if not self._active.get(str(session_id)):
+            self._active.pop(str(session_id), None)
+        if process is not None:
+            processes = self._processes.get(str(session_id))
+            if processes is not None:
+                processes.discard(process)
+                if not processes:
+                    self._processes.pop(str(session_id), None)
+            self._cancelled_processes.discard(process)
+            self._process_groups.pop(process, None)
 
     async def cancel_session(self, session_id: str) -> None:
         """Terminate every ``exec`` call this tool owns for one session.

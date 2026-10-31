@@ -14,7 +14,7 @@ from loguru import logger
 
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, StreamEvent, ToolCallRequest
 from PhyAgentOS.providers.effort import EffortError, apply_litellm_effort
-from PhyAgentOS.providers.errors import describe_provider_error
+from PhyAgentOS.providers.errors import describe_provider_error, extract_error_code
 from PhyAgentOS.providers.registry import find_by_model, find_by_name, find_gateway
 
 # Standard chat-completion message keys.
@@ -260,6 +260,7 @@ class LiteLLMProvider(LLMProvider):
             return LLMResponse(
                 content=describe_provider_error(e),
                 finish_reason="error",
+                error_code=extract_error_code(e),
             )
 
     async def chat_stream(

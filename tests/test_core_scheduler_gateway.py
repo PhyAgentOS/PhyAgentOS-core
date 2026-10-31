@@ -128,7 +128,10 @@ async def test_image_tool_delivers_path_and_thread_through_gateway_bus(
                 "image-call", "image",
                 {"mode": "display", "image_path": "frame.png", "text": "camera"},
             )
-        assert "Image displayed successfully" in messages[-1]["content"]
+        assert any(
+            "Image displayed successfully" in str(message.get("content"))
+            for message in messages if message.get("role") == "tool"
+        )
         return response("image ready")
 
     opened = await _open_gateway(tmp_path, monkeypatch, ScriptedProvider(responder))

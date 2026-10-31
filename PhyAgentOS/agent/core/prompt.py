@@ -27,12 +27,34 @@ __all__ = [
     "PromptAssemblerImpl",
     "PromptFragment",
     "ToolVisibility",
+    "is_runtime_context_message",
     "project_forge_tool_results",
     "project_skill_documents",
 ]
 
 PromptFragment = Callable[[ExecutionContext], str | None]
 ToolVisibility = Callable[[ExecutionContext], "frozenset[str] | None"]  # hidden tool names
+
+
+def is_runtime_context_message(message: Mapping[str, Any]) -> bool:
+    """True only for the live-state tail this assembler writes.
+
+    The check uses role, the standard user ``name`` source marker, and the
+    exact content protocol (header, marker and footer). A real user message —
+    even one that pasted the same text — has no such name and is never matched
+    by position, so it cannot be dropped by a projection or undo helper.
+    """
+    if not isinstance(message, Mapping) or message.get("role") != "user":
+        return False
+    if message.get("name") != _RUNTIME_CONTEXT_NAME:
+        return False
+    content = message.get("content")
+    return (
+        isinstance(content, str)
+        and content.startswith(_RUNTIME_CONTEXT_HEADER)
+        and _RUNTIME_CONTEXT_MARKER in content
+        and content.endswith(_RUNTIME_CONTEXT_FOOTER)
+    )
 
 
 
@@ -55,6 +77,20 @@ def _already_carries_system_text(
     content = messages[0].get("content")
     return isinstance(content, str) and system_text in content
 
+
+# A cache-stable request keeps the static system text in front and appends
+# live state after the conversation. The boundary is explicit so the model
+# does not read environment text as a new user task. The standard user ``name``
+# field records the source, and the content marker lets the session projection
+# and undo helpers recognize our own tail. No non-protocol metadata field is
+# sent; a real user message never carries both the name and the full marker.
+_RUNTIME_CONTEXT_NAME = "paos_runtime_context"
+_RUNTIME_CONTEXT_HEADER = (
+    "--- Runtime context for this step (live environment state; this is not a "
+    "user message and asks for no new task) ---"
+)
+_RUNTIME_CONTEXT_MARKER = "[PhyAgentOS runtime context]"
+_RUNTIME_CONTEXT_FOOTER = "--- End runtime context ---"
 
 _SKILL_TOOL = "activate_skill"
 _FORGE_RESULT_TOOLS = frozenset(
@@ -92,19 +128,24 @@ def _parse_json_object(content: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def project_skill_documents(messages: list[dict[str, Any]]) -> int:
+def project_skill_documents(
+    messages: list[dict[str, Any]], *, keep_earliest: bool = False
+) -> int:
     """Keep one full copy per (Skill name, exact document hash) in one request.
 
     Only a parsed ``activate_skill`` result that still carries the full
     ``skill`` text counts as a copy; summaries, checkpoints or truncated text
     never do. Different versions of the same Skill are different documents and
     each keeps one full body, so older text is never silently replaced by a
-    marker claiming it was the same document. The newest copy of each
-    (name, hash) pair is kept; earlier identical copies keep their activation
-    metadata and a hash marker. Message roles, tool call ids and ordering are
-    untouched, and durable events are never modified.
+    marker claiming it was the same document. By default the newest copy of
+    each (name, hash) pair is kept; ``keep_earliest=True`` keeps the first copy
+    instead so appending a later duplicate does not rewrite an older message,
+    which keeps an already-cached request prefix intact. Earlier or later
+    identical copies keep their activation metadata and a hash marker. Message
+    roles, tool call ids and ordering are untouched, and durable events are
+    never modified.
     """
-    newest: dict[tuple[str, str], int] = {}
+    kept: dict[tuple[str, str], int] = {}
     parsed: dict[int, tuple[dict[str, Any], str, str, str]] = {}
     for index, message in enumerate(messages):
         if message.get("role") != "tool" or message.get("name") != _SKILL_TOOL:
@@ -120,11 +161,14 @@ def project_skill_documents(messages: list[dict[str, Any]]) -> int:
             continue
         digest = hashlib.sha256(skill.encode("utf-8")).hexdigest()
         parsed[index] = (payload, name, skill, digest)
-        newest[(name, digest)] = index
+        if keep_earliest:
+            kept.setdefault((name, digest), index)
+        else:
+            kept[(name, digest)] = index
 
     omitted = 0
     for index, (payload, name, skill, digest) in parsed.items():
-        if newest[(name, digest)] == index:
+        if kept[(name, digest)] == index:
             continue
         original = messages[index]["content"]
         projected = copy.deepcopy(payload)
@@ -162,17 +206,22 @@ def _contains_unsafe_state(node: Any, depth: int = 0) -> bool:
     return False
 
 
-def project_forge_tool_results(messages: list[dict[str, Any]]) -> int:
+def project_forge_tool_results(
+    messages: list[dict[str, Any]], *, keep_earliest: bool = False
+) -> int:
     """Drop only older *identical* successful Forge results in one request.
 
-    The newest copy of each exact (tool name, content hash) stays in full. No
-    size-based trimming is performed: opaque query/context/action/session
-    payloads, failures, unknown/accepted/partial states and anything carrying a
-    nested error keep their full text. A replaced copy keeps only the full hash
-    marker, and only when that serialization is strictly shorter than the text
-    it replaces; short results are left verbatim.
+    By default the newest copy of each exact (tool name, content hash) stays in
+    full. ``keep_earliest=True`` keeps the first exact copy instead, so a later
+    duplicate only appends a hash reference and an already-cached prefix is
+    never rewritten. No size-based trimming is performed: opaque
+    query/context/action/session payloads, failures, unknown/accepted/partial
+    states and anything carrying a nested error keep their full text. A
+    replaced copy keeps only the full hash marker, and only when that
+    serialization is strictly shorter than the text it replaces; short results
+    are left verbatim.
     """
-    newest: dict[tuple[str, str], int] = {}
+    kept: dict[tuple[str, str], int] = {}
     candidates: dict[int, tuple[str, str]] = {}
     for index, message in enumerate(messages):
         name = message.get("name")
@@ -189,16 +238,20 @@ def project_forge_tool_results(messages: list[dict[str, Any]]) -> int:
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         key = (name, digest)
         candidates[index] = (name, digest)
-        newest[key] = index
+        if keep_earliest:
+            kept.setdefault(key, index)
+        else:
+            kept[key] = index
 
     replaced = 0
     for index, (name, digest) in candidates.items():
-        if newest[(name, digest)] == index:
+        if kept[(name, digest)] == index:
             continue
+        marker = "duplicate_of_earlier_result" if keep_earliest else "duplicate_of_later_result"
         replacement = json.dumps(
             {
                 "ok": True,
-                "duplicate_of_later_result": {"tool": name, "sha256": digest},
+                marker: {"tool": name, "sha256": digest},
             },
             ensure_ascii=False,
         )
@@ -220,6 +273,16 @@ class PromptAssemblerImpl:
     fragment or ``None``. They are read live for every step and are never
     stored or memoized here, so two concurrent sessions get their own text
     instead of sharing global state. Caching is the fragment owner's decision.
+
+    With ``cache_stable=True`` the layout is different: the system message
+    contains only ``system_instructions``, and live fragments become one
+    explicit runtime-context message after the conversation. That leaves the
+    system prefix byte-identical across steps, so a provider cache can reuse it;
+    Forge blockers and other live facts still come from this step's fragments.
+    The assembler never appends that runtime message to the caller's history,
+    so it cannot stack across steps. The default ``False`` keeps the historical
+    combined-layout behavior.
+
     Exceptions raised by a fragment propagate unchanged, so the caller sees a
     failed assembly instead of a silently shortened prompt.
     """
@@ -230,9 +293,12 @@ class PromptAssemblerImpl:
         *,
         fragments: Sequence[PromptFragment] = (),
         hidden_tools: ToolVisibility | None = None,
+        cache_stable: bool = False,
     ) -> None:
         if not isinstance(system_instructions, str):
             raise TypeError("system_instructions must be a string")
+        if not isinstance(cache_stable, bool):
+            raise TypeError("cache_stable must be a bool")
         frozen_fragments = tuple(fragments)
         for fragment in frozen_fragments:
             if not callable(fragment):
@@ -242,6 +308,7 @@ class PromptAssemblerImpl:
         self._system_instructions = system_instructions
         self._fragments = frozen_fragments
         self._hidden_tools = hidden_tools
+        self._cache_stable = cache_stable
 
     async def assemble(
         self,
@@ -261,18 +328,23 @@ class PromptAssemblerImpl:
         if not isinstance(context, ExecutionContext):
             raise TypeError("context must be an ExecutionContext")
         messages = _copy_history(history)
-        project_forge_tool_results(messages)
-        project_skill_documents(messages)
+        if self._cache_stable:
+            messages = self._stable_messages(context, messages)
+        else:
+            project_forge_tool_results(messages)
+            project_skill_documents(messages)
 
-        system_text = self._system_text(context)
-        if system_text and not _already_carries_system_text(messages, system_text):
-            messages.insert(0, {"role": "system", "content": system_text})
+            system_text = self._system_text(context)
+            if system_text and not _already_carries_system_text(messages, system_text):
+                messages.insert(0, {"role": "system", "content": system_text})
 
         hidden_names: frozenset[str] = frozenset()
         if self._hidden_tools is not None:
             hidden = self._hidden_tools(context)
             if hidden:
                 hidden_names = frozenset(hidden)
+        # Preserve the caller's offered order. Sorting by name would change
+        # stage semantics and the provider's tool-prefix cache.
         visible = tuple(
             tool
             for tool in tools
@@ -290,16 +362,75 @@ class PromptAssemblerImpl:
             )
         return PromptBundle(messages=tuple(messages), tools=visible, policy=effective_policy)
 
-    def _system_text(self, context: ExecutionContext) -> str:
+    def _stable_messages(
+        self, context: ExecutionContext, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Keep the static prefix stable and put live state last.
+
+        Identical duplicates reference the *earliest* full copy, so a new
+        duplicate at the tail leaves every older message unchanged. Runtime
+        context messages already stored in a replayed history are dropped
+        before the fresh one is appended; the caller's own history is never
+        edited.
+        """
+        project_forge_tool_results(messages, keep_earliest=True)
+        project_skill_documents(messages, keep_earliest=True)
+        _drop_runtime_context(messages)
+
+        system_text = self._system_text(context, include_fragments=False)
+        if system_text and not _already_carries_system_text(messages, system_text):
+            messages.insert(0, {"role": "system", "content": system_text})
+
+        runtime_text = self._system_text(context, include_fragments=True, include_static=False)
+        if runtime_text:
+            # The provider has one generic user role for non-assistant input;
+            # the header states clearly that this is environment state, not a
+            # task authored by the user.
+            messages.append(
+                {
+                    "role": "user",
+                    "name": _RUNTIME_CONTEXT_NAME,
+                    "content": (
+                        f"{_RUNTIME_CONTEXT_HEADER}\n"
+                        f"{_RUNTIME_CONTEXT_MARKER}\n\n"
+                        f"{runtime_text}\n\n"
+                        f"{_RUNTIME_CONTEXT_FOOTER}"
+                    ),
+                }
+            )
+        return messages
+
+    def _system_text(
+        self,
+        context: ExecutionContext,
+        *,
+        include_fragments: bool = True,
+        include_static: bool = True,
+    ) -> str:
         parts: list[str] = []
-        if self._system_instructions.strip():
+        if include_static and self._system_instructions.strip():
             parts.append(self._system_instructions)
-        for fragment in self._fragments:
-            text = fragment(context)
-            if text is None:
-                continue
-            if not isinstance(text, str):
-                raise TypeError("prompt fragment must return a string or None")
-            if text.strip():
-                parts.append(text)
+        if include_fragments:
+            for fragment in self._fragments:
+                text = fragment(context)
+                if text is None:
+                    continue
+                if not isinstance(text, str):
+                    raise TypeError("prompt fragment must return a string or None")
+                if text.strip():
+                    parts.append(text)
         return "\n\n".join(parts)
+
+
+def _drop_runtime_context(messages: list[dict[str, Any]]) -> None:
+    """Remove stale live-state messages anywhere in the copied history.
+
+    A previous turn's request snapshot may have stored the runtime tail before
+    the session projection learned to filter it. Dropping only an older tail
+    would leave stale blockers in a later prefix; dropping every exact marker
+    message is safe because a real user message never matches the full
+    protocol. The caller's history is not edited.
+    """
+    messages[:] = [
+        message for message in messages if not is_runtime_context_message(message)
+    ]

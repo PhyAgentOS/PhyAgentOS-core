@@ -15,7 +15,7 @@ import json_repair
 
 from PhyAgentOS.providers._openai_client import build_async_openai_client
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from PhyAgentOS.providers.errors import describe_provider_error
+from PhyAgentOS.providers.errors import describe_provider_error, extract_error_code
 
 
 class OpenAIResponsesProvider(LLMProvider):
@@ -68,8 +68,16 @@ class OpenAIResponsesProvider(LLMProvider):
                 try:
                     return self._parse(await self._client.responses.create(**kwargs))
                 except Exception as e2:
-                    return LLMResponse(content=describe_provider_error(e2), finish_reason="error")
-            return LLMResponse(content=describe_provider_error(e), finish_reason="error")
+                    return LLMResponse(
+                        content=describe_provider_error(e2),
+                        finish_reason="error",
+                        error_code=extract_error_code(e2),
+                    )
+            return LLMResponse(
+                content=describe_provider_error(e),
+                finish_reason="error",
+                error_code=extract_error_code(e),
+            )
 
     # -- request translation -------------------------------------------------
 
@@ -166,6 +174,7 @@ class OpenAIResponsesProvider(LLMProvider):
                         reasoning_parts.append(text)
         status = getattr(response, "status", None) or "completed"
         content = getattr(response, "output_text", "") or ""
+        error_code: str | None = None
         if status == "completed":
             finish_reason = "stop"
         elif status == "incomplete":
@@ -185,6 +194,7 @@ class OpenAIResponsesProvider(LLMProvider):
                 if status == "cancelled"
                 else describe_provider_error(detail or "Responses API request failed")
             )
+            error_code = extract_error_code(error)
         u = getattr(response, "usage", None)
         return LLMResponse(
             content=content,
@@ -192,6 +202,7 @@ class OpenAIResponsesProvider(LLMProvider):
             finish_reason=finish_reason,
             usage=self._usage_to_dict(u),
             reasoning_content="\n".join(reasoning_parts) or None,
+            error_code=error_code,
         )
 
     def get_default_model(self) -> str:

@@ -19,6 +19,7 @@ from core_background_support import (
 
 from PhyAgentOS.agent.core import TurnRequest, TurnStatus
 from PhyAgentOS.agent.core.events import EventType
+from PhyAgentOS.agent.core.prompt import is_runtime_context_message
 from PhyAgentOS.agent.services.background_runtime import TurnBinding, TurnRoutes
 from PhyAgentOS.cli.command_groups import agent_commands
 from PhyAgentOS.config.schema import MCPServerConfig
@@ -138,7 +139,8 @@ async def test_core_entry_cancel_reaps_running_shell_and_keeps_other_sessions_us
     tmp_path, monkeypatch,
 ):
     async def answer(count, messages, tools):
-        if messages[-1]["role"] == "user" and messages[-1]["content"] == "long tool":
+        current = [message for message in messages if not is_runtime_context_message(message)][-1]
+        if current["role"] == "user" and current["content"] == "long tool":
             return tool_call(
                 "long-shell", "exec", {"command": "echo $$ > running.pid; exec sleep 60"},
             )
@@ -181,10 +183,13 @@ async def test_mcp_discovery_precedes_real_entry_composition(tmp_path, monkeypat
 
     async def answer(count, messages, tools):
         names = {item["function"]["name"] for item in tools}
-        assert "mcp_local_echo" in names
         if count == 1:
+            assert "mcp_local_echo" not in names
+            return tool_call("discover-mcp", "tool_search", {"query": "mcp_local_echo"})
+        assert "mcp_local_echo" in names
+        if count == 2:
             return tool_call("mcp-call", "mcp_local_echo", {})
-        assert "echo:{}" in messages[-1]["content"]
+        assert any("echo:{}" in str(message.get("content")) for message in messages)
         return response("done")
 
     config, opened = entry(monkeypatch, tmp_path, ScriptedProvider(answer))
@@ -222,7 +227,7 @@ async def test_mode_tool_is_registered_for_compatible_entry_provider(tmp_path, m
         assert "agent_mode" in {item["function"]["name"] for item in tools}
         if count == 1:
             return tool_call("mode-call", "agent_mode", {"method": "list"})
-        assert "Available Models" in messages[-1]["content"]
+        assert any("Available Models" in str(message.get("content")) for message in messages)
         return response("done")
 
     provider = ScriptedProvider(answer)
@@ -260,8 +265,9 @@ async def test_tool_provider_resolver_tracks_each_running_turn_selection(tmp_pat
 
 async def test_spawn_completion_reaches_cli_with_parent_identity(tmp_path, monkeypatch):
     async def answer(count, messages, tools):
-        if messages[-1]["role"] == "user":
-            if messages[-1]["content"] == "delegate":
+        current = [message for message in messages if not is_runtime_context_message(message)][-1]
+        if current["role"] == "user":
+            if current["content"] == "delegate":
                 return tool_call("spawn-call", "spawn", {"task": "child-report"})
             return response("child completed")
         return response("delegated")
@@ -282,8 +288,9 @@ async def test_spawn_reply_uses_original_route_after_parent_unbinds(tmp_path, mo
     sent = []
 
     async def answer(count, messages, tools):
-        if messages[-1]["role"] == "user":
-            if messages[-1]["content"] == "delegate":
+        current = [message for message in messages if not is_runtime_context_message(message)][-1]
+        if current["role"] == "user":
+            if current["content"] == "delegate":
                 return tool_call("spawn-call", "spawn", {"task": "child-report"})
             child_started.set()
             await release_child.wait()

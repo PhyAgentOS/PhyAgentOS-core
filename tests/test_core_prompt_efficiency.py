@@ -28,6 +28,16 @@ def _ctx() -> ExecutionContext:
     )
 
 
+def _stable_ctx(step: str = "t:step:1", session: str = "s") -> ExecutionContext:
+    return ExecutionContext(
+        session_id=session,
+        turn_id="t",
+        step_id=step,
+        cancellation=CancellationToken(),
+        budget=Budget(max_steps=8),
+    )
+
+
 def _tool(name: str) -> ToolDefinition:
     return ToolDefinition(name=name, description="d", parameters={"type": "object"})
 
@@ -376,3 +386,261 @@ def test_prepared_request_newer_than_checkpoint_is_used() -> None:
     status = _ContextStatus(session, Output())
     __import__("asyncio").run(status.load("s"))
     assert status.snapshot("s").tokens > 1000
+
+
+# -- cache-stable layout -------------------------------------------------
+
+
+def test_cache_stable_keeps_system_fixed_and_puts_live_state_at_the_tail() -> None:
+    def live(context: ExecutionContext) -> str:
+        return f"blockers: fresh at {context.step_id}"
+
+    assembler = PromptAssemblerImpl(
+        "SYS", fragments=[live], cache_stable=True
+    )
+    bundle = asyncio.run(
+        assembler.assemble(
+            _stable_ctx("t:step:1"),
+            history=[{"role": "user", "content": "pick the cube"}],
+            tools=[_tool("echo")],
+        )
+    )
+
+    assert bundle.messages[0] == {"role": "system", "content": "SYS"}
+    assert [message["role"] for message in bundle.messages] == ["system", "user", "user"]
+    tail = bundle.messages[-1]["content"]
+    assert "blockers: fresh at t:step:1" in tail
+    assert "not a user message" in tail
+    assert "blockers:" not in bundle.messages[0]["content"]
+
+
+def test_cache_stable_prefix_is_byte_identical_across_steps() -> None:
+    def live(context: ExecutionContext) -> str:
+        return f"step={context.step_id}"
+
+    assembler = PromptAssemblerImpl("SYS", fragments=[live], cache_stable=True)
+    history: list[dict[str, object]] = [{"role": "user", "content": "do it"}]
+    first = asyncio.run(
+        assembler.assemble(_stable_ctx("t:step:1"), history=history, tools=[])
+    )
+
+    # The driver appends the settled step; the assembler never edits history.
+    history.append({"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]})
+    history.append({"role": "tool", "tool_call_id": "c1", "content": "ok"})
+    second = asyncio.run(
+        assembler.assemble(_stable_ctx("t:step:2"), history=history, tools=[])
+    )
+
+    assert len(history) == 3
+    # Everything sent before the previous runtime block is unchanged.
+    assert second.messages[: len(first.messages) - 1] == first.messages[: -1]
+    assert second.messages[-1]["content"].endswith("--- End runtime context ---")
+    assert "step=t:step:2" in second.messages[-1]["content"]
+
+
+def test_cache_stable_does_not_stack_runtime_blocks() -> None:
+    assembler = PromptAssemblerImpl(
+        "SYS", fragments=[lambda context: "live"], cache_stable=True
+    )
+    history: list[dict[str, object]] = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "one"},
+    ]
+    first = asyncio.run(
+        assembler.assemble(_stable_ctx("t:step:1"), history=history, tools=[])
+    )
+    # Feed back the previous request as if a caller persisted it.
+    replayed = [dict(message) for message in first.messages[1:]]
+    second = asyncio.run(
+        assembler.assemble(_stable_ctx("t:step:2"), history=replayed, tools=[])
+    )
+
+    runtime_blocks = [
+        message
+        for message in second.messages
+        if isinstance(message.get("content"), str)
+        and message["content"].startswith("--- Runtime context")
+    ]
+    assert len(runtime_blocks) == 1
+    assert second.messages[-1] is runtime_blocks[0]
+
+
+def test_cache_stable_keeps_tool_order_and_two_sessions_apart() -> None:
+    def live(context: ExecutionContext) -> str:
+        return f"session={context.session_id}"
+
+    assembler = PromptAssemblerImpl("SYS", fragments=[live], cache_stable=True)
+    tools = [_tool("zeta"), _tool("alpha"), _tool("middle")]
+    a = asyncio.run(
+        assembler.assemble(
+            _stable_ctx("t:step:1", "session-a"),
+            history=[{"role": "user", "content": "hi"}],
+            tools=tools,
+        )
+    )
+    b = asyncio.run(
+        assembler.assemble(
+            _stable_ctx("t:step:1", "session-b"),
+            history=[{"role": "user", "content": "hi"}],
+            tools=tools,
+        )
+    )
+    assert [tool.name for tool in a.tools] == ["zeta", "alpha", "middle"]
+    assert "session=session-a" in a.messages[-1]["content"]
+    assert "session=session-b" in b.messages[-1]["content"]
+    assert "session=session-b" not in a.messages[-1]["content"]
+
+
+def test_cache_stable_skill_dedup_keeps_the_earliest_full_document() -> None:
+    from PhyAgentOS.agent.core.prompt import project_skill_documents
+
+    doc = "SKILL BODY " + "D" * 400
+    content = json.dumps(
+        {"ok": True, "activation": {"skill_name": "robot"}, "skill": doc}
+    )
+    messages = [
+        {"role": "tool", "tool_call_id": "c1", "name": "activate_skill", "content": content},
+        {"role": "tool", "tool_call_id": "c2", "name": "activate_skill", "content": content},
+    ]
+
+    assert project_skill_documents(messages, keep_earliest=True) == 1
+
+    assert json.loads(messages[0]["content"])["skill"] == doc
+    later = json.loads(messages[1]["content"])
+    assert "skill" not in later
+    assert len(later["skill_document_omitted"]["sha256"]) == 64
+
+
+def test_cache_stable_forge_dedup_keeps_earliest_and_safety() -> None:
+    from PhyAgentOS.agent.core.prompt import project_forge_tool_results
+
+    content = json.dumps(
+        {"ok": True, "data": {"task_id": "t1", "status": "succeeded", "r": "Z" * 400}}
+    )
+    unsafe = json.dumps({"ok": True, "data": {"status": "unknown", "r": "Z" * 400}})
+    messages = [
+        {"role": "tool", "tool_call_id": "c1", "name": "forge_tool_query", "content": content},
+        {"role": "tool", "tool_call_id": "c2", "name": "forge_tool_query", "content": content},
+        {"role": "tool", "tool_call_id": "c3", "name": "forge_tool_query", "content": unsafe},
+    ]
+
+    assert project_forge_tool_results(messages, keep_earliest=True) == 1
+    assert messages[0]["content"] == content
+    marker = json.loads(messages[1]["content"])
+    assert marker["duplicate_of_earlier_result"]["sha256"]
+    assert messages[2]["content"] == unsafe
+
+
+def test_cache_stable_skill_versions_keep_separate_full_bodies() -> None:
+    from PhyAgentOS.agent.core.prompt import project_skill_documents
+
+    old_doc = "OLD SKILL " + "A" * 400
+    new_doc = "NEW SKILL " + "B" * 400
+    old = json.dumps({"ok": True, "activation": {"skill_name": "robot"}, "skill": old_doc})
+    new = json.dumps({"ok": True, "activation": {"skill_name": "robot"}, "skill": new_doc})
+    messages = [
+        {"role": "tool", "tool_call_id": "c1", "name": "activate_skill", "content": old},
+        {"role": "tool", "tool_call_id": "c2", "name": "activate_skill", "content": new},
+    ]
+
+    assert project_skill_documents(messages, keep_earliest=True) == 0
+    assert json.loads(messages[0]["content"])["skill"] == old_doc
+    assert json.loads(messages[1]["content"])["skill"] == new_doc
+
+
+def test_runtime_context_helper_only_matches_the_exact_protocol() -> None:
+    from PhyAgentOS.agent.core.prompt import is_runtime_context_message
+
+    assembler = PromptAssemblerImpl(
+        "SYS", fragments=[lambda context: "live"], cache_stable=True
+    )
+    bundle = asyncio.run(
+        assembler.assemble(
+            _stable_ctx(),
+            history=[{"role": "user", "content": "real task"}],
+            tools=[],
+        )
+    )
+    assert is_runtime_context_message(bundle.messages[-1])
+    assert not is_runtime_context_message({"role": "user", "content": "real task"})
+    assert not is_runtime_context_message(
+        {"role": "user", "content": "--- Runtime context for this step ---"}
+    )
+
+
+def test_cross_turn_stored_runtime_tail_is_removed_before_new_state() -> None:
+    def live(context: ExecutionContext) -> str:
+        return f"blocker: turn {context.turn_id} step {context.step_id}"
+
+    assembler = PromptAssemblerImpl("SYS", fragments=[live], cache_stable=True)
+    previous = asyncio.run(
+        assembler.assemble(
+            _stable_ctx("old:step:1"),
+            history=[{"role": "user", "content": "old task"}],
+            tools=[],
+        )
+    )
+    # Simulate a driver that replays the last request snapshot minus its leading
+    # system header, then appends the real next-turn user request.
+    history = [dict(message) for message in previous.messages[1:]]
+    history.append({"role": "user", "content": "new real task"})
+    assert any("blocker: turn t step old:step:1" in m["content"] for m in history)
+
+    next_context = _stable_ctx("new:step:1")
+    next_context = ExecutionContext(
+        session_id=next_context.session_id,
+        turn_id="turn-2",
+        step_id=next_context.step_id,
+        cancellation=next_context.cancellation,
+        budget=next_context.budget,
+    )
+    bundle = asyncio.run(assembler.assemble(next_context, history=history, tools=[]))
+
+    assert bundle.messages[0] == {"role": "system", "content": "SYS"}
+    assert [m["content"] for m in bundle.messages if m["role"] == "user"] == [
+        "old task",
+        "new real task",
+        bundle.messages[-1]["content"],
+    ]
+    assert "old:step:1" not in bundle.messages[-1]["content"]
+    assert bundle.messages[-1]["content"].count("--- Runtime context") == 1
+    assert "turn-2 step new:step:1" in bundle.messages[-1]["content"]
+    # The caller's replayed history is untouched.
+    assert any("old:step:1" in m["content"] for m in history)
+
+
+def test_runtime_block_carries_standard_name_and_user_copy_is_preserved() -> None:
+    from PhyAgentOS.agent.core.prompt import is_runtime_context_message
+
+    assembler = PromptAssemblerImpl(
+        "SYS", fragments=[lambda context: "live"], cache_stable=True
+    )
+    bundle = asyncio.run(
+        assembler.assemble(
+            _stable_ctx(),
+            history=[{"role": "user", "content": "real task"}],
+            tools=[],
+        )
+    )
+    runtime = bundle.messages[-1]
+    assert runtime["name"] == "paos_runtime_context"
+    assert is_runtime_context_message(runtime)
+
+    pasted = dict(runtime)
+    pasted.pop("name")
+    assert not is_runtime_context_message(pasted)
+    assert not is_runtime_context_message({**runtime, "name": "someone_else"})
+
+    # A real user message that pasted our exact marker text has no name; the
+    # assembler must keep it verbatim and only append its own fresh block.
+    replayed = asyncio.run(
+        assembler.assemble(
+            _stable_ctx("t:step:2"),
+            history=[{"role": "user", "content": pasted["content"]}],
+            tools=[],
+        )
+    )
+    assert replayed.messages[1]["content"] == pasted["content"]
+    assert replayed.messages[1].get("name") is None
+    assert is_runtime_context_message(replayed.messages[-1])
+    assert replayed.messages[-1]["name"] == "paos_runtime_context"

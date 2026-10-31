@@ -48,6 +48,14 @@ from PhyAgentOS.agent.core import (
     TurnStatus,
     UnfinishedCall,
 )
+from PhyAgentOS.agent.core.protocols import (
+    BatchToolExecutor,
+    ContextPolicy,
+    SteeringControl,
+    TurnBudgetControl,
+)
+from PhyAgentOS.agent.core.tools import ToolExecutorImpl
+from PhyAgentOS.agent.services.turn_budget import TurnBudget
 
 
 def _context(**overrides: object) -> ExecutionContext:
@@ -886,3 +894,40 @@ async def test_protocols_can_be_implemented_and_driven_independently() -> None:
     assert store.closed
     with pytest.raises(RuntimeError):
         await host.submit(TurnRequest(session_id="session-1", text="late"))
+
+
+class _PerformanceContextPolicy:
+    async def prepare(
+        self,
+        context: ExecutionContext,
+        history: tuple,
+        tools: tuple,
+        *,
+        force: bool = False,
+    ) -> None:
+        return None
+
+
+class _PerformanceSteering:
+    def drain(self, session_id: str, turn_id: str) -> tuple[str, ...]:
+        return ()
+
+
+def test_optional_performance_protocols_are_minimal_and_checkable() -> None:
+    executor = ToolExecutorImpl([], _FakeStore())
+    assert isinstance(executor, BatchToolExecutor)
+    assert executor.registrations == ()
+    assert executor.registration("missing") is None
+
+    policy = _PerformanceContextPolicy()
+    assert isinstance(policy, ContextPolicy)
+    steering = _PerformanceSteering()
+    assert isinstance(steering, SteeringControl)
+
+    tracker = TurnBudget(
+        max_tokens=100, repeated_call_limit=3, reserve_steps=1
+    ).begin_turn()
+    assert isinstance(tracker, TurnBudgetControl)
+    assert not tracker.token_budget_exhausted()
+    assert not tracker.is_summary_step(1, 1)
+    assert tracker.is_summary_step(2, 2)

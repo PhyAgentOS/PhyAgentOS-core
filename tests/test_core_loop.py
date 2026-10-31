@@ -14,6 +14,7 @@ from dataclasses import replace
 
 import pytest
 
+from PhyAgentOS.agent.core import AgentRuntimeImpl, SQLiteSessionStore
 from PhyAgentOS.agent.core.events import EventType, RuntimeEvent
 from PhyAgentOS.agent.core.loop import LoopDriverImpl
 from PhyAgentOS.agent.core.types import (
@@ -33,6 +34,8 @@ from PhyAgentOS.agent.core.types import (
     TurnStart,
     TurnStatus,
 )
+from PhyAgentOS.agent.services.context_policy import ContextPolicy
+from PhyAgentOS.agent.services.turn_budget import TurnBudget
 
 _DRIVER_EVENTS = frozenset(
     {
@@ -197,6 +200,10 @@ def _driver(
     store: _Store,
     *,
     tools: tuple[ToolDefinition, ...] = (),
+    max_parallel_tools: int = 4,
+    context_policy: object = None,
+    turn_budget: object = None,
+    steering: object = None,
 ) -> LoopDriverImpl:
     return LoopDriverImpl(
         assembler=assembler,
@@ -208,6 +215,10 @@ def _driver(
         temperature=0.1,
         max_tokens=64,
         reasoning_effort="low",
+        max_parallel_tools=max_parallel_tools,
+        context_policy=context_policy,
+        turn_budget=turn_budget,
+        steering=steering,
     )
 
 
@@ -756,3 +767,832 @@ async def test_driver_writes_only_its_own_events() -> None:
         if event.type is EventType.MODEL_ATTEMPT_STARTED
     ]
     assert len(set(model_call_ids)) == 2
+
+
+class _Reduction:
+    def __init__(
+        self,
+        messages: list[dict],
+        before_tokens: int,
+        after_tokens: int,
+        reason: str = "test reduction",
+    ) -> None:
+        self.messages = tuple(messages)
+        self.before_tokens = before_tokens
+        self.after_tokens = after_tokens
+        self.reason = reason
+
+
+class _ContextPolicy:
+    def __init__(self, handler: Callable[[tuple, bool], object]) -> None:
+        self._handler = handler
+        self.calls: list[tuple[ExecutionContext, list[dict], tuple, bool]] = []
+
+    async def prepare(
+        self,
+        context: ExecutionContext,
+        history: tuple,
+        tools: tuple,
+        *,
+        force: bool = False,
+    ) -> object:
+        self.calls.append((context, [dict(message) for message in history], tools, force))
+        return self._handler(history, force)
+
+
+class _Steering:
+    def __init__(self, texts: list[tuple[str, ...]]) -> None:
+        self.texts = list(texts)
+        self.calls: list[tuple[str, str]] = []
+
+    def drain(self, session_id: str, turn_id: str) -> tuple[str, ...]:
+        self.calls.append((session_id, turn_id))
+        return self.texts.pop(0) if self.texts else ()
+
+
+class _BrokenSteering:
+    def drain(self, session_id: str, turn_id: str) -> tuple[str, ...]:
+        raise RuntimeError("steering backend down")
+
+
+async def test_context_policy_reduction_is_persisted_before_the_model_call() -> None:
+    reduction = _Reduction(
+        [
+            {"role": "system", "content": "summary of earlier work"},
+            {"role": "user", "content": "hi"},
+        ],
+        100,
+        40,
+        "trim older turns",
+    )
+    policy = _ContextPolicy(lambda history, force: reduction if not force else None)
+    adapter = _Adapter([ModelResponse(content="done", finish_reason="stop")])
+    store = _Store()
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), store, context_policy=policy
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.COMPLETED
+    types = _event_types(store)
+    assert types == [
+        EventType.CONTEXT_COMPACTED,
+        EventType.REQUEST_PREPARED,
+        EventType.MODEL_ATTEMPT_STARTED,
+        EventType.MODEL_ATTEMPT_COMPLETED,
+    ]
+    compacted = store.events[0]
+    assert compacted.turn_id == "turn-1"
+    assert compacted.step_id is None
+    assert compacted.payload["before_tokens"] == 100
+    assert compacted.payload["after_tokens"] == 40
+    assert compacted.payload["reason"] == "trim older turns"
+    assert compacted.payload["messages"] == list(reduction.messages)
+    assert adapter.requests[0].to_messages()[:2] == list(reduction.messages)
+    assert policy.calls[0][3] is False
+    assert policy.calls[0][1] == [{"role": "user", "content": "hi"}]
+    assert policy.calls[0][2] == ()
+
+
+async def test_context_policy_none_leaves_history_and_events_unchanged() -> None:
+    policy = _ContextPolicy(lambda history, force: None)
+    adapter = _Adapter([ModelResponse(content="done", finish_reason="stop")])
+    store = _Store()
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), store, context_policy=policy
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.COMPLETED
+    assert EventType.CONTEXT_COMPACTED not in _event_types(store)
+    assert adapter.requests[0].to_messages() == [
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "sys"},
+    ]
+    assert len(policy.calls) == 1
+
+
+async def test_context_policy_invalid_reduction_fails_before_the_model_call() -> None:
+    policy = _ContextPolicy(lambda history, force: _Reduction([], -1, 0))
+    adapter = _Adapter([ModelResponse(content="never", finish_reason="stop")])
+    store = _Store()
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), store, context_policy=policy
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.FAILED
+    assert result.error is not None and "invalid reduction" in result.error
+    assert adapter.requests == []
+    assert store.events == []
+
+
+async def test_context_overflow_retries_once_after_a_forced_reduction() -> None:
+    reduction = _Reduction([{"role": "user", "content": "short"}], 1000, 100, "forced")
+    policy = _ContextPolicy(
+        lambda history, force: reduction if force else None
+    )
+    adapter = _Adapter(
+        [
+            ModelCallError("model-x", "too long", code="context_overflow"),
+            ModelResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    store = _Store()
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), store, context_policy=policy
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.COMPLETED
+    assert result.reply == "done"
+    assert len(adapter.requests) == 2
+    assert adapter.requests[0].model_call_id != adapter.requests[1].model_call_id
+    assert [call[3] for call in policy.calls] == [False, True]
+    assert adapter.requests[1].to_messages()[0] == {
+        "role": "user",
+        "content": "short",
+    }
+    types = _event_types(store)
+    assert types == [
+        EventType.REQUEST_PREPARED,
+        EventType.MODEL_ATTEMPT_STARTED,
+        EventType.MODEL_ATTEMPT_FAILED,
+        EventType.CONTEXT_COMPACTED,
+        EventType.REQUEST_PREPARED,
+        EventType.MODEL_ATTEMPT_STARTED,
+        EventType.MODEL_ATTEMPT_COMPLETED,
+    ]
+    assert store.events[2].payload["error"] == "too long"
+
+
+async def test_context_overflow_without_a_real_reduction_is_not_retried() -> None:
+    policy = _ContextPolicy(lambda history, force: None)
+    adapter = _Adapter(
+        [ModelCallError("model-x", "too long", code="context_overflow")]
+    )
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), _Store(), context_policy=policy
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.FAILED
+    assert len(adapter.requests) == 1
+    assert [call[3] for call in policy.calls] == [False, True]
+
+
+async def test_context_overflow_is_retried_at_most_once() -> None:
+    reduction = _Reduction([{"role": "user", "content": "short"}], 1000, 100, "forced")
+    policy = _ContextPolicy(lambda history, force: reduction if force else None)
+    adapter = _Adapter(
+        [
+            ModelCallError("model-x", "too long", code="context_overflow"),
+            ModelCallError("model-y", "still too long", code="context_overflow"),
+        ]
+    )
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), _Store(), context_policy=policy
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.FAILED
+    assert len(adapter.requests) == 2
+    assert [call[3] for call in policy.calls] == [False, True]
+
+
+async def test_steering_text_is_persisted_then_used_at_the_next_safe_step() -> None:
+    steering = _Steering([(), ("correct it",)])
+    adapter = _Adapter(
+        [
+            ModelResponse(
+                content=None,
+                finish_reason="tool_calls",
+                tool_calls=(_echo_call(),),
+            ),
+            ModelResponse(content="fixed", finish_reason="stop"),
+        ]
+    )
+    store = _Store()
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), store, steering=steering
+    ).run(_turn())
+
+    assert result.status is TurnStatus.COMPLETED
+    assert steering.calls == [("session-1", "turn-1"), ("session-1", "turn-1")]
+    types = _event_types(store)
+    assert types.count(EventType.INPUT_STEERED) == 1
+    steered = [event for event in store.events if event.type is EventType.INPUT_STEERED][0]
+    assert steered.payload["text"] == "correct it"
+    assert steered.turn_id == "turn-1"
+    assert steered.step_id is not None
+    request_messages = adapter.requests[1].to_messages()
+    assert request_messages[-2] == {"role": "user", "content": "correct it"}
+    assert EventType.INPUT_STEERED in types
+
+
+async def test_steering_failure_stops_before_the_model_call() -> None:
+    adapter = _Adapter([ModelResponse(content="never", finish_reason="stop")])
+    store = _Store()
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), store, steering=_BrokenSteering()
+    ).run(_turn())
+
+    assert result.status is TurnStatus.FAILED
+    assert result.error is not None and "steering drain failed" in result.error
+    assert adapter.requests == []
+    assert store.events == []
+
+
+async def test_reserved_summary_step_returns_partial_reply_and_stays_failed() -> None:
+    config = TurnBudget(reserve_steps=1)
+    adapter = _Adapter(
+        [
+            ModelResponse(
+                content=None,
+                finish_reason="tool_calls",
+                tool_calls=(_echo_call(),),
+            ),
+            ModelResponse(content="partial progress summary", finish_reason="stop"),
+        ]
+    )
+    executor = _Executor()
+    store = _Store()
+
+    result = await _driver(
+        _Assembler(), adapter, executor, store, turn_budget=config
+    ).run(_turn(max_steps=2))
+
+    assert result.status is TurnStatus.FAILED
+    assert result.reply == "partial progress summary"
+    assert result.error is not None and "summary" in result.error
+    assert len(adapter.requests) == 2
+    assert adapter.requests[1].tools == ()
+    assert adapter.requests[1].tool_choice == "none"
+    assert len(executor.calls) == 1
+    prepared = [
+        event for event in store.events if event.type is EventType.REQUEST_PREPARED
+    ]
+    assert prepared[-1].payload["tools"] == []
+    assert prepared[-1].payload["tool_choice"] == "none"
+
+
+async def test_hard_token_budget_stops_before_dispatching_requested_tools() -> None:
+    config = TurnBudget(max_tokens=5)
+    adapter = _Adapter(
+        [
+            ModelResponse(
+                content=None,
+                finish_reason="tool_calls",
+                tool_calls=(_echo_call(),),
+                usage={"total_tokens": 5},
+            ),
+            ModelResponse(content="never", finish_reason="stop"),
+        ]
+    )
+    executor = _Executor()
+
+    result = await _driver(
+        _Assembler(), adapter, executor, _Store(), turn_budget=config
+    ).run(_turn())
+
+    assert result.status is TurnStatus.FAILED
+    assert result.error is not None and "token budget" in result.error
+    assert executor.calls == []
+    assert len(adapter.requests) == 1
+
+
+async def test_turn_budget_config_keeps_independent_state_per_run() -> None:
+    config = TurnBudget(max_tokens=5)
+    first_adapter = _Adapter(
+        [ModelResponse(content="first", finish_reason="stop", usage={"total_tokens": 5})]
+    )
+    second_adapter = _Adapter(
+        [ModelResponse(content="second", finish_reason="stop", usage={"total_tokens": 5})]
+    )
+
+    first = await _driver(
+        _Assembler(), first_adapter, _Executor(), _Store(), turn_budget=config
+    ).run(_turn())
+    second = await _driver(
+        _Assembler(), second_adapter, _Executor(), _Store(), turn_budget=config
+    ).run(_turn())
+
+    assert first.status is TurnStatus.COMPLETED
+    assert second.status is TurnStatus.COMPLETED
+    assert len(first_adapter.requests) == 1
+    assert len(second_adapter.requests) == 1
+
+
+async def test_identical_no_progress_tool_results_stop_the_turn() -> None:
+    config = TurnBudget(repeated_call_limit=3)
+    repeated = ToolOutcome(
+        tool_call_id="call-1",
+        tool_name="echo",
+        status=ToolStatus.FAILED,
+        text="same failure",
+        error=ToolError("same_error", "same failure"),
+    )
+    tool_response = ModelResponse(
+        content=None,
+        finish_reason="tool_calls",
+        tool_calls=(_echo_call(),),
+    )
+    adapter = _Adapter([tool_response, tool_response, tool_response, tool_response])
+    executor = _Executor(outcomes=[repeated, repeated, repeated])
+
+    result = await _driver(
+        _Assembler(), adapter, executor, _Store(), turn_budget=config
+    ).run(_turn(max_steps=4))
+
+    assert result.status is TurnStatus.FAILED
+    assert result.error is not None and "no progress" in result.error
+    assert len(executor.calls) == 3
+    assert len(adapter.requests) == 3
+
+
+async def test_one_step_turn_with_reserved_summary_still_gets_a_normal_request() -> None:
+    config = TurnBudget(reserve_steps=1)
+    adapter = _Adapter([ModelResponse(content="normal answer", finish_reason="stop")])
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), _Store(), turn_budget=config
+    ).run(_turn(max_steps=1))
+
+    assert result.status is TurnStatus.COMPLETED
+    assert result.reply == "normal answer"
+    assert len(adapter.requests) == 1
+    assert adapter.requests[0].tool_choice is None
+
+
+async def test_overflow_retry_is_not_made_after_the_hard_token_cap_is_reached() -> None:
+    reduction = _Reduction([{"role": "user", "content": "short"}], 1000, 100, "forced")
+    policy = _ContextPolicy(lambda history, force: reduction if force else None)
+    config = TurnBudget(max_tokens=5)
+    adapter = _Adapter(
+        [
+            ModelCallError(
+                "model-x",
+                "too long",
+                usage={"total_tokens": 5},
+                code="context_overflow",
+            ),
+            ModelResponse(content="never requested", finish_reason="stop"),
+        ]
+    )
+    store = _Store()
+
+    result = await _driver(
+        _Assembler(),
+        adapter,
+        _Executor(),
+        store,
+        context_policy=policy,
+        turn_budget=config,
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.FAILED
+    assert result.error is not None and "token budget" in result.error
+    assert len(adapter.requests) == 1
+    # The forced policy call would itself cost another model request.
+    assert [call[3] for call in policy.calls] == [False]
+    assert EventType.CONTEXT_COMPACTED not in _event_types(store)
+
+
+class _NarrowingAssembler:
+    """Hides one tool and appends a live fragment on every assembly."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[ExecutionContext, list[dict], tuple]] = []
+
+    async def assemble(
+        self,
+        context: ExecutionContext,
+        *,
+        history: tuple,
+        tools: tuple[ToolDefinition, ...],
+    ) -> PromptBundle:
+        self.calls.append(
+            (context, [dict(message) for message in history], tuple(tools))
+        )
+        visible = tuple(tool for tool in tools if tool.name != "hidden")
+        return PromptBundle(
+            messages=(
+                *history,
+                {
+                    "role": "system",
+                    "content": f"live-fragment-{len(self.calls)}",
+                },
+            ),
+            tools=visible,
+        )
+
+
+class _RequestMessagesPolicy:
+    """A newer policy that accepts the real assembled request messages."""
+
+    def __init__(self, reduction: object = None, *, force_reduction: object = None) -> None:
+        self.reduction = reduction
+        self.force_reduction = force_reduction
+        self.calls: list[tuple[ExecutionContext, list[dict], tuple, bool]] = []
+        self.request_messages: list[list[dict] | None] = []
+
+    async def prepare(
+        self,
+        context: ExecutionContext,
+        history: tuple,
+        tools: tuple,
+        *,
+        force: bool = False,
+        request_messages: object = None,
+    ) -> object:
+        self.calls.append((context, [dict(message) for message in history], tools, force))
+        self.request_messages.append(
+            None
+            if request_messages is None
+            else [dict(message) for message in request_messages]
+        )
+        return self.force_reduction if force else self.reduction
+
+
+def _hidden_tool() -> ToolDefinition:
+    return ToolDefinition(
+        name="hidden",
+        description="Hidden tool.",
+        parameters={"type": "object", "properties": {}},
+    )
+
+
+async def test_context_policy_uses_visible_tools_and_real_bundle_messages() -> None:
+    visible = _echo_definition()
+    hidden = _hidden_tool()
+    assembler = _NarrowingAssembler()
+    reduction = _Reduction([{"role": "user", "content": "compressed"}], 100, 40)
+    policy = _RequestMessagesPolicy(reduction)
+    adapter = _Adapter([ModelResponse(content="done", finish_reason="stop")])
+    store = _Store()
+
+    result = await _driver(
+        assembler,
+        adapter,
+        _Executor(),
+        store,
+        tools=(visible, hidden),
+        context_policy=policy,
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.COMPLETED
+    # Measurement assembly plus one re-assembly after the reduction.
+    assert len(assembler.calls) == 2
+    assert assembler.calls[0][2] == (visible, hidden)
+    assert assembler.calls[1][1] == [{"role": "user", "content": "compressed"}]
+
+    _, policy_history, policy_tools, _ = policy.calls[0]
+    assert policy_tools == (visible,)
+    assert policy_history == [{"role": "user", "content": "hi"}]
+    assert policy.request_messages[0] is not None
+    assert policy.request_messages[0][-1] == {
+        "role": "system",
+        "content": "live-fragment-1",
+    }
+    # The dynamic fragment never enters the internal history or the checkpoint.
+    compacted = [
+        event for event in store.events if event.type is EventType.CONTEXT_COMPACTED
+    ][0]
+    assert compacted.payload["messages"] == [{"role": "user", "content": "compressed"}]
+    assert adapter.requests[0].to_messages() == [
+        {"role": "user", "content": "compressed"},
+        {"role": "system", "content": "live-fragment-2"},
+    ]
+
+
+async def test_context_policy_without_reduction_reuses_the_single_assembly() -> None:
+    visible = _echo_definition()
+    assembler = _NarrowingAssembler()
+    policy = _RequestMessagesPolicy(None)
+    adapter = _Adapter([ModelResponse(content="done", finish_reason="stop")])
+
+    result = await _driver(
+        assembler,
+        adapter,
+        _Executor(),
+        _Store(),
+        tools=(visible, _hidden_tool()),
+        context_policy=policy,
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.COMPLETED
+    assert len(assembler.calls) == 1
+    assert policy.request_messages[0] is not None
+    assert policy.request_messages[0][-1]["content"] == "live-fragment-1"
+    assert adapter.requests[0].to_messages()[-1] == {
+        "role": "system",
+        "content": "live-fragment-1",
+    }
+
+
+class _UsageDrainingPolicy:
+    """Policy that also exposes the summary usage it observed."""
+
+    def __init__(
+        self,
+        reduction: object = None,
+        *,
+        force_reduction: object = None,
+        batches: tuple = (),
+        error: BaseException | None = None,
+    ) -> None:
+        self.reduction = reduction
+        self.force_reduction = force_reduction
+        self.batches = list(batches)
+        self.error = error
+        self.drain_calls = 0
+
+    async def prepare(
+        self,
+        context: ExecutionContext,
+        history: tuple,
+        tools: tuple,
+        *,
+        force: bool = False,
+    ) -> object:
+        if self.error is not None:
+            raise self.error
+        return self.force_reduction if force else self.reduction
+
+    def drain_usage(self) -> tuple:
+        self.drain_calls += 1
+        return self.batches.pop(0) if self.batches else ()
+
+
+async def test_context_preparation_usage_is_recorded_and_can_stop_the_turn() -> None:
+    config = TurnBudget(max_tokens=5)
+    policy = _UsageDrainingPolicy(batches=[({"total_tokens": 5},)])
+    adapter = _Adapter([ModelResponse(content="never", finish_reason="stop")])
+
+    result = await _driver(
+        _Assembler(),
+        adapter,
+        _Executor(),
+        _Store(),
+        context_policy=policy,
+        turn_budget=config,
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.FAILED
+    assert result.error is not None and "token budget" in result.error
+    assert adapter.requests == []
+    assert policy.drain_calls == 1
+
+
+async def test_context_preparation_usage_without_a_total_is_not_zero() -> None:
+    config = TurnBudget(max_tokens=5)
+    policy = _UsageDrainingPolicy(batches=[({"prompt_tokens": 3},)])
+    adapter = _Adapter([ModelResponse(content="done", finish_reason="stop")])
+
+    result = await _driver(
+        _Assembler(),
+        adapter,
+        _Executor(),
+        _Store(),
+        context_policy=policy,
+        turn_budget=config,
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.COMPLETED
+    assert result.reply == "done"
+    assert len(adapter.requests) == 1
+    assert policy.drain_calls == 1
+
+
+async def test_policy_usage_is_drained_even_when_prepare_fails() -> None:
+    policy = _UsageDrainingPolicy(
+        error=RuntimeError("summary backend down"),
+        batches=[({"total_tokens": 5},)],
+    )
+
+    result = await _driver(
+        _Assembler(),
+        _Adapter([ModelResponse(content="never", finish_reason="stop")]),
+        _Executor(),
+        _Store(),
+        context_policy=policy,
+        turn_budget=TurnBudget(max_tokens=5),
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.FAILED
+    assert result.error is not None and "context policy failed" in result.error
+    assert policy.drain_calls == 1
+
+
+async def test_forced_recovery_summary_usage_blocks_the_retry() -> None:
+    config = TurnBudget(max_tokens=5)
+    reduction = _Reduction([{"role": "user", "content": "short"}], 1000, 100, "forced")
+    policy = _UsageDrainingPolicy(
+        force_reduction=reduction,
+        batches=[(), ({"total_tokens": 5},)],
+    )
+    adapter = _Adapter(
+        [
+            ModelCallError("model-x", "too long", code="context_overflow"),
+            ModelResponse(content="never requested", finish_reason="stop"),
+        ]
+    )
+
+    result = await _driver(
+        _Assembler(),
+        adapter,
+        _Executor(),
+        _Store(),
+        context_policy=policy,
+        turn_budget=config,
+    ).run(_turn("hi"))
+
+    assert result.status is TurnStatus.FAILED
+    assert result.error is not None and "token budget" in result.error
+    assert len(adapter.requests) == 1
+    assert policy.drain_calls == 2
+
+
+class _BlockingPolicy:
+    """Context policy whose summary provider call is pending until cancelled."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = False
+        self.drain_calls = 0
+
+    async def prepare(
+        self,
+        context: ExecutionContext,
+        history: tuple,
+        tools: tuple,
+        *,
+        force: bool = False,
+    ) -> object:
+        self.started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return None
+
+    def drain_usage(self) -> tuple:
+        self.drain_calls += 1
+        return ({"total_tokens": 2},)
+
+
+async def test_cancel_during_context_summary_stops_before_any_model_call() -> None:
+    policy = _BlockingPolicy()
+    adapter = _Adapter([ModelResponse(content="never", finish_reason="stop")])
+    turn = _turn()
+    driver = _driver(_Assembler(), adapter, _Executor(), _Store(), context_policy=policy)
+    before = asyncio.all_tasks()
+
+    running = asyncio.create_task(driver.run(turn))
+    await asyncio.wait_for(policy.started.wait(), timeout=1)
+    turn.cancellation.request("user stop")
+    result = await asyncio.wait_for(running, timeout=1)
+
+    assert result.status is TurnStatus.INTERRUPTED
+    assert policy.cancelled
+    assert policy.drain_calls == 1
+    assert adapter.requests == []
+    assert asyncio.all_tasks() - before == set()
+
+
+async def test_external_cancel_during_context_summary_reaps_and_drains() -> None:
+    policy = _BlockingPolicy()
+    adapter = _Adapter([ModelResponse(content="never", finish_reason="stop")])
+    driver = _driver(_Assembler(), adapter, _Executor(), _Store(), context_policy=policy)
+    before = asyncio.all_tasks()
+
+    running = asyncio.create_task(driver.run(_turn()))
+    await asyncio.wait_for(policy.started.wait(), timeout=1)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert policy.cancelled
+    assert policy.drain_calls == 1
+    assert adapter.requests == []
+    assert asyncio.all_tasks() - before == set()
+
+
+class _CancelThenReturnPolicy:
+    def __init__(self, turn: TurnStart) -> None:
+        self._turn = turn
+        self.drain_calls = 0
+
+    async def prepare(
+        self,
+        context: ExecutionContext,
+        history: tuple,
+        tools: tuple,
+        *,
+        force: bool = False,
+    ) -> object:
+        self._turn.cancellation.request("stop before the model call")
+        return None
+
+    def drain_usage(self) -> tuple:
+        self.drain_calls += 1
+        return ()
+
+
+async def test_token_set_while_prepare_settles_wins_over_the_model_call() -> None:
+    turn = _turn()
+    policy = _CancelThenReturnPolicy(turn)
+    adapter = _Adapter([ModelResponse(content="never", finish_reason="stop")])
+
+    result = await _driver(
+        _Assembler(), adapter, _Executor(), _Store(), context_policy=policy
+    ).run(turn)
+
+    assert result.status is TurnStatus.INTERRUPTED
+    assert adapter.requests == []
+    assert policy.drain_calls == 1
+
+
+class _BlockingSummaryProvider:
+    """Real ContextPolicy summary provider: pending until cancelled."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = False
+        self.calls = 0
+
+    async def chat_with_retry(self, messages: object, tools: object = None, **kwargs: object) -> object:
+        self.calls += 1
+        self.started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError as exc:
+            self.cancelled = True
+            exc.usage = {
+                "total_tokens": 4,
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+            }
+            raise
+        raise AssertionError("unreachable")
+
+
+async def test_runtime_cancel_during_real_context_summary_is_bounded(tmp_path) -> None:
+    store = SQLiteSessionStore(tmp_path / "context-cancel.db")
+    provider = _BlockingSummaryProvider()
+    policy = ContextPolicy(
+        store,
+        provider,
+        model="fake-model",
+        capacity=100_000,
+        reserve_tokens=1_000,
+        threshold=10,
+        system_instructions="sys",
+        estimator=lambda messages, tools: 1_000,
+        provider_name="fake-provider",
+    )
+    adapter = _Adapter([ModelResponse(content="first", finish_reason="stop")])
+    driver = LoopDriverImpl(
+        assembler=_Assembler(),
+        adapter=adapter,
+        executor=_Executor(),
+        store=store,
+        model="fake-model",
+        context_policy=policy,
+        turn_budget=TurnBudget(),
+    )
+    runtime = AgentRuntimeImpl(driver=driver, store=store, max_steps=4)
+
+    first = await runtime.submit(TurnRequest(session_id="s1", text="first"))
+    assert first.status is TurnStatus.COMPLETED
+
+    second = asyncio.create_task(
+        runtime.submit(TurnRequest(session_id="s1", text="second"))
+    )
+    await asyncio.wait_for(provider.started.wait(), timeout=1)
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    await asyncio.wait_for(runtime.cancel("s1"), timeout=1)
+    elapsed = loop.time() - started_at
+    result = await asyncio.wait_for(second, timeout=1)
+
+    assert elapsed < 1
+    assert result.status is TurnStatus.INTERRUPTED
+    assert provider.cancelled
+    assert provider.calls == 1
+    # The only model request was the completed first turn; the blocked
+    # summary never turned into a normal model call.
+    assert len(adapter.requests) == 1
+
+    attempts = await store.list_compaction_attempts("s1")
+    assert len(attempts) == 1
+    assert attempts[0].status == "interrupted"
+    assert attempts[0].usage == {
+        "total_tokens": 4,
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+    }
+    await runtime.aclose()

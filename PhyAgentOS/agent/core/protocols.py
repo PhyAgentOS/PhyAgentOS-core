@@ -83,15 +83,19 @@ if TYPE_CHECKING:  # annotation only; the store module imports these protocols
 __all__ = [
     "AgentHost",
     "AgentRuntime",
+    "BatchToolExecutor",
     "Capability",
+    "ContextPolicy",
     "LoopDriver",
     "ModelAdapter",
     "PromptAssembler",
     "SessionStore",
     "SessionSnapshot",
     "StartupSnapshotStore",
+    "SteeringControl",
     "StreamingModelAdapter",
     "ToolExecutor",
+    "TurnBudgetControl",
     "UndoTurnStore",
 ]
 
@@ -261,6 +265,85 @@ class ToolExecutor(Protocol):
     """
 
     async def execute(self, call: ToolCall, context: ExecutionContext) -> ToolOutcome: ...
+
+
+@runtime_checkable
+class BatchToolExecutor(Protocol):
+    """Optional extension: run one step's calls with declared-safe parallelism.
+
+    The driver uses it when the injected executor implements it and otherwise
+    falls back to sequential :meth:`ToolExecutor.execute` calls. Every call must
+    still follow the single-call contract: validation, policy, and durable
+    ``tool.intent`` / ``tool.dispatched`` before the handler. Only calls whose
+    registration declares ``parallel_safe=True`` may overlap. Results are
+    returned in the original call order; a call that never started after a
+    persistence failure or a local stop is reported as ``cancelled``, never as
+    success or unknown.
+    """
+
+    async def execute_batch(
+        self,
+        calls: Sequence[ToolCall],
+        context: ExecutionContext,
+        *,
+        max_parallel: int = 4,
+    ) -> tuple[ToolOutcome, ...]: ...
+
+
+@runtime_checkable
+class ContextPolicy(Protocol):
+    """Optional step-boundary context reducer.
+
+    ``prepare`` is called before each model step. Returning ``None`` means the
+    history is unchanged. Returning a reduction with ``messages``,
+    ``before_tokens``, ``after_tokens`` and ``reason`` replaces the driver's
+    in-memory history; the driver persists ``context.compacted`` first and
+    never reads conversation history from the store itself. ``force=True`` is
+    the one bounded recovery request after a structured
+    ``context_overflow`` model failure. The policy owns any summarisation call
+    and records it through the store's compaction-attempt accounting.
+    """
+
+    async def prepare(
+        self,
+        context: ExecutionContext,
+        history: Sequence[Mapping[str, Any]],
+        tools: Sequence[ToolDefinition],
+        *,
+        force: bool = False,
+    ) -> Any: ...
+
+
+@runtime_checkable
+class SteeringControl(Protocol):
+    """Synchronous safe-boundary correction source.
+
+    ``drain`` returns pending correction texts for one turn. It is called only
+    between steps, never while a model call or tool batch is in flight, and the
+    drain never cancels or resumes dispatched work. The driver persists each
+    text as ``input.steered`` before it becomes a user message.
+    """
+
+    def drain(self, session_id: str, turn_id: str) -> tuple[str, ...]: ...
+
+
+@runtime_checkable
+class TurnBudgetControl(Protocol):
+    """Optional per-turn usage budget used by the driver only when injected."""
+
+    def record_usage(self, usage: Mapping[str, int]) -> None: ...
+
+    def token_budget_exhausted(self) -> bool: ...
+
+    def is_summary_step(self, step_number: int, max_steps: int) -> bool: ...
+
+    def observe_tool_outcome(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        status: str,
+        text: str,
+    ) -> bool: ...
 
 
 @runtime_checkable

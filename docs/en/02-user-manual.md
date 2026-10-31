@@ -328,6 +328,51 @@ The active Skill Runtime manifest is the only source of the Gateway URL. The Reg
 be supplied with `PAOS_RESOURCE_REGISTRY_URL`; an empty URL permits only local bundles or an
 explicit static index. Starting PAOS never downloads a Skill.
 
+### Core execution settings
+
+`agents.defaults.performance` controls how Core runs a turn. It accepts camelCase (the stored
+form) and snake_case. These settings never select a provider or model, and Core never switches to
+a cheaper model on its own.
+
+| Key | Default | Effect |
+|:----|:--------|:-------|
+| `maxParallelTools` | `4` | Upper bound for concurrent tool calls declared `parallel_safe` in one model step. |
+| `cacheStablePrompts` | `true` | Keeps the fixed system text first and appends live state as a separate runtime-context message, so the static prefix stays byte-identical. |
+| `autoCompact` | `true` | Runs the automatic context reduction described in “Compacting a session” before a model request. |
+| `compactionThreshold` | `0.8` | Automatic reduction pressure point; the actual trigger is the smaller of this share of the window and the window minus the reply reserve. |
+| `lazyMcpTools` | `true` | Hides MCP tool schemas behind `tool_search`; MCP servers still connect at startup. |
+| `codeMode` | `true` | Offers the restricted `execute_program` tool. |
+| `maxTurnTokens` | `null` | No turn token ceiling. A positive integer stops new model calls after the reported usage for the turn reaches it. |
+| `repeatedCallLimit` | `3` | Stops a turn after this many consecutive identical tool results; a changed result or a different call resets the count. |
+| `reserveSteps` | `1` | Reserves the final step for a tools-hidden progress summary when the turn has more than one step; `0` disables it. |
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "performance": {
+        "maxParallelTools": 4,
+        "cacheStablePrompts": true,
+        "autoCompact": true,
+        "compactionThreshold": 0.8,
+        "lazyMcpTools": true,
+        "codeMode": true,
+        "maxTurnTokens": null,
+        "repeatedCallLimit": 3,
+        "reserveSteps": 1
+      }
+    }
+  }
+}
+```
+
+`maxTurnTokens` is a ceiling on usage the provider reported, not a hard billing budget: a request
+already in flight can exceed it. Once the ceiling is reached, no new model call is made. If the
+answer already arrived in that call, the turn can still complete; if another call would be needed,
+the turn ends FAILED with any partial text, and that text is not a completed task. `reserveSteps`
+spends the final step of a multi-step turn on a tools-hidden summary, which is also partial progress
+and ends the turn FAILED.
+
 ## 3. Install and run a Skill Runtime
 
 Use a configured Registry or a schema-v3 static package index:
@@ -415,10 +460,11 @@ remote state and AgentTask protection are workspace-wide and shared by both.
 `paos agent` starts a new session each time. Its id is `cli:YYYYMMDD-NN`, where the date and
 two-digit sequence belong to the workspace and are allocated atomically, so concurrent processes
 cannot receive the same id and a restart never reuses an old one. The title is derived from the
-first turn's task text and stored separately; setting a title never changes the id. `--session
-<id>` uses the given id instead of allocating a new one, resuming it when it already exists. In the
-Core session, `/new` starts a fresh session, bare `/session` lists the Core sessions to choose
-from (an inline picker on a terminal), and `/session <id>` loads an existing id directly. Both
+first turn's task text and stored separately; setting a title never changes the id. It stays
+catalog metadata and is not repeated in the status line; the `/session` list still shows it.
+`--session <id>` uses the given id instead of allocating a new one, resuming it when it already
+exists. In the Core session, `/new` starts a fresh session, bare `/session` lists the Core sessions
+to choose from (an inline picker on a terminal), and `/session <id>` loads an existing id directly. Both
 `/new` and `/session` are handled locally and do not submit a model turn. Unlike the legacy chat,
 where `/new` only clears history, the Core `/new` allocates a new session id. Existing Core sessions
 in `core.db` are preserved. Legacy JSONL sessions are not imported or converted, and there is no
@@ -457,12 +503,107 @@ The cumulative line is rebuilt from stored events, so it survives a reload; a co
 without a usage record marks it as incomplete. The footer is terminal output only and is never
 part of the model history.
 
+### Turn display and intermediate steps
+
+For every ordinary request and every explicit `/resume`, the instruction the turn actually uses
+is echoed once in full before any OS output. A divider that grows with the terminal width, starting
+at the left edge with a centered `PhyAgentOS · Turn N` title, marks the start of the OS block; `N`
+is a local display sequence number, not a stored turn identity. Tool calls, the answer, errors and
+the usage footer all stay inside the block, and the matching `End Turn N` divider is printed after
+all of that turn's output. A turn that ends early still leaves its request and its end boundary
+visible. Redirected output gets the same rule and title as plain text, without ANSI.
+
+The session, provider/model and `context` line sits above the request input. The status line does
+not repeat the session title derived from the first request; that title remains catalog metadata
+and is still shown by the `/session` list. The request is shown once with a cyan vertical bar and
+a dark background block, without a `You:` label. The submitted input line is cleared, so the
+permanent block is the only request marker on screen; multi-line and long requests are kept in
+full. The bar and background are display only and do not change the request text.
+
+Per-message `Queued` and `Processing` notices are no longer printed. While a turn runs, the live
+region shows a spinner with elapsed time and the turn phase, and it is the only writer of that
+area. The live rows stay directly above the session line and the input line instead of a
+terminal-anchored bottom toolbar, so there is no large gap between the request and the status.
+`/display_all_step [on|off]` controls the intermediate steps. With no argument the command
+toggles the setting. The default `off` keeps a limited number of recent steps in the scrolling
+display and reports the hidden and total counts. `on` immediately prints every step already
+recorded for the turn in full, then appends each newly settled step as its own line to the scroll
+record. The selection stays in effect across turns until you change it. The command only changes
+the display; execution, the event log, tool results and the model context are unchanged. `/tools`
+is no longer a CLI command.
+
+`/help` lists the local commands. If answer text contains a DSML protocol block, the CLI display
+guard does not lay it out as ordinary answer text; it prints a short warning instead and the
+original text remains in the event log. Core does not execute or parse DSML blocks.
+
+### Background shell jobs
+
+`exec background=true` starts a tracked job and returns `accepted` with a `job_id`; that is a
+handle, not a result. `job_status` reports the current state (omitting `job_id` lists this
+session's jobs), `job_wait` waits up to its own `timeout` and reports when that wait expired while
+the job is still running (this is not a job timeout), and `job_cancel` stops the local process
+group and waits for it to settle. A running job is never reported as complete. Jobs belong to the
+session that started them, and closing the owning process stops its jobs. `job_cancel` stops local
+work only and does not prove that remote work stopped.
+
+### Tool execution, tool search and code mode
+
+Tool calls returned by one model step are returned to the model in the order they were requested.
+Only tools whose author declared them `parallel_safe` may overlap, up to `maxParallelTools`; every
+other call is a sequential barrier that waits for the earlier safe batch. Reads, directory listing, web
+search/fetch, scene-graph queries, `job_status` and `subagent_status` are safe; writes, edits,
+shell, `spawn`, `job_wait`, `job_cancel` and all Forge tools are barriers. Each call still runs
+through the normal policy and writes `tool.intent`, `tool.dispatched` and `tool.settled`.
+
+With `lazyMcpTools`, only MCP tool schemas (names starting with `mcp_`) are hidden. MCP servers are
+still discovered and connected at startup; laziness reduces schema size, not connection delay.
+`tool_search(query)` returns matching schemas and makes them visible from the next step. Discovery
+is per session, does not weaken policy, and a hidden name called directly is rejected. Forge tools
+are never candidates.
+
+With `codeMode`, `execute_program` accepts a restricted Python subset: assignments, containers,
+indexing, `if`, a bounded `for`, `await tools.call(name, arguments)`, `await parallel([...])`,
+`print(...)` and `return`. It is not general Python: there are no imports, no attribute access
+except `tools.call`, no direct file, process or network access, and no `eval` or `exec`. Only
+read-only tools marked `parallel_safe` are exposed, Forge tools are excluded, and every subcall
+still obeys the current tool policy and is recorded as a normal tool call. Turning `codeMode` off
+removes the tool.
+
+### Subagents
+
+`spawn` starts a background child session and returns an accepted handle, not a result. Pass a
+finished child's `child_session_id` to continue it and reuse its stored conversation; a running
+child cannot be replaced. `role` is prompt text only, and `tool_allowlist` can only narrow the
+general tools already allowed. `subagent_status` reports the current state and never calls a running
+child complete; another parent's child is rejected. `subagent_cancel` stops one child owned by this
+session and returns its settled status, which is a local stop and does not prove that remote work
+stopped. Children cannot spawn recursively or register Forge execution tools; their completion
+summary stays with the parent session and does not change the parent's actual task result.
+
 ### Compacting a session
 
-`/compact` manually compacts history: it writes a summary of earlier turns and keeps recent
-complete turns verbatim. It runs only between turns. Once a summary request is sent, the attempt is
-recorded even if it fails or is cancelled: the original context and history stay unchanged, the
-attempt stays in the session record, and any token usage it reported is added to the session total.
+Automatic compaction is on by default when the effective window is known. Before each model
+request, Core compares the estimated next request (system prompt, visible tool schemas and history)
+with the effective window. The pressure point is the smaller of `compactionThreshold × window` (80%
+by default) and the window minus the reply reserve. Above it, it first shortens old oversized tool
+result text deterministically, without a model call, then makes at most one summary request over the
+safe completed prefix. The current user
+task and the most recent complete tool call/result pair stay verbatim. It never loops, and it
+returns a reduction only when the measured next request actually shrinks; a failed summary does not
+discard a trim that already reduced it. During an unfinished turn the reduction is recorded in that
+turn, not as a checkpoint. The summary is a real provider call: any usage it reports is counted in
+the session total, including a failed attempt.
+
+Turning `autoCompact` off disables both this automatic reduction and the forced overflow recovery
+below. If the provider rejects a request with a structured `context_overflow` or
+`context_length_exceeded` code, Core may force one reduction and retry the model call once with a
+fresh call id. No tool call is replayed by that retry. If the reduction does not shrink the request
+or the retry still fails, the turn is FAILED. Failure prose alone does not start that recovery.
+
+`/compact` writes a summary of earlier turns and keeps recent complete turns verbatim. It runs
+only between turns. Once a summary request is sent, the attempt is recorded even if it fails or is
+cancelled: the original context and history stay unchanged, the attempt stays in the session
+record, and any token usage it reported is added to the session total.
 A checkpoint is written only when the estimate for the next request actually shrinks; if it does not
 (for example the summary is longer than the original), the compaction is refused and the original
 context stays unchanged, while the attempt and any reported usage are still recorded. A successful
@@ -484,8 +625,36 @@ further back. It only runs between turns and is refused while a turn or a comman
 input is still queued. A failed or interrupted request never entered the context, so it is only
 refilled; a request already folded into a `/compact` summary cannot be removed from that summary
 and is only refilled as well. The status-bar estimate and the offered-tool snapshot skip reverted
-turns too, so both drop back to the earlier request. Tool side effects (robot actions, file edits)
-are never undone.
+turns too, so both drop back to the earlier request. The conversation projection used after undo
+also skips Core's runtime-context message, so the recalled text is the user's original request
+rather than live state. Tool side effects (robot actions, file edits) are never undone.
+
+### Resuming a failed or interrupted request
+
+`/resume [text]` continues the newest failed or interrupted request of the current session after
+earlier queued turns settle. It builds an explicit partial history from that turn's stored request
+snapshot plus the assistant replies and settled tool results recorded after it. Successful tool
+progress is kept; unsettled, unknown and cancelled calls are reported as warnings and never
+replayed. The optional text becomes the new user instruction; without it Core asks the model to
+continue from confirmed progress and not repeat work with unknown side effects. A completed turn is
+not a resume source; an already reverted or checkpoint-covered turn is refused, and resume is
+refused while the session has an unfinished turn. A correction, an undo, or a later compaction does
+not make covered history replayable. The printed status is the new turn's real status: FAILED or
+INTERRUPTED with partial text is not a completed task.
+
+### Correcting a running turn
+
+On a terminal, press **Ctrl+G** while a turn is running to open the local correction editor.
+Enter sends its `/correct <text>` line; Esc closes it and restores the previous draft. Ordinary
+typing remains blocked during a turn. Redirected input may send `/correct <text>` directly.
+
+`/correct <text>` queues one correction for the current turn only. Core reads it at the next safe
+step boundary, before the next model request, and records an `input.steered` event for what it
+actually used. It never opens another turn, never inserts text into an answer that is already
+streaming, and never cancels or undoes a tool call or physical action that was already dispatched.
+The queue is small and in memory; an unconsumed correction is not replayed, and the CLI explicitly
+warns when a turn ended before it could be applied. Queueing is not applying. `/correct` needs an
+active turn and is refused otherwise.
 
 ### Gateway background entries
 
@@ -509,27 +678,31 @@ exactly-once guarantee across multiple gateways. Channels that are not configure
 automatically. Media bytes are not forwarded to the model in this version: the reference is kept
 in the turn text and the model is told the bytes were not forwarded.
 
-Core includes filesystem read/write/edit, directory listing, shell, web search/fetch, image,
-scene-graph queries, MCP and `spawn` tools. Existing tool configuration applies; MCP only connects
-to explicitly configured servers. Gateway message/image delivery uses the current turn's destination;
+Core includes filesystem read/write/edit, directory listing, shell (including tracked background
+jobs), web search/fetch, image, scene-graph queries, MCP, `spawn`/`subagent_status`/
+`subagent_cancel`, `tool_search` when MCP tools exist, and `execute_program` when code mode is on.
+Existing tool configuration applies; MCP only connects to explicitly configured servers. Gateway
+message/image delivery uses the current turn's destination;
 a CLI without a delivery channel does not claim a message was sent. Child results return to their
 parent session/channel; closing the owning process stops its children. The legacy entry remains
 available for regression comparisons.
 
-The Core runtime is still experimental: `/correct` is unavailable. On a
-terminal, `/model` and `/effort` without an argument open the same inline selector as the legacy
-runtime; text commands (`/model 2`, `/effort high`) and non-terminal input keep the text list.
+The Core runtime remains experimental, but `/correct` and `/resume` are available as described
+above. On a terminal, `/model` and `/effort` without an argument open the same inline selector as
+the legacy runtime; text commands (`/model 2`, `/effort high`) and non-terminal input keep the text
+list.
 Interrupting a selector with Esc or Ctrl+C leaves the session and its selection unchanged. Locally,
-`/help` lists the commands and `/tools [on|off]` shows or hides this turn's full tool-call record.
+`/help` lists the commands and `/display_all_step [on|off]` switches the intermediate-step display
+described under “Turn display and intermediate steps”.
 To stop a running turn, press Esc twice within two seconds: the first Esc shows a yellow hint and
 the second requests local cancellation; it never proves that remote actions stopped. Non-terminal
 input cannot capture Esc, so use Ctrl+C to interrupt the local turn. `/stop` is not a command and
 never submits a model turn. Unknown slash commands are rejected without a model turn. The
-session/model line sits above the input; while a turn runs the `You:` marker and cursor are hidden
-and ordinary keys are ignored (an existing draft is kept), so nothing is silently queued. The
-running turn shows a spinner with elapsed time, switching between preparing, thinking, calling a
-tool, and stopping locally; the bottom toolbar lists the last four tool calls plus hidden and total
-counts. Its history lives in `<workspace>/sessions/core.db`; the legacy runtime keeps JSONL
+session, provider/model and `context` line sits above the input; while a turn runs the vertical-bar
+request marker and cursor are hidden and ordinary keys are ignored (an existing draft is kept), so nothing is
+silently queued. The running turn shows a spinner with elapsed time, switching between preparing,
+thinking, calling a tool, and stopping locally; the live region shows the steps kept by the current
+display setting, plus hidden and total counts. Its history lives in `<workspace>/sessions/core.db`; the legacy runtime keeps JSONL
 history under `<workspace>/sessions/`. The two stores are not imported or merged. A Core failure
 exits; it does not fall back to the legacy runtime. Fleet mode still requires `--runtime legacy`.
 

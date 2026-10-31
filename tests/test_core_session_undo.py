@@ -473,3 +473,129 @@ async def test_completed_turn_without_request_snapshot_has_no_request_text(
         assert outcome.context_reverted is True
         # The turn is skipped, so the broken snapshot is never projected.
         assert await store.read_conversation(SESSION) == ()
+
+
+RUNTIME_CONTEXT_TAIL = (
+    "--- Runtime context for this step (live environment state; this is not a "
+    "user message and asks for no new task) ---\n"
+    "[PhyAgentOS runtime context]\n\n"
+    "workspace: /tmp/demo\n\n"
+    "--- End runtime context ---"
+)
+
+
+async def test_undo_reads_the_real_request_before_a_runtime_context_tail(
+    tmp_path: Path,
+) -> None:
+    async with _open(tmp_path / "events.sqlite") as store:
+        await store.append(
+            RuntimeEvent(
+                type=EventType.TURN_STARTED,
+                session_id=SESSION,
+                turn_id="turn-cache",
+                payload={"max_steps": 8},
+            )
+        )
+        await store.append(
+            RuntimeEvent(
+                type=EventType.REQUEST_PREPARED,
+                session_id=SESSION,
+                turn_id="turn-cache",
+                step_id="turn-cache:step:1",
+                payload={
+                    "model_call_id": "turn-cache:model:1",
+                    "messages": [
+                        {"role": "system", "content": "be terse"},
+                        {"role": "user", "content": "move the box"},
+                        {"role": "assistant", "content": "working"},
+                        {"role": "user", "name": "paos_runtime_context", "content": RUNTIME_CONTEXT_TAIL},
+                    ],
+                    "tools": [],
+                },
+            )
+        )
+        await store.append(
+            RuntimeEvent(
+                type=EventType.TURN_COMPLETED,
+                session_id=SESSION,
+                turn_id="turn-cache",
+                payload={"reply": "done"},
+            )
+        )
+
+        projected = await store.read_conversation(SESSION)
+        assert projected == (
+            {"role": "user", "content": "move the box"},
+            {"role": "assistant", "content": "working"},
+            {"role": "assistant", "content": "done"},
+        )
+
+        outcome = await store.undo_last_turn(SESSION)
+        assert outcome is not None
+        assert outcome.request_text == "move the box"
+
+
+async def test_undo_ignores_a_real_cache_stable_assembler_tail(tmp_path: Path) -> None:
+    from PhyAgentOS.agent.core.prompt import PromptAssemblerImpl
+    from PhyAgentOS.agent.core.types import Budget, CancellationToken, ExecutionContext
+
+    async with _open(tmp_path / "events.sqlite") as store:
+        context = ExecutionContext(
+            session_id=SESSION,
+            turn_id="turn-real-cache",
+            step_id="turn-real-cache:step:1",
+            cancellation=CancellationToken(),
+            budget=Budget(max_steps=4),
+        )
+        assembler = PromptAssemblerImpl(
+            "static system",
+            fragments=[lambda current: "workspace: /tmp/live"],
+            cache_stable=True,
+        )
+        bundle = await assembler.assemble(
+            context,
+            history=({"role": "user", "content": "move the box"},),
+            tools=(),
+        )
+        messages = [dict(message) for message in bundle.messages]
+        assert messages[-1]["role"] == "user"
+        assert "workspace: /tmp/live" in messages[-1]["content"]
+
+        await store.append(
+            RuntimeEvent(
+                type=EventType.TURN_STARTED,
+                session_id=SESSION,
+                turn_id="turn-real-cache",
+                payload={"max_steps": 4},
+            )
+        )
+        await store.append(
+            RuntimeEvent(
+                type=EventType.REQUEST_PREPARED,
+                session_id=SESSION,
+                turn_id="turn-real-cache",
+                step_id="turn-real-cache:step:1",
+                payload={
+                    "model_call_id": "turn-real-cache:model:1",
+                    "messages": messages,
+                    "tools": [],
+                },
+            )
+        )
+        await store.append(
+            RuntimeEvent(
+                type=EventType.TURN_COMPLETED,
+                session_id=SESSION,
+                turn_id="turn-real-cache",
+                payload={"reply": "done"},
+            )
+        )
+
+        projected = await store.read_conversation(SESSION)
+        assert projected == (
+            {"role": "user", "content": "move the box"},
+            {"role": "assistant", "content": "done"},
+        )
+        outcome = await store.undo_last_turn(SESSION)
+        assert outcome is not None
+        assert outcome.request_text == "move the box"

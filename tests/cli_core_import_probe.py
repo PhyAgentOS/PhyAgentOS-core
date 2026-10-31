@@ -42,11 +42,13 @@ PROVIDER_CALLS: list[list[dict]] = []
 
 class _FakeProvider:
     async def chat_with_retry(self, *, messages, tools=None, **kwargs):
+        from PhyAgentOS.agent.core.prompt import is_runtime_context_message
         from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest
 
         PROVIDER_CALLS.append(list(messages))
         assert "read_file" in {item["function"]["name"] for item in tools}
-        if messages[-1]["role"] == "user" and messages[-1]["content"] == "migration-read":
+        current = [message for message in messages if not is_runtime_context_message(message)][-1]
+        if current["role"] == "user" and current["content"] == "migration-read":
             return LLMResponse(
                 content=None,
                 tool_calls=[ToolCallRequest(
@@ -54,8 +56,8 @@ class _FakeProvider:
                 )],
                 finish_reason="tool_calls",
             )
-        if messages[-1]["role"] == "tool":
-            assert "migration-content" in messages[-1]["content"]
+        if current["role"] == "tool":
+            assert "migration-content" in current["content"]
             return LLMResponse(content="tool-read-confirmed", finish_reason="stop")
         return LLMResponse(content="done", finish_reason="stop")
 

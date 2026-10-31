@@ -106,6 +106,7 @@ class FakeOutput:
         self.errors: list[str] = []
         self.results: list[TurnResult] = []
         self.turn_starts = 0
+        self.turn_requests: list[tuple[str | None, str | None]] = []
         self.turn_finishes = 0
         self.cancel_requests = 0
         self.tool_views: list[str] = []
@@ -119,8 +120,9 @@ class FakeOutput:
     def result(self, result: TurnResult) -> None:
         self.results.append(result)
 
-    def turn_started(self, session_id=None) -> None:
+    def turn_started(self, session_id=None, request_text=None) -> None:
         self.turn_starts += 1
+        self.turn_requests.append((session_id, request_text))
 
     def turn_finished(self) -> None:
         self.turn_finishes += 1
@@ -477,16 +479,19 @@ async def test_stop_command_is_a_local_hint_and_never_cancels(running_agent):
     assert [request.text for request in session.requests] == ["first"]
 
 
-async def test_queue_receipt_is_immediate_and_never_echoes_message_content(running_agent):
+async def test_queue_has_no_queued_or_processing_receipts(running_agent):
     session, reader, output, task = running_agent
     reader.send("first")
     await until(lambda: session.active is not None)
     reader.send("second with sk-secret-value")
-    await until(lambda: any("Queued message 2" in info for info in output.infos))
+    await until(lambda: reader.reads >= 2)
+    assert output.infos == []
+    assert not any("Queued message" in info for info in output.infos)
+    assert not any("Processing message" in info for info in output.infos)
     assert not any("sk-secret-value" in info for info in output.infos)
     session.releases[0].set()
     await until(lambda: len(session.requests) == 2)
-    assert any("Processing message 2" in info for info in output.infos)
+    assert output.infos == []
     session.releases[1].set()
     await until(lambda: len(output.results) == 2)
     reader.send("exit")
@@ -502,7 +507,7 @@ async def test_help_is_answered_locally_without_a_model_turn(running_agent):
     reader.send("/help", "exit")
     await asyncio.wait_for(task, 2)
     assert not session.requests
-    assert any("Local commands" in info and "/tools" in info for info in output.infos)
+    assert any("Local commands" in info and "/display_all_step" in info for info in output.infos)
 
 
 async def test_unknown_slash_command_is_rejected_locally(running_agent):
@@ -516,20 +521,58 @@ async def test_unknown_slash_command_is_rejected_locally(running_agent):
     assert "secret-argument" not in output.errors[0]
 
 
-async def test_tools_command_toggles_locally_even_while_a_turn_is_running(running_agent):
+async def test_display_all_step_accepts_on_off_and_toggle_even_while_busy(running_agent):
     session, reader, output, task = running_agent
     reader.send("first")
     await until(lambda: session.active is not None)
-    reader.send("/tools on")
+    reader.send("/display_all_step on")
     await until(lambda: output.tool_views == ["on"])
     assert any("tool view:on" in info for info in output.infos)
+    reader.send("/display_all_step off")
+    await until(lambda: output.tool_views == ["on", "off"])
     assert not session.cancelled
     session.releases[0].set()
     await until(lambda: len(output.results) == 1)
-    reader.send("/tools", "exit")
+    reader.send("/display_all_step", "exit")
     await asyncio.wait_for(task, 2)
-    assert output.tool_views == ["on", ""]
+    assert output.tool_views == ["on", "off", ""]
     assert [request.text for request in session.requests] == ["first"]
+
+
+async def test_old_tools_command_is_rejected_and_never_reaches_the_model(running_agent):
+    session, reader, output, task = running_agent
+    reader.send("/tools on", "exit")
+    await asyncio.wait_for(task, 2)
+    assert not session.requests
+    assert output.tool_views == []
+    assert len(output.errors) == 1
+    assert "Unknown command /tools" in output.errors[0]
+    assert "not sent to the model" in output.errors[0]
+
+
+async def test_request_text_is_passed_to_output_once_per_real_turn(running_agent):
+    session, reader, output, task = running_agent
+    reader.send("first request")
+    await until(lambda: session.active is not None)
+    assert output.turn_requests == [("cli:test", "first request")]
+    session.releases[0].set()
+    await until(lambda: len(output.results) == 1)
+    reader.send("second request")
+    await until(lambda: len(session.requests) == 2)
+    assert output.turn_requests == [
+        ("cli:test", "first request"),
+        ("cli:test", "second request"),
+    ]
+    assert output.turn_starts == 2
+    session.releases[1].set()
+    await until(lambda: len(output.results) == 2)
+    reader.send("exit")
+    await asyncio.wait_for(task, 2)
+    # One turn_started per turn: no re-echo from result or cleanup.
+    assert output.turn_requests == [
+        ("cli:test", "first request"),
+        ("cli:test", "second request"),
+    ]
 
 
 async def test_turn_lifecycle_marks_start_and_cleanup_on_success_and_failure(running_agent):
@@ -604,7 +647,8 @@ def test_output_prints_final_reply_only_once_and_hides_reasoning(markdown):
     output.result(result)
     assert buffer.getvalue().count("final reply") == 1
     assert "secret" not in buffer.getvalue()
-    assert "🍞 PhyAgentOS:" in buffer.getvalue()
+    # The turn block's divider is the only heading; no second product title.
+    assert "🍞 PhyAgentOS:" not in buffer.getvalue()
 
 
 def test_output_failed_turn_has_error_and_does_not_claim_remote_failure():
@@ -850,3 +894,258 @@ async def test_help_lists_undo_with_its_side_effect_warning(running_agent):
     help_text = next(info for info in output.infos if "Local commands" in info)
     assert "/undo" in help_text
     assert "not undone" in help_text
+
+
+async def test_correct_callback_runs_during_a_blocked_turn_and_queues_no_turn():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+    calls: list[tuple[str, str | None]] = []
+
+    async def correct_command(text, binding):
+        calls.append((text, binding.session_id))
+        assert session.active is not None
+        return "correction queued for the next safe step"
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        correct_command=correct_command,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("first")
+        await until(lambda: session.active is not None)
+        reader.send("/correct turn left now")
+        await until(lambda: "correction queued" in " ".join(output.infos))
+        assert calls == [("turn left now", "cli:test")]
+        # The correction never becomes a second submitted turn.
+        assert len(session.requests) == 1
+        assert session.max_active_submits == 1
+        session.releases[0].set()
+        await until(lambda: len(output.results) == 1)
+        reader.send("exit")
+        await asyncio.wait_for(run, 2)
+        assert len(session.requests) == 1
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_correct_without_text_is_rejected_without_calling_the_callback():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+    calls = []
+
+    async def correct_command(text, binding):
+        calls.append(text)
+        return "applied"
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        correct_command=correct_command,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("/correct   ", "exit")
+        await asyncio.wait_for(run, 2)
+        assert calls == []
+        assert not session.requests
+        assert any("needs replacement text" in error for error in output.errors)
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_correct_callback_failure_is_reported_and_reader_keeps_running():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+
+    async def correct_command(text, binding):
+        raise RuntimeError("no active turn")
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        correct_command=correct_command,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("/correct retry", "exit")
+        await asyncio.wait_for(run, 2)
+        assert not session.requests
+        assert len(output.errors) == 1
+        assert "Correction failed" in output.errors[0]
+        assert "no active turn" in output.errors[0]
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_resume_runs_at_its_fifo_position_and_never_reaches_the_model():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+    calls: list[tuple[str, str | None]] = []
+
+    async def resume_command(text, binding):
+        calls.append((text, binding.session_id))
+        assert session.active is None
+        return "resumed turn-1"
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        resume_command=resume_command,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("first")
+        await until(lambda: session.active is not None)
+        reader.send("/resume keep going")
+        await until(lambda: reader.reads == 2)
+        assert calls == []
+        assert len(session.requests) == 1
+
+        session.releases[0].set()
+        await until(lambda: len(calls) == 1)
+        assert calls == [("/resume keep going", "cli:test")]
+        assert len(session.requests) == 1
+        await until(lambda: "resumed turn-1" in output.infos)
+        reader.send("exit")
+        await asyncio.wait_for(run, 2)
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_resume_without_a_callback_is_reported_without_a_turn():
+    session, reader, output = FakeSession(), FakeInput(), FakeOutput()
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("/resume", "exit")
+        await asyncio.wait_for(run, 2)
+        assert not session.requests
+        assert any("Resume is not available" in error for error in output.errors)
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_resume_stop_is_available_again_after_a_cancelled_resume():
+    class Session:
+        def __init__(self):
+            self.requests = []
+            self.gates = []
+            self.cancelled = []
+
+        async def submit(self, request):  # pragma: no cover - resume only
+            self.requests.append(request)
+            return TurnResult(request.session_id, "turn", TurnStatus.COMPLETED)
+
+        async def cancel(self, session_id):
+            self.cancelled.append(session_id)
+            if self.gates:
+                self.gates[-1].set()
+
+    session = Session()
+    reader = FakeInput()
+    output = FakeOutput()
+    active: list[str | None] = []
+
+    async def resume_command(text, binding):
+        gate = asyncio.Event()
+        session.gates.append(gate)
+        await gate.wait()
+        return "resume interrupted"
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        resume_command=resume_command,
+        on_active_session=active.append,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("/resume first")
+        await until(lambda: len(session.gates) == 1)
+        assert active == ["cli:test"]
+        agent.request_stop()
+        await until(lambda: session.cancelled == ["cli:test"])
+
+        reader.send("/resume second")
+        await until(lambda: len(session.gates) == 2)
+        # The first cancel must not swallow the second turn's stop.
+        assert agent._stop_requested is False
+        agent.request_stop()
+        await until(lambda: session.cancelled == ["cli:test", "cli:test"])
+        reader.send("exit")
+        await asyncio.wait_for(run, 2)
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+
+async def test_eof_during_resume_requests_capability_cancel_before_reaping():
+    class Session:
+        def __init__(self):
+            self.requests = []
+            self.gates = []
+            self.cancelled = []
+
+        async def submit(self, request):  # pragma: no cover - resume only
+            self.requests.append(request)
+            return TurnResult(request.session_id, "turn", TurnStatus.COMPLETED)
+
+        async def cancel(self, session_id):
+            self.cancelled.append(session_id)
+            if self.gates:
+                self.gates[-1].set()
+
+    session = Session()
+    reader = FakeInput()
+    output = FakeOutput()
+
+    async def resume_command(text, binding):
+        gate = asyncio.Event()
+        session.gates.append(gate)
+        await gate.wait()
+        return "resume stopped"
+
+    agent = InteractiveAgent(
+        session,
+        session_id="cli:test",
+        output=output,
+        read_input=reader,
+        resume_command=resume_command,
+    )
+    run = asyncio.create_task(agent.run())
+    try:
+        reader.send("/resume work")
+        await until(lambda: len(session.gates) == 1)
+        reader.send(EOFError())
+        await asyncio.wait_for(run, 2)
+    finally:
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+
+    assert session.cancelled == ["cli:test"]
+    assert not session.requests

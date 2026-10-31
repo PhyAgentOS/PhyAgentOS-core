@@ -28,6 +28,7 @@ from rich.console import Console
 
 from PhyAgentOS.agent.bootstrap import build_forge_components
 from PhyAgentOS.agent.capabilities.agent_mode_capability import AgentModeCapability
+from PhyAgentOS.agent.capabilities.code_execution_capability import CodeExecutionCapability
 from PhyAgentOS.agent.capabilities.cron_capability import CronCapability
 from PhyAgentOS.agent.capabilities.forge_capability import ForgeCapability
 from PhyAgentOS.agent.capabilities.general_tools_capability import GeneralToolsCapability
@@ -35,6 +36,7 @@ from PhyAgentOS.agent.capabilities.image_capability import ImageCapability
 from PhyAgentOS.agent.capabilities.mcp_capability import MCPCapability
 from PhyAgentOS.agent.capabilities.skill_access_capability import SkillAccessCapability
 from PhyAgentOS.agent.capabilities.spawn_capability import SpawnCapability
+from PhyAgentOS.agent.capabilities.tool_search_capability import ToolSearchCapability
 from PhyAgentOS.agent.composition import AgentAssembly, compose_agent
 from PhyAgentOS.agent.core import SQLiteSessionStore, TurnRequest, TurnStatus
 from PhyAgentOS.agent.core.events import EventType, reverted_turn_ids
@@ -45,6 +47,7 @@ from PhyAgentOS.agent.core.prompt import (
 )
 from PhyAgentOS.agent.core.session import CHECKPOINT_SUMMARY_NOTICE
 from PhyAgentOS.agent.services.context_compaction import compact_session
+from PhyAgentOS.agent.services.context_policy import ContextPolicy
 from PhyAgentOS.agent.services.session_catalog import (
     SessionCatalog,
     SessionInfo,
@@ -52,6 +55,8 @@ from PhyAgentOS.agent.services.session_catalog import (
 )
 from PhyAgentOS.agent.services.skill_documents import SkillDocumentLoader
 from PhyAgentOS.agent.services.turn_activation import TurnSkillActivationManager
+from PhyAgentOS.agent.services.turn_budget import TurnBudget, TurnBudgetRegistry
+from PhyAgentOS.agent.services.turn_control import TurnControl
 from PhyAgentOS.agent.services.usage import (
     ContextSnapshot,
     estimate_context,
@@ -178,6 +183,12 @@ def _effective_window(config, selection) -> tuple[int | None, str]:
     return None, "unknown"
 
 
+class _ContextLimitError(ProviderError):
+    """A local measured overflow, distinct from an arbitrary provider failure."""
+
+    code = "context_overflow"
+
+
 class _SelectedProvider:
     """Forward a turn to its frozen selection; leave SDK retries to the provider.
 
@@ -216,7 +227,7 @@ class _SelectedProvider:
             self.selection.provider, model, messages, tools
         )
         if estimated and estimated + self.max_tokens > self.context_window:
-            raise ProviderError(
+            raise _ContextLimitError(
                 f"Context limit reached (estimated prompt {estimated}, reply budget "
                 f"{self.max_tokens}, limit {self.context_window}). Use /compact to "
                 "summarize older history, or /new to start a new session. No further "
@@ -275,6 +286,8 @@ class _SelectedProvider:
                 type="error",
                 content=content if isinstance(content, str) else "provider error",
                 finish_reason="error",
+                usage=dict(getattr(response, "usage", {}) or {}),
+                error_code=getattr(response, "error_code", None),
             )
             return
         for call in getattr(response, "tool_calls", None) or ():
@@ -389,6 +402,35 @@ class CoreAgentSession:
         self._close_lock = asyncio.Lock()
 
     async def submit(self, request: TurnRequest):
+        return await self._submit(request)
+
+    async def resume(self, request: TurnRequest, *, source_turn_id: str | None = None):
+        """Continue confirmed progress through the same admission queue as submit."""
+        return await self._submit(request, resume=True, source_turn_id=source_turn_id)
+
+    async def correct(self, session_id: str, text: str) -> str:
+        """Deliver a correction to the current turn without opening another turn."""
+        if not text.strip():
+            raise ValueError("A correction must contain text.")
+        async with self._registry_lock:
+            if self._closed:
+                raise RuntimeError("agent session is closed")
+            slot = self._slots.get(session_id)
+            if slot is None or slot.tail is None or slot.tail.done() or slot.current is None:
+                raise RuntimeError("No active turn to correct in this session.")
+            runtime = slot.current.assembly.runtime
+            steer = getattr(runtime, "steer", None)
+            if not callable(steer):
+                raise RuntimeError("This runtime does not support corrections.")
+        result = steer(session_id, text)
+        if inspect.isawaitable(result):
+            result = await result
+        return str(result or "Correction queued for the next safe step boundary.")
+
+    async def _submit(
+        self, request: TurnRequest, *, resume: bool = False,
+        source_turn_id: str | None = None,
+    ):
         session_id = request.session_id
         async with self._registry_lock:
             if self._closed:
@@ -419,7 +461,23 @@ class CoreAgentSession:
                     # or a retired assembly.
                     slot.current = state
                     self._accepted_sessions.setdefault(session_id, None)
-                return await assembly.host.submit(request)
+                if resume:
+                    reader = getattr(assembly.runtime, "resume", None)
+                    if not callable(reader):
+                        raise RuntimeError("This runtime does not support resuming progress.")
+                    result = await reader(request, source_turn_id=source_turn_id)
+                else:
+                    result = await assembly.host.submit(request)
+                unapplied_reader = getattr(assembly.runtime, "unapplied_corrections", None)
+                if callable(unapplied_reader) and unapplied_reader(session_id, result.turn_id):
+                    try:
+                        self.output.error(
+                            "Correction was not applied: the turn ended before another safe "
+                            "step boundary. It was not replayed; submit it as a new request."
+                        )
+                    except Exception:
+                        pass
+                return result
             finally:
                 # One assembly serves exactly one turn. Retiring its runtime
                 # keeps the next turn independent and leaves the shared store
@@ -700,6 +758,8 @@ def _compose_for_selection(
     forge_capability: ForgeCapability,
     additional_capabilities=(),
     notice=None,
+    steering=None,
+    budget_registry=None,
 ) -> AgentAssembly:
     """Compose Skill, shared tools and entry capabilities, then Forge.
 
@@ -712,6 +772,22 @@ def _compose_for_selection(
     window, window_source = _effective_window(config, selection)
     provider = _SelectedProvider(
         selection, window, defaults.max_tokens, notice=notice, window_source=window_source
+    )
+    performance = defaults.performance
+    context_policy = None
+    if performance.auto_compact and window is not None and window > defaults.max_tokens:
+        context_policy = ContextPolicy(
+            getattr(store, "store", store), selection.provider,
+            model=selection.model, capacity=window, reserve_tokens=defaults.max_tokens,
+            threshold=performance.compaction_threshold,
+            system_instructions=instructions, provider_name=selection.name,
+            effort=selection.effort, max_tokens=defaults.max_tokens,
+        )
+    turn_budget = TurnBudget(
+        max_tokens=performance.max_turn_tokens,
+        repeated_call_limit=performance.repeated_call_limit,
+        reserve_steps=performance.reserve_steps,
+        registry=budget_registry,
     )
     return compose_agent(
         provider=provider,
@@ -732,6 +808,11 @@ def _compose_for_selection(
             ),
         ),
         forge_capability=forge_capability,
+        max_parallel_tools=defaults.performance.max_parallel_tools,
+        cache_stable_prompts=defaults.performance.cache_stable_prompts,
+        context_policy=context_policy,
+        turn_budget=turn_budget,
+        steering=steering,
     )
 
 
@@ -811,6 +892,9 @@ async def open_core_session(
         instructions = _instructions(config)
         notice = getattr(output, "info", None)
         runtimes = SessionRuntimes(service, selected)
+        steering = TurnControl()
+        budget_registry = TurnBudgetRegistry()
+        resources.callback(steering.close)
         session = None
 
         def tool_selection(session_id):
@@ -843,7 +927,21 @@ async def open_core_session(
 
             return notify
 
-        general_capability = GeneralToolsCapability(config)
+        def job_notify_factory(context):
+            deliver = subagent_notifier(context)
+            if deliver is None:
+                return None
+
+            async def notify_job(session_id, job_id, text):
+                await deliver(
+                    session_id, context.turn_id, f"[Background job {job_id}]\n{text}"
+                )
+
+            return notify_job
+
+        general_capability = GeneralToolsCapability(
+            config, job_notify_factory=job_notify_factory
+        )
         resources.push_async_callback(general_capability.aclose)
         image_capability = ImageCapability(
             config, provider_resolver=tool_selection, routes=routes, send=send
@@ -867,11 +965,20 @@ async def open_core_session(
             store=store,
             notify=notify_subagent if notice is not None else None,
             notify_factory=subagent_notifier,
+            step_usage_observer=budget_registry.observe,
+            budget_guard=budget_registry.permits,
         )
         resources.push_async_callback(spawn_capability.aclose)
+        performance = config.agents.defaults.performance
+        optional_capabilities = []
+        if performance.lazy_mcp_tools and mcp_capability.tool_registrations():
+            optional_capabilities.append(ToolSearchCapability(mcp_capability.tool_registrations()))
+        if performance.code_mode:
+            optional_capabilities.append(CodeExecutionCapability())
         tool_capabilities = (
             general_capability, image_capability, mode_capability,
-            mcp_capability, spawn_capability, *tuple(additional_capabilities),
+            mcp_capability, spawn_capability, *optional_capabilities,
+            *tuple(additional_capabilities),
         )
 
         def build(selection: RuntimeSelection) -> AgentAssembly:
@@ -886,6 +993,8 @@ async def open_core_session(
                 forge_capability=forge_capability,
                 additional_capabilities=tool_capabilities,
                 notice=notice,
+                steering=steering,
+                budget_registry=budget_registry,
             )
 
         # Build one assembly before yielding so wiring failures surface here
@@ -1252,9 +1361,11 @@ async def run_core_agent(
 
         def refresh_label(target: str | None = None) -> str:
             target = target or active_session_id
-            info = infos.get(target)
             selection = session.sessions.get(target)
-            base = f"session {info.label}" if info is not None else f"session {target}"
+            # The prompt header names the stable session id, never the catalog
+            # title generated from the first request: the request text itself
+            # stays in its own transcript block.
+            base = f"session {target}"
             label = f"{base} · {selection.name}/{selection.model}"
             if selection.effort:
                 label += f" · effort {selection.effort}"
@@ -1283,10 +1394,10 @@ async def run_core_agent(
         output.ready()
         label = refresh_label()
         if message is not None:
+            output.info(label)
+            output.turn_started(sid, message)
             await name_session(sid, message)
             label = refresh_label()
-            output.info(label)
-            output.turn_started(sid)
             try:
                 task = asyncio.create_task(session.submit(TurnRequest(sid, message)))
                 try:
@@ -1296,15 +1407,15 @@ async def run_core_agent(
                     await session.cancel(sid)
                     await task
                     raise
+                await context.refresh(sid)
+                output.result(result)
             finally:
                 output.turn_finished()
-            await context.refresh(sid)
-            output.result(result)
             return {TurnStatus.COMPLETED: 0, TurnStatus.FAILED: 1, TurnStatus.INTERRUPTED: 130}[result.status]
 
         output.info(
-            "Local commands: /help · /tools · /new · /session · /compact · "
-            "/undo · /model · /effort · /status · exit. "
+            "Local commands: /help · /display_all_step · /new · /session · /compact · "
+            "/undo · /correct (Ctrl+G while busy) · /resume · /model · /effort · /status · exit. "
             "Press Esc twice while a turn runs to stop it locally. "
             "Accepted or running is not task success."
         )
@@ -1517,6 +1628,10 @@ async def run_core_agent(
                 )
                 return None
             finally:
+                # Clear the local busy state before any refresh can fail. This
+                # command has no model-turn boundary, but it must always
+                # release the input lock it created.
+                output.compact_finished()
                 # Import the attempt rows on success and failure, then refresh
                 # the projection. This keeps an in-process failure visible
                 # without waiting for a restart.
@@ -1583,6 +1698,36 @@ async def run_core_agent(
                 )
             return f"Request {outcome.turn_id} was withdrawn. {placement} {warning}"
 
+        async def correct_command(text: str, binding) -> str | None:
+            target = binding.session_id or binding.fallback or active_session_id
+            if not target:
+                raise RuntimeError("No active session to correct.")
+            await session.correct(target, text)
+            return (
+                "Correction accepted for the next safe step boundary. "
+                "An already-dispatched tool or physical action is not undone."
+            )
+
+        async def resume_command(text: str, binding) -> str | None:
+            target = binding.session_id or binding.fallback or active_session_id
+            if not target:
+                raise RuntimeError("No active session to resume.")
+            _command, _separator, argument = text.partition(" ")
+            instruction = argument.strip() or (
+                "Continue the interrupted task using confirmed progress. "
+                "Do not repeat work with unknown side effects."
+            )
+            output.turn_started(target, instruction)
+            try:
+                result = await session.resume(TurnRequest(session_id=target, text=instruction))
+                output.result(result)
+            finally:
+                output.turn_finished()
+                await context.ensure_usage(target)
+                await context.refresh(target)
+                refresh_label(target)
+            return None
+
         async def on_turn_settled(target: str) -> None:
             await context.refresh(target)
             refresh_label(target)
@@ -1598,6 +1743,8 @@ async def run_core_agent(
                 session_command=session_command,
                 compact_command=compact_command,
                 undo_command=undo_command,
+                correct_command=correct_command,
+                resume_command=resume_command,
                 name_session=name_session,
                 on_active_session=on_active_session,
                 on_turn_settled=on_turn_settled,

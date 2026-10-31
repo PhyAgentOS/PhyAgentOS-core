@@ -188,6 +188,100 @@ def _has_provider_detail(error: object, status: int | None) -> bool:
     return isinstance(error, str) or status is not None or getattr(error, "body", None) is not None
 
 
+_CODE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
+# Structured codes for the same failure class. Providers that report one of
+# these get the canonical name the agent core uses for bounded recovery.
+_CONTEXT_OVERFLOW_CODES = frozenset(
+    {"context_length_exceeded", "context_window_exceeded"}
+)
+
+
+def _clean_code(value: object) -> str | None:
+    """Return a short machine-shaped code, or None.
+
+    Only identifier-shaped values survive: a response body, a message or a
+    credential can never be mistaken for an error code. ``_sanitize`` is
+    reused so a credential-shaped value is dropped rather than echoed.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not _CODE_RE.fullmatch(text):
+        return None
+    if _sanitize(text) != text:
+        return None
+    return text
+
+
+def _code_from_value(value: object, depth: int = 0) -> str | None:
+    """Read ``error.code`` (or a bare ``code``) from a decoded body."""
+    if depth > 3:
+        return None
+    if isinstance(value, str):
+        if value.strip()[:1] != "{":
+            return None
+        try:
+            return _code_from_value(json.loads(value), depth + 1)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, dict):
+        error = value.get("error")
+        if isinstance(error, dict):
+            code = _clean_code(error.get("code"))
+            if code is not None:
+                return code
+        return _clean_code(value.get("code"))
+    return None
+
+
+def _is_context_overflow_exception(error: object) -> bool:
+    """True for SDKs that raise a dedicated overflow class (e.g. LiteLLM).
+
+    The exception type is structured evidence from the SDK, not a match on
+    provider prose, so it is safe to treat as a context-overflow signal.
+    """
+    return any(
+        cls.__name__ == "ContextWindowExceededError" for cls in type(error).__mro__
+    )
+
+
+def extract_error_code(error: object) -> str | None:
+    """Return the provider's structured error code, or ``None``.
+
+    Sources, in order: a dedicated overflow exception class, the exception's
+    ``code`` attribute, ``error.code`` in its decoded ``body``, then
+    ``response.json()`` when that still carries the provider payload. Message
+    text is never inspected, so prose such as "too many tokens" cannot
+    authorize a context-overflow recovery. Known overflow codes are mapped to
+    ``context_overflow``; every other code is returned only when it is short
+    and identifier-shaped, so no response body can leak through this channel.
+    """
+    if _is_context_overflow_exception(error):
+        return "context_overflow"
+
+    # A decoded body (dict) or a JSON string body can be passed directly, as
+    # the Azure provider does with ``response.json()``.
+    code = _code_from_value(error) if isinstance(error, (dict, str)) else None
+    if code is None:
+        code = _clean_code(getattr(error, "code", None))
+    if code is None:
+        code = _code_from_value(getattr(error, "body", None))
+    if code is None:
+        response = getattr(error, "response", None)
+        json_fn = getattr(response, "json", None)
+        if callable(json_fn):
+            try:
+                code = _code_from_value(json_fn())
+            except Exception:
+                code = None
+
+    if code is None:
+        return None
+    if code in _CONTEXT_OVERFLOW_CODES:
+        return "context_overflow"
+    return code
+
+
 def describe_provider_error(error: object) -> str:
     raw = _raw_message(error)
     text = f"{type(error).__name__} {raw}".lower()

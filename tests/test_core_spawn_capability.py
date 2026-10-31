@@ -299,13 +299,27 @@ async def _wait_entered(event: asyncio.Event) -> None:
 # ---------------------------------------------------------------------------
 # schema and import boundaries
 # ---------------------------------------------------------------------------
-def test_spawn_schema_matches_legacy_external_contract() -> None:
+def test_spawn_schema_keeps_legacy_required_task_and_adds_optional_continuation() -> None:
     assert SPAWN_TOOL.name == "spawn"
     assert "background" in SPAWN_TOOL.description
     assert SPAWN_TOOL.parameters["required"] == ["task"]
-    assert set(SPAWN_TOOL.parameters["properties"]) == {"task", "label"}
+    assert set(SPAWN_TOOL.parameters["properties"]) == {
+        "task",
+        "label",
+        "child_session_id",
+        "role",
+        "tool_allowlist",
+    }
     assert SPAWN_TOOL.parameters["properties"]["task"]["type"] == "string"
     assert SPAWN_TOOL.parameters["properties"]["label"]["type"] == "string"
+    assert (
+        SPAWN_TOOL.parameters["properties"]["child_session_id"]["type"]
+        == "string"
+    )
+    assert (
+        SPAWN_TOOL.parameters["properties"]["tool_allowlist"]["type"]
+        == "array"
+    )
 
 
 async def test_default_general_tools_are_built_once_without_recursive_spawn(
@@ -490,7 +504,16 @@ async def test_spawn_returns_accepted_and_notifies_completed_child(
         assert offered == {"probe"}
         system_text = first_child_call["messages"][0]["content"]
         assert CHILD_SYSTEM_PROMPT.strip() in system_text
-        assert "general child fragment" in system_text
+        # The parent performance default is cache-stable prompts, so live
+        # fragments are a runtime-context tail instead of part of the system.
+        assert "general child fragment" not in system_text
+        runtime_fragments = [
+            message
+            for message in first_child_call["messages"]
+            if message.get("role") == "user"
+            and "general child fragment" in (message.get("content") or "")
+        ]
+        assert len(runtime_fragments) == 1
         assert first_child_call["messages"][1] == {
             "role": "user",
             "content": "inspect the workspace",

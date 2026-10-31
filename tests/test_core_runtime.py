@@ -872,3 +872,30 @@ def test_runtime_satisfies_the_published_protocol() -> None:
     assert isinstance(runtime, core_protocols.AgentRuntime)
     assert isinstance(StaticDriver(), LoopDriver)
     assert isinstance(FakeStore(), SessionStore)
+
+
+class FailedWithReplyDriver:
+    """A failed turn may still return partial progress as data."""
+
+    async def run(self, turn: TurnStart) -> TurnResult:
+        return _result(
+            turn,
+            status=TurnStatus.FAILED,
+            reply="partial progress",
+            error="budget exhausted",
+        )
+
+
+async def test_failed_driver_reply_is_kept_without_becoming_success() -> None:
+    store = FakeStore()
+    runtime = _runtime(FailedWithReplyDriver(), store)
+
+    result = await runtime.submit(_request())
+
+    assert result.status is TurnStatus.FAILED
+    assert result.reply == "partial progress"
+    assert result.error == "budget exhausted"
+    assert _types(store)[-1] is EventType.TURN_FAILED
+    assert store.events[-1].payload["error"] == "budget exhausted"
+    assert store.events[-1].payload["reply"] == "partial progress"
+    assert EventType.TURN_COMPLETED not in _types(store)

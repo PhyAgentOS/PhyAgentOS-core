@@ -37,6 +37,16 @@ Invariants this module enforces:
 * ``stop`` rejects new submissions, cancels active turns, and waits for every
   accepted submit (queued ones included) while leaving the store open.
   ``aclose`` reuses ``stop`` and then closes the store exactly once.
+* ``resume`` reuses the same registration, lock, recovery and cancellation
+  path as ``submit``; only the history source differs. It asks the store for a
+  balanced failed/interrupted snapshot and records the source turn in
+  ``turn.started``. It never changes an ordinary ``submit`` into a resume.
+* ``steer`` queues a correction only on the active turn of one session. The
+  runtime opens and closes that turn on the injected steering object; the loop
+  driver, not the runtime, drains it at a step boundary. Any correction still
+  queued when the turn reaches a terminal state is written to
+  ``payload["unapplied_corrections"]`` and exposed by
+  :meth:`unapplied_corrections`; it is never applied or put into history.
 * ``cancel`` only requests local cancellation and waits for the turn to settle.
   If the session is registered but no turn is published yet, it records
   ``cancel_pending`` for that accepted submit instead of losing the request.
@@ -148,7 +158,9 @@ class AgentRuntime:
     ``max_steps`` is the step ceiling of every turn's :class:`Budget`.
     ``deadline_seconds``, when given, becomes a per-turn absolute
     :func:`time.monotonic` deadline measured from the moment the turn starts.
-    Token billing is deliberately absent.
+    ``steering``, when given (or exposed by ``driver.steering``), is opened and
+    closed with each active turn and receives corrections through
+    :meth:`steer`. Token billing is deliberately absent.
     """
 
     def __init__(
@@ -157,6 +169,7 @@ class AgentRuntime:
         store: SessionStore,
         max_steps: int = 16,
         deadline_seconds: float | None = None,
+        steering: Any | None = None,
     ) -> None:
         if not isinstance(max_steps, int) or isinstance(max_steps, bool):
             raise TypeError("max_steps must be an int")
@@ -175,12 +188,21 @@ class AgentRuntime:
         self._deadline_seconds = (
             None if deadline_seconds is None else float(deadline_seconds)
         )
+        # One object serves both sides: the driver drains it at a step boundary
+        # and the runtime opens/closes the turn it may accept text for. A driver
+        # may expose the same object as ``steering``; an explicit argument wins.
+        self._steering = (
+            steering if steering is not None else getattr(driver, "steering", None)
+        )
 
         self._registry_lock = asyncio.Lock()
         self._sessions: dict[str, _SessionState] = {}
         self._inflight_submits = 0
         self._idle = asyncio.Event()
         self._idle.set()
+        # Unconsumed corrections recorded on the terminal event, kept for the
+        # entry to warn about without reading the whole event log.
+        self._unapplied_corrections: dict[tuple[str, str], tuple[str, ...]] = {}
 
         self._stopped = False
         self._stop_started = False
@@ -210,6 +232,86 @@ class AgentRuntime:
         the driver is not called, and a failed terminal write is never
         reported as ``completed``.
         """
+        return await self._run_turn(request, resume=False)
+
+    async def resume(
+        self, request: TurnRequest, *, source_turn_id: str | None = None
+    ) -> TurnResult:
+        """Start a new turn from an explicit failed/interrupted snapshot.
+
+        The normal registration, per-session lock, recovery, budget and
+        cancellation flow is reused. Instead of ``read_conversation`` (which
+        only ever projects a completed turn), the store's
+        ``read_resume_history`` supplies balanced messages for the chosen
+        failed or interrupted turn. The current ``request.text`` stays the new
+        user instruction and is appended by the loop driver, never merged into
+        the stored snapshot. ``turn.started`` records the source turn in
+        ``payload["resumed_from_turn_id"]``.
+
+        The session must have no unfinished turn. A completed, reverted, or
+        checkpoint-covered source is refused by the store before any event is
+        written. Resume is not a guarantee that a robot action or remote call
+        can be repeated; unsettled calls are reported as warnings by the
+        store and are never replayed automatically.
+        """
+        if source_turn_id is not None:
+            require_non_empty("source_turn_id", source_turn_id)
+        return await self._run_turn(
+            request, resume=True, source_turn_id=source_turn_id
+        )
+
+    async def steer(self, session_id: str, text: str) -> str:
+        """Queue one correction for this session's active turn.
+
+        Returns the turn id that accepted it. The driver drains the text at the
+        next safe step boundary and writes ``input.steered``; a request that
+        already started is not changed. ``RuntimeError`` means no steering
+        object is configured or no turn is active; ``ValueError`` (or the
+        control's own limit error) means the text is empty or the queue is
+        full. Queueing is not applying and says nothing about remote work.
+        """
+        require_non_empty("session_id", session_id)
+        require_non_empty("text", text)
+        steering = self._steering
+        if steering is None:
+            raise RuntimeError(
+                "turn steering is not configured; no correction was queued"
+            )
+        enqueue = getattr(steering, "enqueue", None)
+        if not callable(enqueue):
+            raise RuntimeError(
+                "configured turn steering has no enqueue(); no correction was queued"
+            )
+        state = await self._acquire_state(session_id, create=False, submit=False)
+        try:
+            if state is None:
+                raise RuntimeError(
+                    f"session {session_id!r} has no active turn; no correction was queued"
+                )
+            async with self._registry_lock:
+                active = state.active
+                if active is None:
+                    raise RuntimeError(
+                        f"session {session_id!r} has no active turn; no correction "
+                        "was queued"
+                    )
+                # Holding the registry lock keeps the turn from being closed
+                # between the active check and the queue write. The turn's
+                # later drain decides whether it is consumed; an undrained
+                # correction is discarded with the turn, never moved forward.
+                enqueue(session_id, active.turn_id, text)
+                return active.turn_id
+        finally:
+            if state is not None:
+                await self._release_state(state, submit=False)
+
+    async def _run_turn(
+        self,
+        request: TurnRequest,
+        *,
+        resume: bool,
+        source_turn_id: str | None = None,
+    ) -> TurnResult:
         if not isinstance(request, TurnRequest):
             raise TypeError("request must be a TurnRequest")
 
@@ -220,7 +322,19 @@ class AgentRuntime:
                 if self._stopped:
                     raise RuntimeError("agent runtime is stopped")
 
-                history = await self._startup(request.session_id)
+                resumed_from: str | None = None
+                resume_warnings: tuple[str, ...] = ()
+                if resume:
+                    await self._startup(
+                        request.session_id, with_conversation=False
+                    )
+                    history, resumed_from, resume_warnings = (
+                        await self._read_resume_history(
+                            request.session_id, source_turn_id
+                        )
+                    )
+                else:
+                    history = await self._startup(request.session_id)
                 if self._stopped:
                     raise RuntimeError("agent runtime is stopped")
 
@@ -253,17 +367,46 @@ class AgentRuntime:
                         history=history,
                     )
                     active = _ActiveTurn(turn_id=turn_id, start=start)
+                    # Open steering before publishing the active turn. A closed
+                    # or broken control then raises with no active turn to
+                    # leak, no start event written, and no terminal event
+                    # invented; the outer finally still releases the state.
+                    self._steering_begin(request.session_id, turn_id)
                     state.active = active
 
                 try:
-                    await self._append_start_events(start)
+                    await self._append_start_events(
+                        start,
+                        resumed_from_turn_id=resumed_from,
+                        resume_warnings=resume_warnings,
+                    )
                     result, event_type, payload = await self._execute(start)
+                    # Corrections can arrive while the final answer streams.
+                    # There is no next safe step to consume them, so close the
+                    # queue before the terminal payload is fixed and record
+                    # them as unapplied. A concurrent steer then sees no open
+                    # turn instead of silently queueing into a closed one.
+                    async with self._registry_lock:
+                        unapplied = self._steering_take_unapplied(
+                            request.session_id, turn_id
+                        )
+                    if unapplied:
+                        payload["unapplied_corrections"] = list(unapplied)
                     active.status = result.status
                     await self._append_terminal(start, event_type, payload)
+                    if unapplied:
+                        self._unapplied_corrections[(request.session_id, turn_id)] = (
+                            unapplied
+                        )
                     return result
                 finally:
-                    state.active = None
-                    active.done.set()
+                    try:
+                        async with self._registry_lock:
+                            if state.active is active:
+                                state.active = None
+                            self._steering_end(request.session_id, turn_id)
+                    finally:
+                        active.done.set()
         finally:
             await self._release_state(state, submit=True)
 
@@ -378,7 +521,117 @@ class AgentRuntime:
     # ------------------------------------------------------------------
     # turn execution
     # ------------------------------------------------------------------
-    async def _startup(self, session_id: str) -> tuple[Mapping[str, Any], ...]:
+    def _steering_begin(self, session_id: str, turn_id: str) -> None:
+        """Open the runtime-owned active turn on the steering object.
+
+        ``begin_turn``/``end_turn`` are the TurnControl names; ``activate``/
+        ``deactivate`` are accepted for an equivalent injected object.
+        """
+        if self._steering is None:
+            return
+        begin = getattr(self._steering, "begin_turn", None)
+        if not callable(begin):
+            begin = getattr(self._steering, "activate", None)
+        if callable(begin):
+            begin(session_id, turn_id)
+
+    def _steering_end(self, session_id: str, turn_id: str) -> None:
+        """Close the active turn and discard corrections it never drained."""
+        if self._steering is None:
+            return
+        end = getattr(self._steering, "end_turn", None)
+        if not callable(end):
+            end = getattr(self._steering, "deactivate", None)
+        if callable(end):
+            end(session_id, turn_id)
+
+    def _steering_take_unapplied(
+        self, session_id: str, turn_id: str
+    ) -> tuple[str, ...]:
+        """Take corrections still queued when the turn reaches its terminal.
+
+        The queue is closed here, under the registry lock, so a concurrent
+        ``steer`` cannot add text after the terminal payload is fixed. Prefer
+        ``unapplied`` for a read, then ``end_turn`` for the atomic clear; an
+        ``end_turn`` that returns the remaining text is authoritative because
+        it may include a correction queued between the two calls.
+        """
+        if self._steering is None:
+            return ()
+        peek = getattr(self._steering, "unapplied", None)
+        remaining: tuple[str, ...] = ()
+        if callable(peek):
+            try:
+                remaining = tuple(peek(session_id, turn_id))
+            except Exception:
+                remaining = ()
+        end = getattr(self._steering, "end_turn", None)
+        if not callable(end):
+            end = getattr(self._steering, "deactivate", None)
+        if callable(end):
+            try:
+                ended = end(session_id, turn_id)
+            except Exception:
+                return remaining
+            if isinstance(ended, (tuple, list)):
+                return tuple(item for item in ended if isinstance(item, str))
+        return remaining
+
+    def unapplied_corrections(self, session_id: str, turn_id: str) -> tuple[str, ...]:
+        """Return corrections recorded on a finished turn's terminal event.
+
+        These were never applied and are not part of history. The entry uses
+        this to warn after ``submit``/``resume`` returns; the terminal event
+        carries the same text in ``payload["unapplied_corrections"]``.
+        """
+        return self._unapplied_corrections.get((session_id, turn_id), ())
+
+    async def _read_resume_history(
+        self, session_id: str, source_turn_id: str | None
+    ) -> tuple[tuple[Mapping[str, Any], ...], str, tuple[str, ...]]:
+        """Read the store's explicit resume projection for this session.
+
+        A store that does not implement ``read_resume_history`` refuses the
+        request instead of falling back to the completed-turn projection.
+        ``ResumeUnavailableError`` (a source/checkpoint/revert refusal) is
+        propagated unchanged; any other read failure is a storage error and no
+        turn is opened.
+        """
+        reader = getattr(self._store, "read_resume_history", None)
+        if not callable(reader):
+            raise RuntimeError(
+                "this session store does not support resume; no turn was opened"
+            )
+        try:
+            history = await reader(session_id, turn_id=source_turn_id)
+        except Exception as exc:  # noqa: BLE001 - refusal is re-raised below
+            from .session import ResumeUnavailableError
+
+            if isinstance(exc, ResumeUnavailableError):
+                raise
+            raise RuntimeStorageError(
+                None,
+                f"read_resume_history failed for session {session_id!r}: "
+                f"{_describe(exc)}",
+            ) from exc
+        source = getattr(history, "source_turn_id", None)
+        messages = getattr(history, "messages", None)
+        warnings = getattr(history, "warnings", ())
+        if not isinstance(source, str) or not source.strip():
+            raise RuntimeStorageError(
+                None,
+                "read_resume_history returned no source_turn_id",
+            )
+        if messages is None:
+            raise RuntimeStorageError(
+                None,
+                "read_resume_history returned no messages",
+            )
+        return tuple(messages), source, tuple(warnings or ())
+
+    async def _startup(
+        self, session_id: str, *, with_conversation: bool = True
+    ) -> tuple[Mapping[str, Any], ...]:
         """Recover the session and return the next turn's stored history.
 
         A store exposing ``read_startup_snapshot`` is asked for both values.
@@ -386,6 +639,8 @@ class AgentRuntime:
         folded at; if another process changed the log first, the snapshot is
         read and folded again instead of closing an already-terminal turn.
         Any other store keeps the explicit recover-then-read path.
+        ``with_conversation=False`` performs the same recovery but returns no
+        completed-turn projection; resume supplies its own history.
         """
         snapshot_reader = getattr(self._store, "read_startup_snapshot", None)
         if callable(snapshot_reader):
@@ -408,7 +663,9 @@ class AgentRuntime:
                     session_id, snapshot.recovery, snapshot.head_sequence
                 )
                 if closed:
-                    return tuple(snapshot.conversation)
+                    return (
+                        tuple(snapshot.conversation) if with_conversation else ()
+                    )
             # A live writer kept moving the head. Fail closed: no new turn may
             # start while the report has not been persisted stably. Nothing
             # was written for this startup; the next submit retries.
@@ -421,6 +678,8 @@ class AgentRuntime:
 
         report = await self._store_recovery(session_id)
         await self._close_unfinished_turns(session_id, report)
+        if not with_conversation:
+            return ()
         return await self._read_history(session_id)
 
     async def _store_recovery(self, session_id: str) -> RecoveryReport:
@@ -507,7 +766,13 @@ class AgentRuntime:
             ) from exc
         return tuple(conversation)
 
-    async def _append_start_events(self, start: TurnStart) -> None:
+    async def _append_start_events(
+        self,
+        start: TurnStart,
+        *,
+        resumed_from_turn_id: str | None = None,
+        resume_warnings: Sequence[str] = (),
+    ) -> None:
         accepted = RuntimeEvent(
             type=EventType.INPUT_ACCEPTED,
             session_id=start.request.session_id,
@@ -521,11 +786,19 @@ class AgentRuntime:
                 f"session {start.request.session_id!r}: {_describe(exc)}",
             ) from exc
 
+        payload: dict[str, Any] = {
+            "max_steps": start.budget.max_steps,
+            "request_text": start.request.text,
+        }
+        if resumed_from_turn_id is not None:
+            payload["resumed_from_turn_id"] = resumed_from_turn_id
+            if resume_warnings:
+                payload["resume_warnings"] = list(resume_warnings)
         started = RuntimeEvent(
             type=EventType.TURN_STARTED,
             session_id=start.request.session_id,
             turn_id=start.turn_id,
-            payload={"max_steps": start.budget.max_steps},
+            payload=payload,
         )
         try:
             await self._store.append(started)
@@ -583,7 +856,9 @@ class AgentRuntime:
         if outcome.status is TurnStatus.INTERRUPTED:
             return self._interrupted(start)
         return self._failed(
-            start, outcome.error or "driver reported a failure without an error"
+            start,
+            outcome.error or "driver reported a failure without an error",
+            reply=outcome.reply,
         )
 
     def _completed(
@@ -611,16 +886,22 @@ class AgentRuntime:
         return result, EventType.TURN_INTERRUPTED, payload
 
     def _failed(
-        self, start: TurnStart, error: str
+        self, start: TurnStart, error: str, *, reply: str | None = None
     ) -> tuple[TurnResult, EventType, dict[str, Any]]:
         message = error or "turn failed"
         result = TurnResult(
             session_id=start.request.session_id,
             turn_id=start.turn_id,
             status=TurnStatus.FAILED,
+            reply=reply,
             error=message,
         )
-        return result, EventType.TURN_FAILED, {"error": message}
+        payload: dict[str, Any] = {"error": message}
+        if reply is not None:
+            # Partial progress remains visible as data. It is still a failed
+            # turn: no terminal success and no assistant completion is implied.
+            payload["reply"] = reply
+        return result, EventType.TURN_FAILED, payload
 
     async def _append_terminal(
         self, start: TurnStart, event_type: EventType, payload: dict[str, Any]

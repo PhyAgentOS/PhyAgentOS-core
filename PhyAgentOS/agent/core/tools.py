@@ -20,6 +20,17 @@ arguments are the validated raw payload, not the adapter's parsed mapping.
 
 A settlement that cannot be persisted is returned as ``unknown`` with error
 code ``tool_settled_write_failed``; the local status stays in ``content``.
+
+``execute_batch`` is an optional extension used by the loop driver and by Code
+Mode. It runs consecutive calls whose registration declares
+``parallel_safe=True`` with bounded concurrency, treats any other call as a
+sequential barrier, and still routes every call through :meth:`execute`, so
+validation, authorization, and the intent/dispatched/settled ordering are the
+same as for one call. A durable write failure stops the batch from starting
+new calls; calls already running are allowed to settle, and an unstarted call
+is reported as ``cancelled`` (never as success or unknown). The
+concurrency limit lives only in this batch method, never in ``execute``, so a
+nested call through the same executor cannot deadlock.
 """
 
 from __future__ import annotations
@@ -28,7 +39,7 @@ import asyncio
 import contextlib
 import copy
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -37,6 +48,7 @@ import jsonschema
 from .events import EventType, RuntimeEvent
 from .protocols import SessionStore
 from .types import (
+    CORE_PERSISTENCE_FAILURE_CODES,
     DomainRefs,
     ExecutionContext,
     OperationCancelledError,
@@ -95,7 +107,10 @@ class ToolExecutorImpl:
 
     ``registrations`` is snapshotted at construction; a duplicate tool name is
     a wiring error and raises :class:`ValueError`. The injected store is used
-    only through its async ``append`` method.
+    only through its async ``append`` method. The public ``registrations``
+    tuple and :meth:`registration` let another capability (Code Mode) reuse
+    this exact executor and its registrations instead of building a second
+    dispatch path.
 
     Rejections and pre-dispatch cancellations are settled with their terminal
     status even though no ``tool.intent`` was written: the call never ran, but
@@ -111,6 +126,7 @@ class ToolExecutorImpl:
     ) -> None:
         self._store = store
         self._tools: dict[str, ToolRegistration] = {}
+        self._registrations: list[ToolRegistration] = []
         self._handler_tasks: set[asyncio.Task[Any]] = set()
         for registration in registrations:
             if not isinstance(registration, ToolRegistration):
@@ -119,6 +135,16 @@ class ToolExecutorImpl:
             if name in self._tools:
                 raise ValueError(f"duplicate tool registration for {name!r}")
             self._tools[name] = registration
+            self._registrations.append(registration)
+
+    @property
+    def registrations(self) -> tuple[ToolRegistration, ...]:
+        """The frozen registration list, in wiring order (read-only view)."""
+        return tuple(self._registrations)
+
+    def registration(self, name: str) -> ToolRegistration | None:
+        """Look up one registration by tool name, or ``None``."""
+        return self._tools.get(name)
 
     @property
     def pending_handler_tasks(self) -> tuple[asyncio.Task[Any], ...]:
@@ -188,6 +214,152 @@ class ToolExecutorImpl:
         if not outcome.is_terminal:
             return outcome
         return await self._settle(context, outcome)
+
+    async def execute_batch(
+        self,
+        calls: Sequence[ToolCall],
+        context: ExecutionContext,
+        *,
+        max_parallel: int = 4,
+    ) -> tuple[ToolOutcome, ...]:
+        """Run one model step's calls, parallelising only declared-safe ones.
+
+        Consecutive registrations with ``parallel_safe=True`` form a bounded
+        worker pool; any other call is a sequential barrier that also waits for
+        the preceding pool to finish. Results come back in the original call
+        order. Every call still goes through :meth:`execute`, so validation,
+        policy, and the ``tool.intent`` / ``tool.dispatched`` / ``tool.settled``
+        order are unchanged.
+
+        A core persistence failure (or an external/local stop) prevents new
+        calls from starting. Calls already running are awaited so their
+        settlement is written, and every never-started call is returned as
+        ``cancelled`` because its handler was not called. An unknown result is
+        never rewritten as success.
+        """
+        if not isinstance(context, ExecutionContext):
+            raise TypeError("context must be an ExecutionContext")
+        if (
+            not isinstance(max_parallel, int)
+            or isinstance(max_parallel, bool)
+            or max_parallel < 1
+        ):
+            raise ValueError("max_parallel must be an int >= 1")
+        frozen = tuple(calls)
+        for call in frozen:
+            if not isinstance(call, ToolCall):
+                raise TypeError("calls must contain ToolCall instances")
+        if not frozen:
+            return ()
+
+        outcomes: list[ToolOutcome | None] = [None] * len(frozen)
+        index = 0
+        while index < len(frozen):
+            if context.cancellation.cancelled:
+                break
+            if self._is_parallel_safe(frozen[index]):
+                end = index + 1
+                while end < len(frozen) and self._is_parallel_safe(frozen[end]):
+                    end += 1
+                stop_reason = await self._run_parallel_segment(
+                    frozen, index, end, context, outcomes, max_parallel
+                )
+                index = end
+            else:
+                outcomes[index] = await self.execute(frozen[index], context)
+                stop_reason = self._stop_reason(context, outcomes[index])
+                index += 1
+            if stop_reason is not None:
+                break
+
+        # A call that never started must say so: ``cancelled`` is local and
+        # cannot be confused with a dispatched-but-unknown result.
+        for position, outcome in enumerate(outcomes):
+            if outcome is None:
+                outcomes[position] = self._not_started(
+                    frozen[position],
+                    cancelled=context.cancellation.cancelled,
+                )
+        return tuple(outcome for outcome in outcomes if outcome is not None)
+
+    async def _run_parallel_segment(
+        self,
+        calls: tuple[ToolCall, ...],
+        start: int,
+        stop: int,
+        context: ExecutionContext,
+        outcomes: list[ToolOutcome | None],
+        max_parallel: int,
+    ) -> str | None:
+        """Run one run of consecutive safe calls; return why it stopped."""
+        cursor = start
+        abort: str | None = None
+
+        async def drive() -> None:
+            nonlocal cursor, abort
+            while abort is None and not context.cancellation.cancelled:
+                if cursor >= stop:
+                    return
+                position = cursor
+                cursor += 1
+                outcome = await self.execute(calls[position], context)
+                outcomes[position] = outcome
+                reason = self._stop_reason(context, outcome)
+                if reason is not None:
+                    abort = reason
+                    return
+
+        workers = min(max_parallel, stop - start)
+        tasks = [
+            asyncio.create_task(drive(), name=f"tool-batch:{start}:{offset}")
+            for offset in range(workers)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # External cancellation: let every started call settle as unknown
+            # before propagating. ``execute`` does that settlement itself.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return abort
+
+    def _is_parallel_safe(self, call: ToolCall) -> bool:
+        registration = self._tools.get(call.name)
+        return registration is not None and registration.parallel_safe
+
+    def _stop_reason(
+        self, context: ExecutionContext, outcome: ToolOutcome | None
+    ) -> str | None:
+        if outcome is None:  # pragma: no cover - defensive
+            return "not_started"
+        if outcome.status is ToolStatus.RUNNING:
+            return "running"
+        if (
+            outcome.error is not None
+            and outcome.error.code in CORE_PERSISTENCE_FAILURE_CODES
+        ):
+            return "persistence"
+        if context.cancellation.cancelled:
+            return "cancelled"
+        return None
+
+    def _not_started(self, call: ToolCall, *, cancelled: bool) -> ToolOutcome:
+        if cancelled:
+            text = "cancelled locally before dispatch; the tool handler was not called"
+        else:
+            text = (
+                "not started because an earlier call in this batch could not be "
+                "recorded durably; the tool handler was not called"
+            )
+        return ToolOutcome(
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            status=ToolStatus.CANCELLED,
+            text=text,
+        )
 
     async def _append(
         self,

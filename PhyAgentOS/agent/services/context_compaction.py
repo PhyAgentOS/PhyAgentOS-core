@@ -142,6 +142,9 @@ async def compact_session(
     reserve_tokens: int | None = None,
     token_estimator: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
     request_token_estimator: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
+    conversation: Sequence[Mapping[str, Any]] | None = None,
+    commit_checkpoint: bool = True,
+    usage_observer: Callable[[Mapping[str, int]], None] | None = None,
 ) -> CompactionResult:
     """Summarize the older conversation and store one checkpoint.
 
@@ -156,6 +159,20 @@ async def compact_session(
     uses. It defaults to ``token_estimator`` so before/after are always measured
     by one method; success is committed only when that real next request is
     smaller, never when a character count merely shrank.
+
+    ``conversation`` optionally supplies the messages to compact instead of
+    reading the store projection. This is how an in-turn policy summarizes the
+    current history, which is not yet in ``read_conversation``. With
+    ``commit_checkpoint=False`` the summary call is still recorded as an
+    attempt and the projected messages are returned, but no checkpoint is
+    written; that keeps the store's unfinished-turn protection untouched. The
+    driver that owns the turn persists the returned messages in its own
+    ``context.compacted`` event.
+
+    ``usage_observer`` is called exactly once for every real summary provider
+    call with the usage that call reported. A provider failure or cancellation
+    reports ``{}`` because no usage was received; it is still one call for
+    budget accounting. The observer never replaces the durable attempt row.
 
     The caller serializes calls with the session's turn queue so no turn is
     active. Raises :class:`CompactionError` when compaction is refused or the
@@ -185,6 +202,10 @@ async def compact_session(
         raise ValueError("context_window_tokens must be positive or None")
     if reserve_tokens is not None and reserve_tokens < 0:
         raise ValueError("reserve_tokens must be >= 0 or None")
+    if not isinstance(commit_checkpoint, bool):
+        raise TypeError("commit_checkpoint must be a bool")
+    if usage_observer is not None and not callable(usage_observer):
+        raise TypeError("usage_observer must be callable or None")
 
     estimator = token_estimator or _estimate_tokens
     request_estimator = request_token_estimator or estimator
@@ -192,7 +213,12 @@ async def compact_session(
     # Read the head first: if anything is appended after this point, the commit
     # CAS below rejects the checkpoint instead of covering unseen work.
     head = await store.read_head_sequence(session_id)
-    conversation = tuple(await store.read_conversation(session_id))
+    if conversation is None:
+        conversation = tuple(await store.read_conversation(session_id))
+    else:
+        if not isinstance(conversation, Sequence) or isinstance(conversation, (str, bytes)):
+            raise TypeError("conversation must be a sequence of mappings")
+        conversation = tuple(dict(message) for message in conversation)
     if not conversation:
         raise CompactionError("session has no complete conversation to compact")
 
@@ -246,15 +272,23 @@ async def compact_session(
         response = await provider.chat_with_retry(
             messages=prompt, tools=None, **generation
         )
-    except asyncio.CancelledError:
-        await _finish_attempt(store, attempt, "interrupted", {}, "cancelled")
+    except asyncio.CancelledError as exc:
+        observed = _usage(exc)
+        await _finish_attempt(store, attempt, "interrupted", observed, "cancelled")
+        if usage_observer is not None:
+            usage_observer(observed)
         raise
     except Exception as exc:  # provider failures are not summaries
         reason = f"provider_error:{type(exc).__name__}"
-        await _finish_attempt(store, attempt, "failed", {}, reason)
+        observed = _usage(exc)
+        await _finish_attempt(store, attempt, "failed", observed, reason)
+        if usage_observer is not None:
+            usage_observer(observed)
         raise CompactionError(f"summary provider call failed: {type(exc).__name__}") from exc
 
     usage = _usage(response)
+    if usage_observer is not None:
+        usage_observer(dict(usage))
     try:
         summary = _summary_text(response)
         before_tokens = _checked_estimate(request_estimator, conversation)
@@ -279,7 +313,11 @@ async def compact_session(
             selection={"provider": provider_name, "model": model, "effort": effort},
             usage=usage,
         )
-        committed = await store.commit_checkpoint(checkpoint, expected_head_sequence=head)
+        committed = (
+            await store.commit_checkpoint(checkpoint, expected_head_sequence=head)
+            if commit_checkpoint
+            else checkpoint
+        )
     except asyncio.CancelledError:
         await _finish_attempt(store, attempt, "interrupted", usage, "cancelled")
         raise

@@ -18,7 +18,8 @@ twice:
 
 * ``AgentRuntime``: ``input.accepted``, ``turn.started``, terminal ``turn.*``
   events, and ``session.snapshot.created``;
-* ``LoopDriver``: ``request.prepared``, ``model.attempt.*``, and
+* ``LoopDriver``: ``request.prepared``, ``model.attempt.*``,
+  ``input.steered`` (the correction it consumed at a step boundary), and
   ``context.compacted`` (it owns the message history being compacted);
 * ``ToolExecutor``: ``tool.intent``, ``tool.dispatched``, ``tool.settled``;
 * the session store: ``turn.reverted``.
@@ -61,8 +62,11 @@ class EventType(str, Enum):
 
     ``input.accepted`` arrives before a turn exists. Turn, request, model and
     tool events belong to a turn; request/model/tool events also belong to one
-    step. ``model.attempt.interrupted`` is the recovery-only terminal state
-    for an attempt that was started but never finished.
+    step. ``input.steered`` is written by the loop driver at a safe step
+    boundary: it carries the correction text consumed there, and it never
+    changes a request that already started. ``model.attempt.interrupted`` is
+    the recovery-only terminal state for an attempt that was started but never
+    finished.
 
     ``turn.reverted`` is session-scoped and carries no ``turn_id`` of its own:
     the reverted turn is named in ``payload["reverted_turn_id"]``. It is not a
@@ -72,6 +76,7 @@ class EventType(str, Enum):
     """
 
     INPUT_ACCEPTED = "input.accepted"
+    INPUT_STEERED = "input.steered"
     TURN_STARTED = "turn.started"
     TURN_COMPLETED = "turn.completed"
     TURN_FAILED = "turn.failed"
@@ -218,6 +223,8 @@ class RuntimeEvent:
                 raise ValueError(
                     "model.response.delta requires non-empty payload.content"
                 )
+        if event_type is EventType.INPUT_STEERED and not _payload_text(payload, "text"):
+            raise ValueError("input.steered requires non-empty payload.text")
         if event_type in _TOOL_CALL_EVENTS and not _payload_text(payload, "tool_call_id"):
             raise ValueError(f"{event_type.value} requires payload.tool_call_id")
         if event_type is EventType.TOOL_SETTLED:

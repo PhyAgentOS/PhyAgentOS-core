@@ -35,6 +35,7 @@ from types import MappingProxyType
 from typing import Any
 
 __all__ = [
+    "CORE_PERSISTENCE_FAILURE_CODES",
     "Budget",
     "CancellationToken",
     "DomainRefs",
@@ -70,6 +71,20 @@ def require_non_empty(name: str, value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value
+
+
+# Executor persistence failures are not tool answers. The call either never
+# ran (intent/dispatched write failed) or its result could not be stored
+# (settled write failed), so the turn's record is already incomplete. Both the
+# executor and the driver treat this one set as a hard stop; sharing it here
+# keeps the condition a single membership check in both modules.
+CORE_PERSISTENCE_FAILURE_CODES = frozenset(
+    {
+        "tool_intent_write_failed",
+        "tool_dispatched_write_failed",
+        "tool_settled_write_failed",
+    }
+)
 
 
 def _optional_non_empty(name: str, value: str | None) -> str | None:
@@ -639,7 +654,10 @@ class ModelCallError(RuntimeError):
     empty assistant reply. ``detail`` is the provider's own error text.
     ``usage`` holds whatever token accounting the provider had already
     reported when the stream failed; it is empty when nothing was observed, so
-    a failure never invents usage numbers.
+    a failure never invents usage numbers. ``code`` is an optional structured
+    provider/adapter error code (for example ``context_overflow``) that lets
+    the driver attempt one bounded recovery; callers that only pass the two
+    positional arguments keep the previous behavior.
     """
 
     def __init__(
@@ -648,9 +666,11 @@ class ModelCallError(RuntimeError):
         detail: str,
         *,
         usage: Mapping[str, int] | None = None,
+        code: str | None = None,
     ) -> None:
         self.model_call_id = require_non_empty("model_call_id", model_call_id)
         self.detail = detail
+        self.code = _optional_non_empty("code", code)
         observed: dict[str, int] = {}
         for key, value in (usage or {}).items():
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:

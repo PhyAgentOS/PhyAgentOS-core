@@ -297,7 +297,7 @@ async def test_interactive_undo_refills_the_prompt_and_the_next_read_uses_it(
                 )
             )
             try:
-                await _until(lambda: "You:" in _ANSI.sub("", stream.getvalue()))
+                await _until(lambda: "│" in _ANSI.sub("", stream.getvalue()))
                 pipe.send_text("/undo\r")
                 await _until(lambda: store.calls == ["cli:test"])
                 await _until(lambda: "Tool side effects" in log.getvalue())

@@ -1092,7 +1092,7 @@ async def test_run_core_agent_pauses_reader_for_the_model_menu(tmp_path, monkeyp
     assert seen["text_command"] == ("cli:test", "/model gpt-4o")
 
 
-async def test_run_core_agent_single_message_has_static_progress_and_colon_title(
+async def test_run_core_agent_single_message_echoes_request_once_and_closes_turn(
     tmp_path, monkeypatch
 ):
     class Sessions:
@@ -1136,7 +1136,12 @@ async def test_run_core_agent_single_message_has_static_progress_and_colon_title
     assert code == 0
     assert "Preparing (Forge recovery)" in text
     assert "Preparing" in text and "done" in text
-    assert "🍞 PhyAgentOS:" in text
+    # The prompt header names the stable session id; the request is echoed once
+    # above the OS divider and closed by the End Turn divider.
+    assert "session cli:test · fake/fake-model" in text
+    assert "│ hello" in text and "You:" not in text and text.count("hello") == 1
+    assert "PhyAgentOS · Turn 1" in text and "End Turn 1" in text
+    assert "🍞 PhyAgentOS:" not in text
     assert "\x1b" not in text and "\r" not in text
 
 
@@ -1351,3 +1356,95 @@ async def test_run_core_agent_menu_refresh_shows_the_actual_selection(tmp_path, 
     )
     assert code == 0
     assert seen["order"] == ["pause", "resume", "pause", "resume"]
+
+
+async def test_run_core_agent_single_message_passes_request_text_and_finishes_after_result(
+    tmp_path, monkeypatch
+):
+    calls: list[tuple] = []
+
+    class FakeOutput:
+        display = None
+        ledger = None
+
+        def startup(self, detail="Forge recovery"):
+            pass
+
+        def ready(self):
+            pass
+
+        def configure_stats(self, **kwargs):
+            pass
+
+        def set_session_label(self, label):
+            pass
+
+        def refresh_status(self, session_id=None):
+            pass
+
+        def info(self, text):
+            calls.append(("info", text))
+
+        def error(self, text):
+            calls.append(("error", text))
+
+        def turn_started(self, session_id=None, request_text=None):
+            calls.append(("started", session_id, request_text))
+
+        def result(self, result):
+            calls.append(("result", result.turn_id))
+
+        def turn_finished(self):
+            calls.append(("finished",))
+
+        def cancel_requested(self):
+            calls.append(("cancel",))
+
+    class FakeSession:
+        sessions = _MutableSessions()
+
+        async def submit(self, request):
+            return TurnResult(
+                request.session_id, "turn-1", TurnStatus.COMPLETED, reply="done"
+            )
+
+        async def cancel(self, session_id):
+            raise AssertionError("no cancel expected")
+
+    @asynccontextmanager
+    async def fake_open(config, *, provider_name=None, model=None, effort=None, output, additional_capabilities=(), **_kwargs):
+        calls.append(("output", output))
+        yield FakeSession()
+
+    monkeypatch.setattr(agent_commands, "open_core_session", fake_open)
+    monkeypatch.setattr(
+        agent_commands, "load_agent_config", lambda config, workspace: _config(tmp_path)
+    )
+    monkeypatch.setattr(
+        "PhyAgentOS.cli.interaction.agent_output.AgentOutput",
+        lambda console, markdown=True: FakeOutput(),
+    )
+
+    code = await run_core_agent(
+        message="hello",
+        session_id="cli:test",
+        workspace=None,
+        config_path=None,
+        markdown=True,
+        logs=False,
+        provider_name=None,
+        model=None,
+        effort=None,
+        console=Console(file=StringIO(), width=160, color_system=None),
+    )
+
+    assert code == 0
+    assert ("started", "cli:test", "hello") in calls
+    assert ("result", "turn-1") in calls
+    assert ("finished",) in calls
+    assert calls.index(("result", "turn-1")) < calls.index(("finished",))
+    # The session header uses the stable id, not the request-derived title.
+    assert any(
+        kind == "info" and "session cli:test" in text and "hello" not in text
+        for kind, text in (item[:2] for item in calls if item[0] == "info")
+    )

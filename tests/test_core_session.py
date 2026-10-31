@@ -269,11 +269,15 @@ async def test_concurrent_appends_keep_one_contiguous_sequence() -> None:
             )
         )
         events = await store.read_session(SESSION)
+        other_events = await store.read_session("other")
 
     assert sorted(event.sequence for event in stored) == list(range(1, 26))
     assert [event.sequence for event in events] == list(range(1, 26))
     assert {event.payload["index"] for event in events} == set(range(25))
-    assert [event.sequence for event in other] == [1, 2, 3, 4, 5]
+    # asyncio.to_thread writers commit in lock-acquisition order, which need
+    # not match gather's input order. Both stored streams must be contiguous.
+    assert sorted(event.sequence for event in other) == [1, 2, 3, 4, 5]
+    assert [event.sequence for event in other_events] == [1, 2, 3, 4, 5]
 
 
 async def test_events_survive_a_writer_that_never_closed(tmp_path: Path) -> None:

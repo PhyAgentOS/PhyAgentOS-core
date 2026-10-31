@@ -10,7 +10,7 @@ import httpx
 import json_repair
 
 from PhyAgentOS.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from PhyAgentOS.providers.errors import describe_provider_error
+from PhyAgentOS.providers.errors import describe_provider_error, extract_error_code
 
 _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
 
@@ -117,6 +117,14 @@ class AzureOpenAIProvider(LLMProvider):
 
         return payload
 
+    @staticmethod
+    def _error_code_from_response(response: httpx.Response) -> str | None:
+        """Read a structured provider code from the JSON body, or None."""
+        try:
+            return extract_error_code(response.json())
+        except Exception:
+            return None
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -156,6 +164,7 @@ class AzureOpenAIProvider(LLMProvider):
                     return LLMResponse(
                         content=describe_provider_error(f"{response.status_code}: {response.text}"),
                         finish_reason="error",
+                        error_code=self._error_code_from_response(response),
                     )
 
                 response_data = response.json()
@@ -165,6 +174,7 @@ class AzureOpenAIProvider(LLMProvider):
             return LLMResponse(
                 content=describe_provider_error(e),
                 finish_reason="error",
+                error_code=extract_error_code(e),
             )
 
     def _parse_response(self, response: dict[str, Any]) -> LLMResponse:

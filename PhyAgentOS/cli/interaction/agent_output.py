@@ -24,9 +24,10 @@ from collections.abc import Callable
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
-from PhyAgentOS import __logo__
 from PhyAgentOS.agent.core.events import EventType, RuntimeEvent
 from PhyAgentOS.agent.core.types import TurnResult, TurnStatus
 from PhyAgentOS.agent.services.usage import (
@@ -38,6 +39,7 @@ from PhyAgentOS.agent.services.usage import (
 from PhyAgentOS.cli.interaction.terminal_display import (
     IDLE,
     PREPARING,
+    REQUEST_PROMPT,
     TerminalDisplay,
     display_text,
     safe_detail,
@@ -55,6 +57,14 @@ _TERMINAL_TURNS = frozenset(
     {EventType.TURN_COMPLETED, EventType.TURN_FAILED, EventType.TURN_INTERRUPTED}
 )
 _STREAM_TEXT_LIMIT = 4000
+# The repository has no DSML parser. A model may still print its own tool-call
+# protocol as body text; that text is not an executable call and must not be
+# presented as the answer. Only the exact delimiters below are recognized.
+_DSML_OPEN = "<|DSML| calls>"
+_DSML_CLOSE = "</|DSML| calls>"
+_PROTOCOL_NOTICE = (
+    "模型返回了无法解析的工具调用文本；这段文本未作为工具调用执行"
+)
 
 
 class ThinkFilter:
@@ -116,6 +126,73 @@ class ThinkFilter:
 def visible_text(text: str | None) -> str:
     think = ThinkFilter()
     return think.feed(text) + think.flush()
+
+
+class _ProtocolTextFilter:
+    """Drop unparsed DSML tool-call text; never interpret or execute it.
+
+    Only a complete ``<|DSML| calls> ... </|DSML| calls>`` block is removed.
+    The block body is discarded as it arrives so an arbitrarily long or
+    unterminated block cannot grow memory. A marker split across chunks is
+    held back by at most ``len(marker) - 1`` characters. Text that merely
+    mentions DSML, or contains a partial marker without forming the exact
+    protocol block, is kept.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._in_block = False
+        self.blocked = False
+        self.unterminated = False
+
+    @staticmethod
+    def _partial_suffix(text: str, tag: str) -> int:
+        for size in range(min(len(text), len(tag) - 1), 0, -1):
+            if tag.startswith(text[-size:]):
+                return size
+        return 0
+
+    def feed(self, text: str | None) -> str:
+        if text:
+            self._buffer += text
+        visible: list[str] = []
+        while self._buffer:
+            if self._in_block:
+                end = self._buffer.find(_DSML_CLOSE)
+                if end < 0:
+                    keep = self._partial_suffix(self._buffer, _DSML_CLOSE)
+                    self._buffer = self._buffer[-keep:] if keep else ""
+                    return "".join(visible)
+                self._buffer = self._buffer[end + len(_DSML_CLOSE):]
+                self._in_block = False
+                continue
+
+            start = self._buffer.find(_DSML_OPEN)
+            if start < 0:
+                keep = self._partial_suffix(self._buffer, _DSML_OPEN)
+                if keep:
+                    visible.append(self._buffer[:-keep])
+                    self._buffer = self._buffer[-keep:]
+                else:
+                    visible.append(self._buffer)
+                    self._buffer = ""
+                return "".join(visible)
+            visible.append(self._buffer[:start])
+            self._buffer = self._buffer[start + len(_DSML_OPEN):]
+            self._in_block = True
+            self.blocked = True
+        return "".join(visible)
+
+    def flush(self) -> str:
+        """Discard an unclosed protocol block; report it as unterminated."""
+        if self._in_block:
+            self._in_block = False
+            self._buffer = ""
+            self.unterminated = True
+            self.blocked = True
+            return ""
+        text, self._buffer = self._buffer, ""
+        return text
 
 
 class _StreamSanitizer:
@@ -187,10 +264,10 @@ class AgentOutput:
     """Render each terminal result once; never infer remote action state.
 
     The display owns the live region (turn status and this turn's tool rows).
-    This class only decides what a message looks like: replies carry the
-    product title, notices are dim, errors are red. Replies are the only place
-    a green/success-looking treatment is avoided entirely; tool success never
-    stands in for task success.
+    This class only decides what a message looks like: the request and the
+    reply live in a permanent turn block, notices are dim, errors are red.
+    Replies are the only place a green/success-looking treatment is avoided
+    entirely; tool success never stands in for task success.
     """
 
     def __init__(
@@ -217,9 +294,15 @@ class AgentOutput:
         self._stream_parts: list[str] = []
         self._stream_sanitizer = _StreamSanitizer()
         self._stream_think = ThinkFilter()
+        self._stream_protocol = _ProtocolTextFilter()
         self._live: Live | None = None
         self._live_buffer = ""
         self._fallback_stream_notified = False
+        self._turn_numbers: dict[str, int] = {}
+        self._turn_number: int | None = None
+        self._turn_end_written = False
+        self._protocol_warned = False
+        self._protocol_seen = False
 
     # -- statistics ------------------------------------------------------
 
@@ -261,18 +344,47 @@ class AgentOutput:
     def ready(self) -> None:
         self.display.set_phase(IDLE)
 
-    def turn_started(self, session_id: str | None = None) -> None:
+    def turn_started(
+        self,
+        session_id: str | None = None,
+        request_text: str | None = None,
+    ) -> None:
+        """Open one permanent transcript block for a model turn.
+
+        ``request_text`` is the submitted request, shown verbatim except for
+        control characters: no think filtering, no Markdown and no truncation.
+        ``Turn N`` is a local display counter per session, not a durable turn
+        id. Calls that omit the request still print the OS start divider.
+        """
         if session_id is not None:
             self._active_session_id = session_id
+        key = session_id or self._active_session_id or ""
+        number = self._turn_numbers.get(key, 0) + 1
+        self._turn_numbers[key] = number
+        self._turn_number = number
+        self._turn_end_written = False
+        self._protocol_warned = False
+        self._protocol_seen = False
         self._turn_started_at = time.monotonic()
         self._partial_text = ""
         self._stream_final_text = ""
         self._raw_final_written = False
+        if request_text is not None:
+            self._print_request(request_text)
+        self._print_divider(f"PhyAgentOS · Turn {number}")
         self.display.begin_turn()
         self.refresh_status()
 
     def turn_finished(self) -> None:
+        """Close the block after this turn's reply, notices and usage are out.
+
+        Repeated calls do not print a second end divider. Local compaction is
+        not a model turn and never opens or closes one of these blocks.
+        """
         self.display.end_turn()
+        if self._turn_number is not None and not self._turn_end_written:
+            self._turn_end_written = True
+            self._print_divider(f"End Turn {self._turn_number}")
         self.refresh_status()
 
     def cancel_requested(self) -> None:
@@ -288,6 +400,54 @@ class AgentOutput:
 
     def tool_view(self, argument: str = "") -> str:
         return self.display.tool_view(argument)
+
+    # -- transcript blocks -----------------------------------------------
+
+    def _print_request(self, request_text: str) -> None:
+        # Data, not markup: brackets in the request must stay literal. Only
+        # control characters are removed; think tags and Markdown are the
+        # user's own text and stay untouched. The bar and background replace
+        # the old You label; redirected output keeps the same text without ANSI.
+        background = "#26313d"
+        block = Table.grid(
+            expand=self._console.is_terminal,
+            padding=(0, 1, 0, 0),
+        )
+        block.add_column(
+            width=1,
+            style=f"bold cyan on {background}",
+            no_wrap=True,
+        )
+        block.add_column(ratio=1, style=f"on {background}", overflow="fold")
+        block.add_row(REQUEST_PROMPT.strip(), Text(display_text(request_text)))
+        self._console.print(block, style=f"on {background}")
+
+    def _print_divider(self, label: str) -> None:
+        # A full-width rule whose title is centred, like Rich's Rule. It grows
+        # with the console width and starts at the left edge. Redirected output
+        # gets the same characters without styling and no cursor movement.
+        self._console.print(
+            Rule(
+                Text(display_text(label), style="bold cyan"),
+                characters="─",
+                style="dim",
+                align="center",
+            )
+        )
+
+    def _protocol_filtered(self, text: str) -> str:
+        """Remove complete/unclosed DSML protocol text from one final body."""
+        protocol = _ProtocolTextFilter()
+        filtered = protocol.feed(text) + protocol.flush()
+        if protocol.blocked:
+            self._protocol_seen = True
+        return filtered
+
+    def _emit_protocol_notice(self) -> None:
+        if self._protocol_warned or not self._protocol_seen:
+            return
+        self._protocol_warned = True
+        self.info(_PROTOCOL_NOTICE)
 
     # -- messages --------------------------------------------------------
 
@@ -305,7 +465,7 @@ class AgentOutput:
         self._finish_stream()
         self.display.end_turn()
 
-        content = display_text(visible_text(result.reply))
+        content = self._protocol_filtered(display_text(visible_text(result.reply)))
         mode = self._stream_mode()
         if content.strip():
             if mode == "raw" and self._raw_final_written:
@@ -314,8 +474,12 @@ class AgentOutput:
                 pass
             else:
                 self._print_reply(content)
+        self._emit_protocol_notice()
         if result.status is not TurnStatus.COMPLETED:
-            if self._partial_text.strip() and mode != "raw":
+            partial = self._protocol_filtered(
+                display_text(visible_text(self._partial_text))
+            )
+            if partial.strip() and mode != "raw":
                 self._console.print(
                     Text(
                         "（中断前的部分输出，未完成）" if result.status is TurnStatus.INTERRUPTED
@@ -323,9 +487,10 @@ class AgentOutput:
                     ),
                     style="dim",
                 )
-                self._console.print(Text(self._partial_text))
+                self._console.print(Text(partial))
             elif self._partial_text.strip():
                 self._console.print(Text("（以上为未完成的部分输出）"), style="dim")
+            self._emit_protocol_notice()
         if result.status is TurnStatus.FAILED:
             self.error(
                 f"Turn failed: {result.error}\n"
@@ -400,11 +565,14 @@ class AgentOutput:
         if call_id != self._stream_call_id:
             self._end_attempt(tool_calls=False)
             self._begin_attempt(str(call_id) if call_id else None)
-        visible = self._stream_think.feed(self._stream_sanitizer.feed(text))
-        if not visible:
-            return
-        self._stream_parts.append(visible)
-        self._emit_stream(visible)
+        sanitized = self._stream_sanitizer.feed(text)
+        thought = self._stream_think.feed(sanitized)
+        visible = self._stream_protocol.feed(thought)
+        if self._stream_protocol.blocked:
+            self._protocol_seen = True
+        if visible:
+            self._stream_parts.append(visible)
+            self._emit_stream(visible)
 
     def _begin_attempt(self, call_id: str | None) -> None:
         self._stream_active = True
@@ -412,6 +580,7 @@ class AgentOutput:
         self._stream_parts = []
         self._stream_sanitizer = _StreamSanitizer()
         self._stream_think = ThinkFilter()
+        self._stream_protocol = _ProtocolTextFilter()
         self._live_buffer = ""
 
     def _stream_mode(self) -> str:
@@ -459,10 +628,12 @@ class AgentOutput:
         if not self._stream_active:
             return
         tail = self._stream_sanitizer.flush()
-        visible = "".join(self._stream_parts)
-        if tail:
-            visible += self._stream_think.feed(tail)
-        visible += self._stream_think.flush()
+        extra = self._stream_think.feed(tail) if tail else ""
+        extra += self._stream_think.flush()
+        extra = self._stream_protocol.feed(extra) + self._stream_protocol.flush()
+        if self._stream_protocol.blocked:
+            self._protocol_seen = True
+        visible = "".join(self._stream_parts) + extra
         mode = self._stream_mode()
         if mode == "preview":
             self.display.set_stream_text("")
@@ -479,6 +650,10 @@ class AgentOutput:
             elif not tool_calls:
                 self._stream_final_text = visible
         else:
+            if extra and not terminal:
+                # Only text that was held for a split marker; previously
+                # printed parts are not in ``extra``.
+                self._print_chunk(extra)
             if visible and not visible.endswith("\n"):
                 self._console.print()
             if tool_calls:
@@ -496,6 +671,8 @@ class AgentOutput:
         self._stream_parts = []
         self._stream_sanitizer = _StreamSanitizer()
         self._stream_think = ThinkFilter()
+        self._stream_protocol = _ProtocolTextFilter()
+        self._emit_protocol_notice()
 
     def _finish_stream(self) -> None:
         if self._stream_active:
@@ -505,8 +682,9 @@ class AgentOutput:
             self._live = None
 
     def _print_reply(self, content: str) -> None:
+        # The reply already sits inside the turn block; a second product title
+        # would duplicate the divider that opens the block.
         self._console.print()
-        self._console.print(Text(f"{__logo__} PhyAgentOS:", style="cyan"))
         self._console.print(Markdown(content) if self._markdown else Text(content))
         self._console.print()
 

@@ -15,6 +15,7 @@ This manual covers Core implementation: AgentTask coordination, persistence, bin
 5. Action/Session admission, cancel/stop acceptance, timeout, and `unknown` do not prove physical stop.
 6. General Agent tools, verification, experience, evolution, and dynamic MCP remain independent.
 7. Runtime artifacts are installed only after bounded archive and digest verification.
+8. Core execution settings change how a turn runs; they never change provider/model selection or fall back to a cheaper model.
 
 ## 2. Module map
 
@@ -22,12 +23,15 @@ This manual covers Core implementation: AgentTask coordination, persistence, bin
 |:-------|:---------------|
 | `agent/core/` | Seven Core components (host, runtime, loop driver, model adapter, prompt assembler, tool executor, SQLite session store); contracts in `types.py`, `events.py`, and `protocols.py` |
 | `agent/composition.py` | `compose_agent`: builds the Core assembly from injected collaborators and fixes capability order |
-| `agent/capabilities/` | Core adapters for Forge, Skill access, general tools, images, MCP, subagents, cron and message |
+| `agent/capabilities/` | Core adapters for Forge, Skill access, general tools, images, MCP, subagents, on-demand tool search, restricted program execution, cron and message |
 | `tooling/` | Shared tool implementations independent of Agent runtimes; legacy tool paths retain compatibility exports |
 | `agent/services/skill_documents.py`, `agent/services/turn_activation.py` | Skill document discovery and per-turn activation identity |
 | `agent/bootstrap.py`, `agent/services/forge_verifier.py` | Shared Forge factories and the semantic verifier; `agent_legacy/session_verifier.py` remains an alias |
 | `agent/services/session_catalog.py` | Session ids, titles, per-day counters and per-session provider/model/effort selection in `core.db` |
-| `agent/services/context_compaction.py` | Manual compaction summary and the recent-complete-turn projection |
+| `agent/services/context_compaction.py` | Summary and recent-complete-turn projection used by manual and automatic compaction |
+| `agent/services/context_policy.py` | Automatic trim-then-summary context reduction and one bounded overflow recovery |
+| `agent/services/turn_budget.py`, `agent/services/turn_control.py` | Per-turn token/no-progress budget and the bounded correction queue |
+| `agent/services/job_manager.py` | Session-scoped background shell jobs with bounded output and `job_status` / `job_wait` / `job_cancel` |
 | `agent/services/usage.py` | Usage ledger, next-request context estimate and turn/session footer formatting |
 | `agent/services/background_runtime.py` | One shared Core assembly for gateway cron, heartbeat and channel turns, with frozen routing and bounded admission |
 | `cli/commands.py` | Single Typer app, global callback, and registration of the command groups, including the one `agent` command |
@@ -217,37 +221,77 @@ The Core prompt proxy runs with raw ANSI passthrough so Rich styling reaches the
 of appearing as literal `?[36m` text; untrusted model, tool and exception text is stripped of
 control characters before rendering, so only Rich introduces escape sequences.
 
-The prompt is the only writer of the live region: its bottom toolbar renders the turn phase
+The prompt is the only writer of the live region: its prompt message renders the turn phase
 (preparing, thinking, calling a tool, stopping locally) with a spinner and elapsed time, plus the
-last four tool calls of the current turn, the hidden count and the total. There is no separate
+current turn's step rows, the hidden count and the total, directly above the session line and the
+input line. It is not a terminal-anchored bottom toolbar, so the request block, the live rows and
+the input stay close together without a large blank gap. There is no separate
 `Live`/`status` renderer, so the input line, animation and tool area cannot move the cursor against
-each other. `prompt_toolkit`'s refresh timer animates the toolbar; state changes only come from
+each other. `prompt_toolkit`'s refresh timer animates the message; state changes only come from
 persisted runtime events and the session's submit/cancel callbacks. A tool call is keyed by
 `(session_id, turn_id, tool_call_id)` and updated in place from `tool.intent` to
 `tool.dispatched` to `tool.settled`, so repeated events do not increase the total. Turning the turn
 over resets the rows, which keeps a new turn from inheriting an older turn's state. When no prompt
 is attached (a one-shot `-m` run, startup, or redirected streams) the same state prints one plain
-line per transition with no animation and no escape sequences. `/tools` prints a redacted record
-on request; it shows the tool name, local status and a length-limited error summary, never tool
-arguments, outcomes or credentials.
+line per transition with no animation and no escape sequences. The `/display_all_step` setting
+described under “Turn boundaries and step display” selects whether the live region keeps only the
+limited recent rows or the complete step record. Step rows show the tool name, local status and a
+length-limited error summary, never tool arguments, outcomes or credentials.
 
-The session/provider/model/effort line is part of the prompt message, above the input; the bottom
-toolbar is only attached while a turn is busy. While busy the `You:` marker and the renderer cursor
-are hidden through the layout's `always_hide_cursor` filter, the buffer is read-only, and Enter is
-blocked. Ordinary keys therefore never enter the buffer or a hidden model queue; a draft typed
-before the turn is preserved, and the marker plus cursor return when the turn ends. Non-terminal
-input keeps its plain line behaviour.
+The session/provider/model/effort line, including `context`, is part of the prompt message above
+the cyan vertical-bar input marker; the status, tool and stream-preview rows share that message,
+immediately above the session line and the input. While busy the request marker and the renderer
+cursor are hidden through the layout's `always_hide_cursor` filter, the buffer is read-only, and
+Enter is blocked. Ordinary keys therefore never enter the buffer or a hidden model queue; a draft
+typed before the turn is preserved, and the marker plus cursor return when the turn ends.
+After a request is submitted, the prompt block is erased exactly once, after `prompt_async` has
+finished its final render, so the permanent request block that follows is the only request marker
+and never gets caught by a late erase. Non-terminal input keeps its plain line behaviour: no input
+prompt is written, the permanent request block shows the text once, and no ANSI styling is used.
 
 On a terminal, bare `/model` and `/effort` reuse the inline picker. The reader is paused (its
 prompt ends and no new prompt starts) before the second prompt_toolkit application opens and is
 resumed only after the menu returns; Esc or Ctrl+C closes only the menu and leaves the session and
 selection unchanged. A partially typed line is carried into the next prompt instead of being
-discarded. Every model command (text, menu, reset, cancelled or failed) republishes the toolbar
+discarded. Every model command (text, menu, reset, cancelled or failed) republishes the session
 label from the session's actual selection. Text commands and non-terminal input skip the picker.
 
 The legacy path keeps its existing lifecycle inside `legacy/legacy_agent.py` (build `AgentLoop`,
 run one-shot or terminal flow, then stop the loop and close MCP), with prompt-session helpers in
 `legacy/legacy_support.py`; the steps below describe the new Core path.
+
+### Turn boundaries and step display
+
+For every ordinary request and explicit `/resume`, the command layer prints the instruction the
+turn actually sends once, in full, before any OS output. It then prints a divider that grows with
+the terminal width, starting at the left edge with a centered `PhyAgentOS · Turn N` title; `N` is a
+local display counter for the session, not a durable turn id, and the divider starts the OS block.
+Tool rows, answer text, errors and the usage footer all render inside that block, and the matching
+`End Turn N` divider is printed after the block's last line. The boundaries are display only: they
+do not add events, turn ids or model messages, and redirected output keeps the same rule and title
+as plain text without ANSI.
+
+The session, provider/model and `context` line renders above the request input. The status line
+does not include the title derived from the first request; `derive_title()` still writes catalog
+metadata, and bare `/session` keeps listing it. The permanent request record uses a cyan vertical
+bar and a dark background block instead of `You:`; the text itself is unchanged, multi-line and
+long requests are kept in full, and redirected output has no ANSI styling. The submitted input
+line is cleared afterwards, so the permanent block is the only request marker. Per-message
+`Queued` and `Processing` lines are no longer rendered; a programmatically injected queued input
+still gets its position-only receipt.
+
+`/display_all_step` replaces `/tools` and is handled locally. With no argument it toggles the
+setting. The default `off` keeps only a limited number of recent settled steps in the live region
+and reports the hidden and total counts. `on` immediately prints all steps already recorded for the
+current turn and then appends each newly settled step as its own line to the scroll record. The
+preference survives turn boundaries until changed; the per-turn expanded flag still closes with
+its live region. The setting changes display only: tool execution, `tool.*` events, stored results
+and the context sent to the model are unchanged.
+
+The answer renderer guards against DSML protocol blocks. A complete or unterminated block is not
+laid out as ordinary answer text; the CLI prints a short warning and the original text stays in the
+event log. Core neither executes nor parses DSML blocks, so this guard is not a tool-call path and
+makes no promise that such text will run.
 
 ### Core process lifecycle
 
@@ -266,8 +310,10 @@ run one-shot or terminal flow, then stop the loop and close MCP), with prompt-se
 5. Create `SkillDocumentLoader` and `TurnSkillActivationManager`, then register the activation
    manager with the coordinator so `forge_task_create` can validate `activation_id`.
 6. Open the session store at `<workspace>/sessions/core.db`.
-7. Build a seed assembly with `compose_agent`; `SkillAccessCapability` is first and
-   `ForgeCapability` is last.
+7. Discover MCP tools before composition, then build a seed assembly with `compose_agent`;
+   `SkillAccessCapability` is first, followed by general tools, image, conditional mode management,
+   MCP, spawn, `tool_search` when MCP tools exist and `execute_program` when code mode is on, then
+   `ForgeCapability` last.
 8. Run one message or the interactive loop. Each turn reads its session's selection when it
    actually starts and builds a model-facing assembly that serves that one turn; the runtime is
    stopped as soon as the turn ends (its host stays open), rather than waiting for the next
@@ -293,12 +339,14 @@ shows a yellow hint, the second Esc requests local cancellation through the same
 path used before. A timeout, any other key, an arrow key, or a new turn clears the armed state, so
 a single Esc and cursor/meta keys never stop a turn. Esc in a model menu only closes that menu.
 Cancellation asks Forge to cancel the session's latest task but does not prove a remote action
-stopped; the status says "local" and "remote unconfirmed". Local commands (`/help`, `/tools`,
-`/correct`, and rejected unknown slash commands) are answered by the reader immediately; `/stop`
+stopped; the status says "local" and "remote unconfirmed". Local commands (`/help`,
+`/display_all_step`, `/correct`, and rejected unknown slash commands) are answered by the reader
+immediately; `/stop`
 only returns a hint and never cancels or submits a model turn. Non-terminal input cannot capture
 Esc, so it relies on Ctrl+C. Ordinary text and model commands keep their FIFO order, model
 commands still run only between turns, and programmatic/injected queued input gets a position-only
-receipt and a "processing" notice. The receipt never repeats the message text.
+receipt; per-message `Queued` and `Processing` notices are no longer printed, and the receipt never
+repeats the message text.
 
 `agent/services/forge_verifier.py` is the single verifier implementation used by both paths;
 `agent_legacy/session_verifier.py` re-exports it, so existing imports and module patches still
@@ -315,7 +363,8 @@ processes and restarts never receive the same `cli:YYYYMMDD-NN` id. Sessions tha
 `session_events` stay listed with their original id; metadata is created lazily and no id is
 renamed. The title comes from `derive_title()` over the first input: whitespace is collapsed,
 credential-shaped text is redacted, the value is shortened locally, and no model call is made. The
-title is metadata only; the id never changes. `--session <id>` calls `ensure_session()` instead of
+title is metadata only; the id never changes. The status line does not render it; the catalog and
+bare `/session` listings do. `--session <id>` calls `ensure_session()` instead of
 allocating a new id. Bare `/session` lists catalog entries (most recently updated first), and
 `/session <id>` resumes one. `/new` allocates a new id in the running process. Both commands are
 answered locally and never submit a model turn. Legacy JSONL sessions are neither read nor migrated.
@@ -391,6 +440,40 @@ stream is never re-requested automatically. A budget error is raised before the 
 is recorded as a clean failed attempt. Usage on failed or interrupted attempts contains only keys
 the provider actually sent.
 
+### Execution controls
+
+`CorePerformanceConfig` (`config/schema.py`) is read from `agents.defaults.performance`; camelCase
+is the stored form and snake_case is also accepted. The CLI entry passes `max_parallel_tools` and
+`cache_stable_prompts` into `compose_agent()`, builds `ContextPolicy` when auto-compaction is on and
+the effective window is known, and builds `TurnBudget` from the same object. None of these settings
+selects a provider or model, and the entry never substitutes a cheaper model.
+
+`max_parallel_tools` reaches only an executor implementing the optional `execute_batch` extension.
+`ToolExecutorImpl.execute_batch` runs consecutive `parallel_safe=True` registrations in a bounded
+worker pool, treats every other call as a sequential barrier, and still calls `execute()` for every
+call, so validation, policy and the `tool.intent` / `tool.dispatched` / `tool.settled` sequence are
+unchanged. Results keep the model's call order; a never-started call is settled as `cancelled`, not
+as success. A write, edit, shell, `spawn`, `job_wait`, `job_cancel` or Forge tool therefore never
+overlaps another call.
+
+With `cache_stable_prompts=True`, `PromptAssemblerImpl` keeps only the fixed system instructions in
+the system message and appends the step's live fragments as one runtime-context message after the
+history. The static prefix stays byte-identical across steps while Forge blockers and other live
+facts are re-read every step; the assembler never stores that runtime message in the caller's
+history.
+
+`TurnBudget` (`agent/services/turn_budget.py`) counts only usage the provider reported. A missing
+total is not zero, a known partial total is not presented as complete, and none of this is a
+billing cap. `max_turn_tokens` stops new model calls once the reported total reaches it; an
+already-dispatched request cannot be unspent. `repeated_call_limit` stops a turn after that many
+*consecutive* identical (tool name, arguments, terminal status, result text) outcomes; a different
+call resets the run, and `*_status`, `*_wait` and `wait` polls are exempt. With `reserve_steps=1`,
+the final step of a multi-step turn becomes a tools-hidden summary request (`tool_choice="none"`);
+its text is returned
+with status FAILED because partial progress is not a completed task. Child usage is attributed
+through `TurnBudgetRegistry`, and an unknown or evicted parent fails closed for further child
+requests.
+
 ### Undo
 
 `/undo` is a CLI-local command; nothing is sent to the model. `CoreAgentSession.undo` refuses while a
@@ -403,13 +486,37 @@ validation and the insert happen inside one session lock and one `BEGIN IMMEDIAT
 `_conversation_from_events` skips reverted turns, so the projection falls back to the previous
 completed turn's request snapshot. A turn already covered by a checkpoint is reported with
 `block_reason="checkpoint"` and no marker is written; a failed or interrupted turn is marked with
-`context_reverted=False` so the next undo moves further back. `UndoOutcome.request_text` is read back
-from that turn's newest `request.prepared` snapshot (`input.accepted` stores only a character count),
-and `TerminalInput.prefill` stages it as the next prompt's default text. The status line follows the
+`context_reverted=False` so the next undo moves further back. `UndoOutcome.request_text` uses the
+original text on `turn.started`, falling back to the first `request.prepared` snapshot for older logs
+(`input.accepted` stores only a character count),
+and `TerminalInput.prefill` stages it as the next prompt's default text. Both the conversation
+projection and `_last_user_text` drop Core's runtime-context message, so the refilled text is the
+original user request, not live prompt state. The status line follows the
 same rule: `reverted_turn_ids` (in `events.py`) is shared by the projection, `estimate_context` and
 the `_last_request_tools` / `_last_request_system` helpers, and `_ContextStatus.refresh` re-reads
 the stored events so a marker written by the store itself is seen (the usage ledger is still only
 seeded by `load`).
+
+### Automatic context policy
+
+`ContextPolicy` (`agent/services/context_policy.py`) runs before a model request when `auto_compact`
+is on and the effective window is known. It has two bounded stages and never loops: deterministic
+shortening of old oversized tool text (no model call; only the result body changes, so the
+call/result pairing stays valid and the original text stays in the append-only event log), then at
+most one summary call over the safe completed prefix through `compact_session`. The current user
+task and the most recent complete tool pair stay verbatim. It returns a reduction only when the
+measured next request actually shrank; during an unfinished turn it does not commit a checkpoint,
+and the turn owner persists the returned messages in `context.compacted`. A failed summary does not
+erase a real trim. The estimator measures the real next request, including system text and tool
+schema.
+
+`compaction_threshold` is a fraction of the effective window by default (`0.8`); the hard ceiling
+is `capacity - reserve_tokens`. Summary usage is recorded on the compaction attempt and counted in
+the session total. When the provider returns the structured `context_overflow` code, the loop asks
+the policy for one forced reduction (`force=True`), retries the model call once with a fresh step
+id, and never replays a tool call. If the forced reduction does not shrink the request, or the
+retry still fails, the turn fails. Only the structured code starts this recovery; failure prose
+alone does not.
 
 ### Manual compaction
 
@@ -430,6 +537,32 @@ The UI switches the checkpoint projection only at `REQUEST_PREPARED`, so a turn 
 (`TURN_STARTED`) does not fall back to the old history. Compaction never dispatches a tool call and
 never changes an AgentTask or Forge record, so an unresolved `unknown` after compaction still
 blocks new tasks.
+
+### Resume and correction
+
+`/resume [text]` calls `AgentRuntimeImpl.resume()` with the store's
+`read_resume_history(turn_id=None)`. The store chooses the newest terminal failed or interrupted
+turn that undo did not withdraw; a completed turn is not a source, and a reverted or
+checkpoint-covered turn is refused, as is a session with an unfinished turn. The base is that
+turn's last `request.prepared` snapshot, and
+completed assistant messages and settled tool results recorded after it are appended as a legal
+call/result sequence. Unsettled, unknown and cancelled calls are warnings and are never replayed.
+`turn.started` records `resumed_from_turn_id`. The new request text is the new user instruction; it
+is not merged into the stored snapshot, and a FAILED/INTERRUPTED resume result is not a completed
+task.
+
+`/correct <text>` calls `AgentRuntimeImpl.steer()`, which enqueues into `TurnControl` keyed by the
+exact `(session_id, turn_id)`. The loop drains the queue only at a step boundary before the next
+model request and writes one `input.steered` event per consumed text. It never opens a turn, never
+inserts into an in-flight stream, and never cancels or undoes dispatched work. The queue is bounded
+(16 pending, 4000 total characters, 2000 per item); an unconsumed correction is discarded when the
+turn ends. The terminal event records remaining texts as `unapplied_corrections`, and the CLI warns
+that they were not applied. Refusal means no active turn or a full queue, not an applied correction.
+`TerminalInput` exposes a Ctrl+G correction editor while busy; ordinary keys stay blocked, Enter
+can return only a valid `/correct` line, and Esc restores the saved draft without requesting stop.
+
+Resume also refuses a source followed by an unwithdrawn completed turn: it does not silently
+branch or discard later history. Start a new session when a separate branch is needed.
 
 ### Background gateway runtime
 
@@ -471,16 +604,19 @@ Activation reads the Skill document and does not start a Skill runtime.
 
 ### What the Core path does not cover
 
-`/correct`, long-term memory, experience/evolution, managed interaction Sessions, and fleet
-mode remain separate follow-up tasks. The Forge interaction supervisor is not wired into the Core CLI, so this is
-not a completed interaction migration. Existing legacy JSONL sessions are not imported; the Core
-store is a separate SQLite file. Provider failures are reported with a short redacted diagnostic:
-the exception type and HTTP status are kept, while response bodies and credentials are not.
+`/correct` and explicit `/resume` are implemented (see “Resume and correction”). Long-term memory,
+experience/evolution, managed interaction Sessions, and fleet mode remain separate follow-up tasks.
+The Forge interaction supervisor is not wired into the Core CLI, so this is not a completed
+interaction migration. Existing legacy JSONL sessions are not imported; the Core store is a
+separate SQLite file. Provider failures are reported with a short redacted diagnostic: the
+exception type and HTTP status are kept, while response bodies and credentials are not.
 
 ### General tools and the legacy entry
 
-The Core CLI and gateway share `open_core_session()` to register filesystem, shell, web search/fetch,
-scene graph, image, MCP and `spawn` capabilities. Shared implementations live in `tooling/`, which
+The Core CLI and gateway share `open_core_session()` to register filesystem, shell (including
+tracked background jobs), web search/fetch, scene graph, image, MCP, `spawn`/`subagent_status`/
+`subagent_cancel`, and the optional `tool_search` and `execute_program` capabilities. Shared
+implementations live in `tooling/`, which
 must not import either Agent runtime. Corresponding `agent_legacy/tools/` modules retain compatibility
 exports. The explicit legacy entry remains available for regression comparisons; removing it is not
 a requirement of this migration. `agent_mode` is only offered for providers supporting the existing
@@ -492,17 +628,24 @@ notice while other tools remain available. Timeouts and disconnects after dispat
 and are not replayed automatically. Large general-tool, vision and MCP outputs retain their complete
 text in files and expose a bounded excerpt plus its path to the model.
 `spawn` runs an isolated child session through the existing
-Core components rather than the legacy model loop. Children do not recursively spawn or register Forge
-physical execution tools. Completion notifications retain the parent session and destination captured
-when the child was created. A bounded completion summary is available only to later requests from
-that parent session. Notification failure does not change the child's actual result; shutdown cancels
-delivery waits while retaining that result.
+Core components rather than the legacy model loop. A finished child of the same parent can be
+continued by passing `child_session_id`, which reuses its stored conversation; `role` is prompt text
+only, and `tool_allowlist` can only narrow the general tools already allowed. Children do not
+recursively spawn or register Forge physical execution tools. Completion notifications retain the
+parent session and destination captured when the child was created. A bounded completion summary is
+available only to later requests from that parent session. Notification failure does not change the
+child's actual result; shutdown cancels delivery waits while retaining that result.
 
 ### Tests
 
 Focused suites cover document discovery, activation scope, verifier aliasing, Core CLI single-turn
 and per-turn assembly wiring, interactive FIFO, cancel, rendering, queue receipts, local command
-handling, and tool-row tracking. Session catalog and manual compaction have local tests for atomic
+handling, and tool-row tracking. Execution-control suites cover performance defaults and aliases,
+parallel barriers, cache-stable prompt layout, automatic context policy and the bounded overflow
+retry, turn budgets, background jobs, restricted programs, resume projection and steering
+(`test_core_performance_config.py`, `test_core_performance_entry.py`,
+`test_core_context_policy.py`, `test_core_background_jobs.py`, `test_core_code_execution.py`,
+`test_core_resume.py`, `test_core_steering.py`). Session catalog and manual compaction have local tests for atomic
 per-day ids, title derivation, event-only sessions, selection persistence, checkpoint projection,
 refused/failed summaries, open turns and retained tool pairs; the Core CLI session commands are
 covered by `test_cli_session_features.py`. Streaming coverage uses fake providers with delta,

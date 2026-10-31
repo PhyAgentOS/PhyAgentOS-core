@@ -1,8 +1,9 @@
 """Interactive input scheduling over an injected, entry-facing session.
 
 The reader stays alive during turns. Ordinary input, model commands and
-session switches share one FIFO; local commands (stop, help, tools, correct,
-undo, unknown slash commands) bypass it so a running turn never delays them.
+session switches share one FIFO; local commands (stop, help, display_all_step,
+correct, undo, unknown slash commands) bypass it so a running turn never
+delays them.
 Every queued ordinary message carries the session binding that was current
 when it was read, so a switch cannot move an already queued message to another
 session.
@@ -31,27 +32,33 @@ _EXIT_COMMANDS = frozenset({"exit", "quit", "/exit", "/quit", ":q"})
 _MODEL_COMMANDS = frozenset({"/provider", "/model", "/effort", "/status"})
 _SESSION_COMMANDS = frozenset({"/new", "/session"})
 _COMPACT_COMMANDS = frozenset({"/compact"})
+_RESUME_COMMANDS = frozenset({"/resume"})
 _LOCAL_COMMANDS = (
-    frozenset({"/help", "/stop", "/tools", "/correct", "/undo"})
+    frozenset({"/help", "/stop", "/display_all_step", "/correct", "/undo"})
     | _MODEL_COMMANDS
     | _SESSION_COMMANDS
     | _COMPACT_COMMANDS
+    | _RESUME_COMMANDS
 )
 _COMMAND_SHAPE = re.compile(r"^/[A-Za-z][A-Za-z0-9_-]*$")
 
 HELP_TEXT = """\
 Local commands (handled by the CLI; none of them is sent to the model):
   /help            Show this help.
-  /tools [on|off]  Show or hide the full tool-call record for this turn.
+  /display_all_step [on|off]
+                   Show every intermediate step, or a limited view; no
+                   argument toggles. Display only; execution is unchanged.
   /new             Create and switch to a new session.
   /session         List sessions, or pick one on a terminal.
   /session <id>    Load an existing session.
   /compact         Manually summarize older history with the current model.
+  /resume [text]   Continue the last failed or interrupted request (waits its turn).
   /provider ...    Change provider with text arguments (that session).
   /model ...       Change model (menu on a terminal; text otherwise).
   /effort ...      Change reasoning effort (menu on a terminal; text otherwise).
   /status          Show the current session, model and effort.
-  /correct         Not supported; no turn is submitted.
+  /correct <text>  Add a correction to the running turn's next safe step.
+                   It does not start another turn or stop remote work.
   /undo            Revert the last request; refill the input line with it.
                    Tool side effects (robot actions, file edits) are not undone.
   exit | quit      Leave after earlier queued input.
@@ -76,7 +83,9 @@ class _Output(Protocol):
 
     def result(self, result: TurnResult) -> None: ...
 
-    def turn_started(self, session_id: str | None = None) -> None: ...
+    def turn_started(
+        self, session_id: str | None = None, request_text: str | None = None
+    ) -> None: ...
 
     def turn_finished(self) -> None: ...
 
@@ -134,6 +143,8 @@ class InteractiveAgent:
         model_command: Callable[[str], Awaitable[str | None]] | None = None,
         session_command: Callable[[str, _Binding], Awaitable[str | None]] | None = None,
         compact_command: Callable[[str, _Binding], Awaitable[str | None]] | None = None,
+        resume_command: Callable[[str, _Binding], Awaitable[str | None]] | None = None,
+        correct_command: Callable[[str, _Binding], Awaitable[str | None]] | None = None,
         undo_command: Callable[[_Binding], Awaitable[str | None]] | None = None,
         name_session: Callable[[str, str], Awaitable[None]] | None = None,
         on_active_session: Callable[[str | None], None] | None = None,
@@ -147,6 +158,8 @@ class InteractiveAgent:
         self._model_command = model_command
         self._session_command = session_command
         self._compact_command = compact_command
+        self._resume_command = resume_command
+        self._correct_command = correct_command
         self._undo_command = undo_command
         self._name_session = name_session
         self._on_active_session = on_active_session
@@ -170,10 +183,15 @@ class InteractiveAgent:
         finally:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
-            if self._command is not None:
-                self._command.cancel()
-                await asyncio.gather(self._command, return_exceptions=True)
-                self._command = None
+            command = self._command
+            if command is not None:
+                if self._command_kind == "resume" and not command.done():
+                    await self._request_cancel()
+                    await self._wait_for_cancel()
+                command.cancel()
+                await asyncio.gather(command, return_exceptions=True)
+                if self._command is command:
+                    self._command = None
             if self._active is not None and not self._active.done():
                 await self._request_cancel()
             await self._wait_for_cancel()
@@ -224,16 +242,16 @@ class InteractiveAgent:
             )
         elif command == "/help":
             self._output.info(HELP_TEXT)
-        elif command == "/tools":
+        elif command == "/display_all_step":
             self._output.info(self._output.tool_view(argument))
         elif command == "/correct":
-            self._output.error(
-                "/correct is not supported by this CLI; no model turn was submitted."
-            )
+            await self._correct(argument)
         elif command == "/undo":
             await self._undo(argument)
         elif command in _EXIT_COMMANDS:
             self._pending.put_nowait(_Queued(text, self._binding))
+        elif command in _RESUME_COMMANDS:
+            self._pending.put_nowait(_Queued(text, self._binding, kind="resume"))
         elif command in _SESSION_COMMANDS:
             # The switch runs at its queue position. Later input is bound to
             # the same placeholder, so it follows the switch instead of being
@@ -257,9 +275,35 @@ class InteractiveAgent:
             self._pending.put_nowait(
                 _Queued(text, self._binding, sequence=self._sequence)
             )
-            waiting = max(0, self._pending.qsize() - 1)
-            suffix = f"; {waiting} more waiting." if waiting else "."
-            self._output.info(f"Queued message {self._sequence}{suffix}")
+
+    async def _correct(self, argument: str) -> None:
+        """Send one correction to the running turn, without queueing a turn.
+
+        The callback is invoked by the reader task, so a blocked turn does not
+        hold the correction behind its FIFO queue. The text is only queued for
+        the next safe step; this command never submits another turn, never
+        inserts text into an answer already streaming, and never claims that
+        remote work stopped. A callback failure is reported and the reader
+        keeps running.
+        """
+        if self._correct_command is None:
+            self._output.error(
+                "/correct is not supported by this CLI; no model turn was submitted."
+            )
+            return
+        if not argument.strip():
+            self._output.error(
+                "/correct needs replacement text; no correction was queued."
+            )
+            return
+        try:
+            message = await self._correct_command(argument, self._binding)
+        except Exception as exc:
+            # The reader task must survive a refused correction.
+            self._output.error(f"Correction failed: {exc}")
+            return
+        if message:
+            self._output.info(message)
 
     async def _undo(self, argument: str) -> None:
         """Revert the last request locally, at a turn boundary only.
@@ -307,8 +351,18 @@ class InteractiveAgent:
         self._aborting = True
         if self._active is not None and not self._active.done():
             await self._request_cancel()
-        if self._command is not None:
-            self._command.cancel()
+        command = self._command
+        if command is not None and not command.done():
+            if self._command_kind == "resume":
+                # Closing the terminal while a resume turn is running must ask
+                # the session to cancel first, so capabilities receive their
+                # cleanup. Only then reap an unresponsive local task.
+                await self._request_cancel()
+                await self._wait_for_cancel()
+                if not command.done():
+                    command.cancel()
+            else:
+                command.cancel()
         self._pending.put_nowait(None)
 
     def request_stop(self) -> None:
@@ -369,6 +423,9 @@ class InteractiveAgent:
             if item.kind == "compact":
                 await self._run_compact_command(item)
                 continue
+            if item.kind == "resume":
+                await self._run_resume_command(item)
+                continue
             if item.kind == "model":
                 await self._run_model_command(item)
                 continue
@@ -380,10 +437,6 @@ class InteractiveAgent:
                 )
                 item.binding.session_id = self._fallback(item.binding)
                 continue
-            if item.sequence is not None:
-                waiting = self._pending.qsize()
-                suffix = f"; {waiting} still queued." if waiting else "."
-                self._output.info(f"Processing message {item.sequence}{suffix}")
             await self._submit(item.text, target)
 
     async def _run_session_command(self, item: _Queued) -> None:
@@ -417,7 +470,8 @@ class InteractiveAgent:
         try:
             message = await asyncio.shield(self._command)
         except asyncio.CancelledError:
-            if self._aborting:
+            current = asyncio.current_task()
+            if self._aborting or (current is not None and current.cancelling()):
                 raise
             self._output.info(
                 "Context compaction cancelled locally; no checkpoint was written "
@@ -426,6 +480,46 @@ class InteractiveAgent:
             return
         except Exception as exc:
             self._output.error(f"Context compaction failed: {exc}")
+            return
+        else:
+            if message:
+                self._output.info(message)
+        finally:
+            self._command = None
+            self._command_kind = None
+            self._active_session_id = None
+
+    async def _run_resume_command(self, item: _Queued) -> None:
+        """Run /resume at its FIFO position, without sending its text to the model.
+
+        The callback owns the actual continuation turn (it returns a message
+        after ``session.resume``). It shares the command slot and the
+        active-session marker so cancel, undo and shutdown see it; its argument
+        is a new instruction, not an ordinary chat message.
+        """
+        target = item.binding.session_id or item.binding.fallback
+        if self._resume_command is None or target is None:
+            self._output.error("Resume is not available in this session.")
+            return
+        # A previous cancel must not swallow this resume's stop gesture.
+        self._stop_requested = False
+        self._active_session_id = target
+        if self._on_active_session is not None:
+            self._on_active_session(target)
+        self._command_kind = "resume"
+        self._command = asyncio.create_task(
+            self._resume_command(item.text, item.binding)
+        )
+        try:
+            message = await asyncio.shield(self._command)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if self._aborting or (current is not None and current.cancelling()):
+                raise
+            self._output.info("Resume stopped locally; remote work is not confirmed.")
+            return
+        except Exception as exc:
+            self._output.error(f"Resume failed: {exc}")
             return
         else:
             if message:
@@ -465,6 +559,9 @@ class InteractiveAgent:
     async def _submit(self, text: str, session_id: str) -> None:
         self._stop_requested = False
         self._active_session_id = session_id
+        # The permanent request opens the block before naming or any other
+        # callback can print an error belonging to this turn.
+        self._output.turn_started(session_id, text)
         if self._name_session is not None and session_id not in self._named:
             self._named.add(session_id)
             try:
@@ -473,7 +570,6 @@ class InteractiveAgent:
                 self._output.error(f"Session title could not be saved: {exc}")
         if self._on_active_session is not None:
             self._on_active_session(session_id)
-        self._output.turn_started(session_id)
         self._active = asyncio.create_task(
             self._session.submit(TurnRequest(session_id=session_id, text=text))
         )

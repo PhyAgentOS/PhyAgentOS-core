@@ -12,7 +12,7 @@ from typing import Any
 
 import json_repair
 
-from PhyAgentOS.providers.errors import describe_provider_error
+from PhyAgentOS.providers.errors import describe_provider_error, extract_error_code
 
 try:
     from loguru import logger
@@ -62,6 +62,9 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
+    # Provider's own short error code (for example ``context_overflow``).
+    # Only structured evidence is kept; never inferred from error prose.
+    error_code: str | None = None
 
     @property
     def has_tool_calls(self) -> bool:
@@ -86,6 +89,8 @@ class StreamEvent:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict] | None = None
+    # Short provider error code carried on a terminal ``error`` event.
+    error_code: str | None = None
 
 
 class LLMCallError(RuntimeError):
@@ -291,6 +296,7 @@ class LLMProvider(ABC):
                 content=response.content,
                 finish_reason="error",
                 usage=dict(response.usage),
+                error_code=response.error_code,
             )
             return
         if not response.finish_reason:
@@ -355,6 +361,7 @@ class LLMProvider(ABC):
                     content=describe_provider_error(exc),
                     finish_reason="error",
                     usage=dict(observed_usage),
+                    error_code=extract_error_code(exc),
                 )
                 if emitted:
                     yield event
@@ -732,6 +739,7 @@ class LLMProvider(ABC):
                 response = LLMResponse(
                     content=describe_provider_error(exc),
                     finish_reason="error",
+                    error_code=extract_error_code(exc),
                 )
 
             if response.finish_reason != "error":
@@ -765,6 +773,7 @@ class LLMProvider(ABC):
             return LLMResponse(
                 content=describe_provider_error(exc),
                 finish_reason="error",
+                error_code=extract_error_code(exc),
             )
 
     @abstractmethod

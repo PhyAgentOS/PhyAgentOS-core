@@ -812,3 +812,49 @@ async def test_a_second_checkpoint_at_the_same_head_is_rejected(
         assert latest.summary == "first summary"
     finally:
         await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_conversation_without_commit_keeps_store_projection(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "core.db")
+    try:
+        await _seed_turns(store, 3)
+        before_events = await _snapshot(store)
+        before_projection = list(await store.read_conversation(SESSION))
+        in_turn = [
+            *before_projection,
+            {"role": "user", "content": "current in-turn task"},
+            {"role": "assistant", "content": "current answer"},
+        ]
+
+        result = await compact_session(
+            store,
+            FakeProvider("short summary"),
+            SESSION,
+            model="fake-model",
+            conversation=in_turn,
+            commit_checkpoint=False,
+        )
+
+        assert result.checkpoint.retained_messages[-2]["content"] == "current in-turn task"
+        # The summary attempt is durable cost; no checkpoint and no event moved.
+        assert await store.read_checkpoint(SESSION) is None
+        assert list(await store.read_conversation(SESSION)) == before_projection
+        assert await _snapshot(store) == before_events
+        attempts = await store.list_compaction_attempts(SESSION)
+        assert [attempt.status for attempt in attempts] == ["completed"]
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_commit_stays_available_by_default(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path / "core.db")
+    try:
+        await _seed_turns(store, 3)
+        await compact_session(store, FakeProvider("short"), SESSION, model="fake-model")
+        assert await store.read_checkpoint(SESSION) is not None
+    finally:
+        await store.aclose()

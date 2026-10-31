@@ -55,6 +55,21 @@ def _safe_detail(value: object) -> str:
     return text[:_MAX_DETAIL_LENGTH]
 
 
+def _error_code(value: object) -> str | None:
+    """Keep structured overflow evidence; never infer retryability from prose."""
+    code = getattr(value, "code", None) or getattr(value, "error_code", None)
+    body = getattr(value, "body", None)
+    if code is None and isinstance(body, Mapping):
+        error = body.get("error", body)
+        if isinstance(error, Mapping):
+            code = error.get("code")
+    if not isinstance(code, str):
+        return None
+    if code in {"context_overflow", "context_length_exceeded", "context_window_exceeded"}:
+        return "context_overflow"
+    return code if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", code) else None
+
+
 class ChatProvider(Protocol):
     """The slice of the provider interface this adapter needs.
 
@@ -127,6 +142,8 @@ class ModelAdapter:
             raise ModelCallError(
                 request.model_call_id,
                 _safe_detail(f"{type(exc).__name__}: {exc}"),
+                usage=_to_usage(getattr(exc, "usage", None)),
+                code=_error_code(exc),
             ) from exc
 
         try:
@@ -196,6 +213,7 @@ class ModelAdapter:
             raise ModelCallError(
                 model_call_id,
                 _safe_detail(f"{type(exc).__name__}: {exc}"),
+                code=_error_code(exc),
             ) from exc
         if not hasattr(events, "__aiter__"):
             raise ModelCallError(
@@ -243,6 +261,7 @@ class ModelAdapter:
                                 getattr(event, "content", None) or "provider stream error"
                             ),
                             usage=usage,
+                            code=_error_code(event),
                         )
                     raise ModelCallError(
                         model_call_id,
@@ -256,6 +275,7 @@ class ModelAdapter:
                     model_call_id,
                     _safe_detail(f"{type(exc).__name__}: {exc}"),
                     usage=usage,
+                    code=_error_code(exc),
                 ) from exc
         finally:
             await _close_stream(events)
@@ -311,7 +331,11 @@ def _to_model_response(model_call_id: str, response: object) -> ModelResponse:
     content = getattr(response, "content", None)
     if finish_reason == "error":
         detail = content if isinstance(content, str) and content.strip() else "provider error"
-        raise ModelCallError(model_call_id, _safe_detail(detail))
+        raise ModelCallError(
+            model_call_id, _safe_detail(detail),
+            usage=_to_usage(getattr(response, "usage", None)),
+            code=_error_code(response),
+        )
     if not finish_reason:
         raise ModelCallError(model_call_id, "provider response has no finish_reason")
     if content is not None and not isinstance(content, str):

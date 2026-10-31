@@ -330,6 +330,10 @@ async def test_forge_blocker_reaches_the_background_prompt(tmp_path) -> None:
         message["content"] or ""
         for message in provider.calls[0]["messages"]
         if message.get("role") == "system"
+        or (
+            message.get("role") == "user"
+            and "[PhyAgentOS runtime context]" in str(message.get("content"))
+        )
     )
     assert 'invocation_id=None' in system_text
     assert "blocks creating a new AgentTask" in system_text

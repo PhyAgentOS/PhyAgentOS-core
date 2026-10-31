@@ -1,7 +1,9 @@
 """Single owner of the live terminal region: turn status and the tool area.
 
 The interactive prompt owns the input line. When a prompt is attached, this
-module supplies its bottom toolbar and invalidates it; prompt_toolkit's own
+module supplies the prompt message: the live rows render directly above the
+session line and the input line, so they stay next to the permanent request
+without the gap a terminal-anchored bottom toolbar leaves. prompt_toolkit's own
 refresh timer animates the spinner and the elapsed time. There is no second
 cursor-moving writer: Rich prints messages above the prompt through
 ``patch_stdout``, which the terminal input owns.
@@ -60,6 +62,7 @@ STOP_HINT = (
     "(local stop; remote stop is not confirmed)."
 )
 TOOL_ROWS = 4
+REQUEST_PROMPT = "│ "
 _ERROR_LIMIT = 400
 _STATUS_LABELS = {
     PREPARING: "Preparing",
@@ -95,7 +98,7 @@ _TOOL_STYLES = {
 }
 
 # The same C0/C1 filter the renderer applies to model and tool text. Keeping it
-# here lets the toolbar and the line fallback share one safety rule.
+# here lets the live rows and the line fallback share one safety rule.
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _URL_RE = re.compile(r"\b(?:https?|wss?)://[^\s'\"]+", re.IGNORECASE)
 _BEARER_RE = re.compile(r"\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
@@ -247,6 +250,9 @@ class TerminalDisplay:
         self._records: list[_ToolRecord] = []
         self._index: dict[tuple[str, str, str], _ToolRecord] = {}
         self._expanded = False
+        # User-selected display preference survives turn boundaries. The
+        # per-turn _expanded flag still closes when the live region closes.
+        self._display_all_steps = False
         self._collapsed = False
         self._summary_shown = False
         self._last_line = ""
@@ -257,7 +263,7 @@ class TerminalDisplay:
     # -- ownership -------------------------------------------------------
 
     def attach_prompt(self, prompt) -> None:
-        """Make the attached prompt's bottom toolbar the live region."""
+        """Make the attached prompt's message the live region."""
         self._prompt = prompt
         self._last_line = ""
         # Hide the real renderer cursor while busy; the official Window flag is
@@ -276,7 +282,6 @@ class TerminalDisplay:
                     window.always_hide_cursor = hide
         except Exception:
             pass
-        self._sync_toolbar()
         self._invalidate()
 
     def set_session_label(self, label: str) -> None:
@@ -312,15 +317,32 @@ class TerminalDisplay:
         return self._stream_text
 
     def prompt_message(self):
-        """Session line above the input, then the normal You marker when idle."""
+        """Live rows, the session line, then the request marker when idle.
+
+        The live area is part of the prompt message so it renders immediately
+        above the input line, close to the permanent request. A bottom toolbar
+        would pin the same rows to the last terminal line and leave a large
+        blank gap in between.
+        """
         fragments: list[tuple[str, str]] = []
+        if self._prompt is not None:
+            try:
+                width, rows = self._size()
+                for index, line in enumerate(
+                    self.render_lines(width=width, rows=rows)
+                ):
+                    fragments.append((self._style_for(line, index), line + "\n"))
+            except Exception:
+                # A render error must never take down the prompt. The fallback
+                # has no remote or secret text.
+                fragments.append(("fg:ansibrightblack", "status unavailable\n"))
         line = self._session_label
         if self._context_label:
             line = f"{line} · {self._context_label}" if line else self._context_label
         if line:
             fragments.append(("fg:ansibrightblack", line + "\n"))
         if not self.busy:
-            fragments.append(("bold fg:ansiblue", "You: "))
+            fragments.append(("bold fg:ansicyan", REQUEST_PROMPT))
         return fragments
 
     # -- stop hint -------------------------------------------------------
@@ -402,7 +424,7 @@ class TerminalDisplay:
         self._turn_id = None
         self._records = []
         self._index = {}
-        self._expanded = False
+        self._expanded = self._display_all_steps
         self._collapsed = False
         self._summary_shown = False
         self._last_line = ""
@@ -459,7 +481,7 @@ class TerminalDisplay:
             self._turn_id = event.turn_id
             self._records = []
             self._index = {}
-            self._expanded = False
+            self._expanded = self._display_all_steps
             self._collapsed = False
             self._summary_shown = False
         self._turn_active = True
@@ -540,19 +562,6 @@ class TerminalDisplay:
 
     # -- rendering -------------------------------------------------------
 
-    def toolbar(self):
-        """Formatted-text fragments for the prompt's bottom toolbar."""
-        try:
-            width, rows = self._size()
-            fragments: list[tuple[str, str]] = []
-            for index, line in enumerate(self.render_lines(width=width, rows=rows)):
-                fragments.append((self._style_for(line, index), line + "\n"))
-            return fragments
-        except Exception:
-            # A render error must never take down the prompt. The fallback has
-            # no remote or secret text.
-            return [("fg:ansibrightblack", "status unavailable")]
-
     def render_lines(self, *, width: int = 80, rows: int = 24) -> list[str]:
         lines: list[str] = []
         if (
@@ -582,7 +591,7 @@ class TerminalDisplay:
             # final Markdown once, printed by AgentOutput above the prompt.
             inner_width = max(1, width - 2)
             wrapped = _wrap_display(self._stream_text, inner_width)
-            reserved = 3  # status + session + prompt marker
+            reserved = 3  # status + session line + input line
             if self._stop_hint and self._phase != IDLE:
                 reserved += 1
             if self._turn_active and self._records and not self._collapsed:
@@ -668,7 +677,7 @@ class TerminalDisplay:
         prefix = "! " if bad else ""
         return (
             f"{prefix}Tools this turn: " + " · ".join(parts)
-            + ". /tools shows the full record."
+            + ". /display_all_step shows the full record."
         )
 
     def _record_line(self, record: _ToolRecord, index: int) -> str:
@@ -697,13 +706,14 @@ class TerminalDisplay:
     def tool_view(self, argument: str = "") -> str:
         argument = argument.strip().lower()
         if argument in {"on", "show", "expand"}:
-            self._expanded = True
+            self._display_all_steps = True
         elif argument in {"off", "hide", "collapse"}:
-            self._expanded = False
+            self._display_all_steps = False
         elif argument:
-            return "Usage: /tools [on|off]. The command is local and was not sent to the model."
+            return "Usage: /display_all_step [on|off]. The command is local and was not sent to the model."
         else:
-            self._expanded = not self._expanded
+            self._display_all_steps = not self._display_all_steps
+        self._expanded = self._display_all_steps
         self._invalidate()
         if not self._expanded:
             return "Tool record collapsed."
@@ -745,16 +755,9 @@ class TerminalDisplay:
     def _line(self, text: str) -> None:
         self._print_text(text)
 
-    def _sync_toolbar(self) -> None:
-        """Show the status/tool toolbar only while busy (session is in the prompt)."""
-        if self._prompt is None:
-            return
-        self._prompt.bottom_toolbar = self.toolbar if self.busy else None
-
     def _invalidate(self) -> None:
         if self._prompt is not None:
             try:
-                self._sync_toolbar()
                 self._prompt.app.invalidate()
             except Exception:
                 pass

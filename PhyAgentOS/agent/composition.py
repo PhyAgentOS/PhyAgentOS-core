@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from PhyAgentOS.forge.task import AgentTaskCoordinator
 from PhyAgentOS.forge.tool_client import ForgeToolClient
@@ -75,6 +76,11 @@ def compose_agent(
     additional_capabilities: Sequence[Capability] = (),
     forge_capability: Capability | None = None,
     stream: bool = True,
+    max_parallel_tools: int = 4,
+    cache_stable_prompts: bool = False,
+    context_policy: Any = None,
+    turn_budget: Any = None,
+    steering: Any = None,
 ) -> AgentAssembly:
     """Build the Forge-enabled host from already-built collaborators.
 
@@ -98,13 +104,18 @@ def compose_agent(
     callers.
     """
     capability = forge_capability or ForgeCapability(coordinator, client=client)
+    # Executor-bound capabilities must not share a mutable executor reference
+    # across the entry's concurrent per-turn assemblies.
+    additional_capabilities = tuple(
+        item.for_turn() if callable(getattr(item, "for_turn", None)) else item
+        for item in additional_capabilities
+    )
     capabilities: tuple[Capability, ...] = (*additional_capabilities, capability)
 
     skill_capability = next(
         (item for item in additional_capabilities if isinstance(item, SkillAccessCapability)),
         None,
     )
-    hidden_tools = None
     if skill_capability is not None and isinstance(capability, ForgeCapability):
         def _stage(context: ExecutionContext) -> str:
             if not skill_capability.has_primary_activation(context.session_id, context.turn_id):
@@ -112,7 +123,15 @@ def compose_agent(
             return "task" if capability.has_active_task(context.session_id) else "activated"
 
         capability.set_stage_resolver(_stage)
-        hidden_tools = capability.hidden_tools
+
+    visibility = tuple(
+        item.hidden_tools
+        for item in capabilities
+        if callable(getattr(item, "hidden_tools", None))
+    )
+
+    def hidden_tools(context: ExecutionContext) -> frozenset[str]:
+        return frozenset(name for hide in visibility for name in hide(context))
 
     registrations = tuple(
         registration
@@ -126,10 +145,15 @@ def compose_agent(
     assembler = PromptAssemblerImpl(
         system_instructions,
         fragments=tuple(item.prompt_context for item in capabilities),
-        hidden_tools=hidden_tools,
+        hidden_tools=hidden_tools if visibility else None,
+        cache_stable=cache_stable_prompts,
     )
     adapter = ModelAdapterImpl(provider, stream=stream)
     executor = ToolExecutorImpl(registrations, store)
+    for item in capabilities:
+        binder = getattr(item, "bind_executor", None)
+        if callable(binder):
+            binder(executor)
     driver = LoopDriverImpl(
         assembler=assembler,
         adapter=adapter,
@@ -141,12 +165,17 @@ def compose_agent(
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
         tool_choice=tool_choice,
+        max_parallel_tools=max_parallel_tools,
+        context_policy=context_policy,
+        turn_budget=turn_budget,
+        steering=steering,
     )
     runtime = AgentRuntimeImpl(
         driver=driver,
         store=store,
         max_steps=max_steps,
         deadline_seconds=deadline_seconds,
+        steering=steering,
     )
     host = AgentHostImpl(runtime=runtime, capabilities=capabilities)
     return AgentAssembly(
