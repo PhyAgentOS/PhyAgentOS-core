@@ -171,6 +171,17 @@ class SkillActivationManager:
                     )
             if existing is None:
                 context.activations.append(activation)
+            elif (
+                candidate_id is not None
+                and existing.binding_candidate_id != candidate_id
+            ):
+                # The binding was recomputed against a different runtime
+                # (e.g. the Skill runtime restarted): the stored activation
+                # describes a binding that no longer exists, so replace it
+                # with the fresh one. Otherwise re-activating a Skill within
+                # the same turn is a no-op and task creation keeps targeting
+                # the dead runtime.
+                context.activations[context.activations.index(existing)] = activation
             else:
                 activation = existing
             task_summary = context.task_summary
