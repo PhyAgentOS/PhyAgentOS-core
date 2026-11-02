@@ -41,6 +41,7 @@ from PhyAgentOS import __logo__, __version__
 from PhyAgentOS.config.paths import get_workspace_path
 from PhyAgentOS.config.schema import Config
 from PhyAgentOS.utils.helpers import sync_workspace_templates
+from PhyAgentOS.utils.proxy import normalize_proxy_env
 
 app = typer.Typer(
     name="paos",
@@ -204,7 +205,7 @@ def main(
     ),
 ):
     """PhyAgentOS - Personal AI Assistant."""
-    pass
+    normalize_proxy_env()
 
 
 # ============================================================================
