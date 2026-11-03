@@ -298,8 +298,8 @@ async def test_cli_cron_capability_adds_jobs_without_starting_the_scheduler(
     ]
 
 
-async def test_forge_blocker_reaches_the_background_prompt(tmp_path) -> None:
-    """The migrated entry keeps the Core/Forge unresolved-unknown guard."""
+async def test_forge_blocker_is_not_injected_into_a_new_background_prompt(tmp_path) -> None:
+    """Startup reconciliation runs, but old cross-session state stays out of the prompt."""
     config = make_config(tmp_path)
     blocker = {
         "task_id": "task-1",
@@ -335,6 +335,8 @@ async def test_forge_blocker_reaches_the_background_prompt(tmp_path) -> None:
             and "[PhyAgentOS runtime context]" in str(message.get("content"))
         )
     )
-    assert 'invocation_id=None' in system_text
-    assert "blocks creating a new AgentTask" in system_text
+    assert "task-1" not in system_text
+    assert "invocation_id=None" not in system_text
+    assert "blocks creating a new AgentTask" not in system_text
+    # Startup still reconciles non-terminal Forge tasks before the turn.
     assert coordinator.reconcile_calls == 1

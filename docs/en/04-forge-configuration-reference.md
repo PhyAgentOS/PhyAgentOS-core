@@ -23,6 +23,7 @@ manifest and an explicitly started profile.
 | `requestTimeoutS` | number | `10.0` | HTTP request timeout, greater than zero. |
 | `pollIntervalS` | number | `0.5` | Recommended Action/Session reconciliation interval in `[0.1, 5.0]` seconds. |
 | `executionTimeoutS` | number | `300.0` | Default Agent-side task deadline guidance. It does not prove that a timed-out execution stopped. |
+| `unknownRecoveryTimeoutS` | number | `3600.0` | How long an Action/Session may stay `unknown` before it is failed locally and its session slot is released. Set once per record and never extended; the remote outcome stays unconfirmed. |
 | `evidence` | object | below | AgentTask best-effort before/after capture settings. |
 | `interaction` | object | `{"enabled": false}` | Opt-in restricted interaction extension; see below. |
 
@@ -126,13 +127,14 @@ require the `task_id` and contribute to task verification.
 
 Task lifecycle tools are `forge_task_create`, `forge_task_get`, `forge_task_begin_revision`,
 `forge_task_finalize`, and `forge_task_cancel`. Tool transport tools are `forge_tool_context`,
-`forge_tool_query`, `forge_tool_start_action`, `forge_tool_action_status`,
+`forge_tool_list`, `forge_tool_query`, `forge_tool_start_action`, `forge_tool_action_status`,
 `forge_tool_action_result`, `forge_tool_cancel_action`, `forge_tool_start_session`,
 `forge_tool_session_status`, `forge_tool_session_result`, and `forge_tool_stop_session`.
 
 `binding_id`, `task_id`, `revision_id`, execution record ID, PAOS `caller_id`, Gateway
-`invocation_id`, and Gateway `attempt_id` are distinct identities. Only one AgentTask may be
-non-terminal globally. A recovery revision keeps
+`invocation_id`, and Gateway `attempt_id` are distinct identities. Each origin session (or the
+unbound slot) may have one non-terminal AgentTask; different sessions create independently. A
+recovery revision keeps
 the same task ID and is limited by `maxReplansPerEpisode` and `replanTimeoutS`.
 
 ## 7. `TaskVerificationContract`

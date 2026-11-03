@@ -155,17 +155,35 @@ def _coordinator(
     )
 
 
-def test_only_one_nonterminal_task_occupies_the_global_slot(tmp_path) -> None:
+def test_one_nonterminal_task_occupies_each_session_slot(tmp_path) -> None:
     coordinator = _coordinator(tmp_path)
     first = coordinator.create_task(
         task_description="first",
         verification=_contract(),
+        origin_session_key="session-a",
     )
 
     with pytest.raises(AgentTaskBusyError):
-        coordinator.create_task(task_description="second", verification=_contract())
+        coordinator.create_task(
+            task_description="second",
+            verification=_contract(),
+            origin_session_key="session-a",
+        )
 
-    assert coordinator.store.active().task_id == first.task_id
+    other_session = coordinator.create_task(
+        task_description="second session",
+        verification=_contract(),
+        origin_session_key="session-b",
+    )
+    unbound = coordinator.create_task(
+        task_description="unbound",
+        verification=_contract(),
+    )
+    with pytest.raises(AgentTaskBusyError):
+        coordinator.create_task(task_description="another unbound", verification=_contract())
+
+    active = {task.task_id for task in coordinator.store.active_tasks()}
+    assert active == {first.task_id, other_session.task_id, unbound.task_id}
 
 
 def test_non_off_task_requires_existing_verification_service(tmp_path) -> None:
@@ -620,7 +638,11 @@ async def test_bare_cancelled_dispatch_leaves_unknown_without_identity(tmp_path)
     client = HangingActionClient()
     coordinator = _coordinator(tmp_path, client=client)
     _short_cancel_budget(coordinator)
-    task = coordinator.create_task(task_description="move", verification=_contract())
+    task = coordinator.create_task(
+        task_description="move",
+        verification=_contract(),
+        origin_session_key="session-old",
+    )
 
     dispatch = asyncio.create_task(
         coordinator.start_action(task.task_id, "motion.move_pose", {})
@@ -641,17 +663,30 @@ async def test_bare_cancelled_dispatch_leaves_unknown_without_identity(tmp_path)
     with pytest.raises(AgentTaskError, match="unknown remote state"):
         await coordinator.start_action(task.task_id, "motion.move_pose", {})
     assert client.action_calls == 1
-    with pytest.raises(AgentTaskBusyError) as caught:
-        coordinator.create_task(task_description="again", verification=_contract())
-    assert caught.value.task_id == task.task_id
-    assert caught.value.invocation_id is None
-    message = str(caught.value)
-    assert "Gateway identity was never confirmed" in message
-    assert "forge_tool_action_status" not in message
-    assert "forge_tool_session_status" not in message
-    assert "cannot locate it" in message
-    assert "do not invent an invocation_id" in message
-    assert "Do not call forge_task_create again" in message
+
+    other_session = coordinator.create_task(
+        task_description="new session work",
+        verification=_contract(),
+        origin_session_key="session-new",
+    )
+    assert other_session.task_id != task.task_id
+    assert coordinator.get_task(task.task_id).status == AgentTaskStatus.EXECUTING
+
+    # The same session cannot wait forever on a dispatch whose remote identity
+    # was never confirmed: the stale task is closed locally as failed while the
+    # execution record stays unknown.
+    same_session = coordinator.create_task(
+        task_description="same session work",
+        verification=_contract(),
+        origin_session_key="session-old",
+    )
+    assert same_session.task_id != task.task_id
+    stale = coordinator.get_task(task.task_id)
+    assert stale.status == AgentTaskStatus.FAILED
+    assert stale.execution_records[0].status == "unknown"
+    assert stale.execution_records[0].invocation_id is None
+    assert any("superseded locally" in item for item in stale.evidence_errors)
+    assert client.action_calls == 1
 
 
 async def test_cancelled_dispatch_uses_grace_identity_and_requests_stop(tmp_path) -> None:
@@ -759,7 +794,7 @@ async def test_failed_stop_can_be_retried_without_redispatching_the_action(
     assert client.cancel_calls == [invocation_id, invocation_id]
 
 
-async def test_new_task_is_blocked_while_an_unknown_invocation_remains(
+async def test_terminal_unknown_invocation_does_not_block_a_new_task(
     tmp_path,
 ) -> None:
     client = ScriptedCancelClient(["running"])
@@ -767,10 +802,15 @@ async def test_new_task_is_blocked_while_an_unknown_invocation_remains(
     _short_cancel_budget(coordinator)
     task = coordinator.create_task(task_description="move", verification=_contract())
     await coordinator.start_action(task.task_id, "motion.move_pose", {})
-    await coordinator.cancel_task(task.task_id, reason="operator stop")
+    cancelled = await coordinator.cancel_task(task.task_id, reason="operator stop")
+    assert cancelled.status == AgentTaskStatus.FAILED
+    assert cancelled.execution_records[0].status == "unknown"
 
-    with pytest.raises(AgentTaskBusyError, match="unknown remote state"):
-        coordinator.create_task(task_description="move again", verification=_contract())
+    created = coordinator.create_task(task_description="move again", verification=_contract())
+
+    assert created.task_id != task.task_id
+    assert coordinator.get_task(task.task_id).execution_records[0].status == "unknown"
+    assert client.action_calls == 1
 
 
 async def test_new_actions_are_rejected_while_the_cancel_request_is_in_flight(
@@ -910,7 +950,9 @@ async def test_reconcile_confirms_terminal_state_for_unknown_record_without_rese
     assert client.cancel_calls == []
 
 
-async def test_busy_unknown_reports_authoritative_cross_session_identity(tmp_path) -> None:
+async def test_terminal_unknown_in_other_session_keeps_the_fact_without_blocking(
+    tmp_path,
+) -> None:
     client = ScriptedCancelClient(["cancelled"])
     coordinator = _coordinator(tmp_path, client=client)
     task = coordinator.create_task(
@@ -932,32 +974,25 @@ async def test_busy_unknown_reports_authoritative_cross_session_identity(tmp_pat
         event_type="test_mark_terminal",
     )
 
-    with pytest.raises(AgentTaskBusyError) as caught:
-        coordinator.create_task(
-            task_description="again",
-            verification=_contract(),
-            origin_session_key="cli:mine",
-        )
+    created = coordinator.create_task(
+        task_description="again",
+        verification=_contract(),
+        origin_session_key="cli:mine",
+    )
 
-    error = caught.value
-    assert error.task_id == task.task_id
-    assert error.invocation_id == invocation_id
-    assert error.status == "unknown"
-    assert error.blocking[0]["task_id"] == task.task_id
-    assert error.blocking[0]["invocation_id"] == invocation_id
-    assert error.blocking[0]["origin_session_key"] == "cli:other"
-    message = str(error)
-    assert "unknown remote state" in message
-    assert task.task_id in message and invocation_id in message
-    assert (
-        f'forge_tool_action_status(task_id="{task.task_id}", '
-        f'invocation_id="{invocation_id}")'
-    ) in message
-    assert "Do not call forge_task_create again" in message
-    assert "do not resend" in message
+    assert created.task_id != task.task_id
+    stale = coordinator.get_task(task.task_id)
+    assert stale.status == AgentTaskStatus.CANCELLED
+    assert stale.execution_records[0].status == "unknown"
+    assert stale.execution_records[0].invocation_id == invocation_id
+    # The unknown record remains visible as a fact, but it is not a gate.
+    blockers = coordinator.unknown_remote_blockers()
+    assert [item["task_id"] for item in blockers] == [task.task_id]
+    assert blockers[0]["origin_session_key"] == "cli:other"
+    assert client.action_calls == 1
 
 
-async def test_terminal_unknown_cleared_by_gateway_get_allows_a_new_task(tmp_path) -> None:
+async def test_terminal_unknown_is_not_requeried_and_creation_is_allowed(tmp_path) -> None:
     client = ScriptedCancelClient(["cancelled"])
     coordinator = _coordinator(tmp_path, client=client)
     task = coordinator.create_task(task_description="move", verification=_contract())
@@ -973,19 +1008,20 @@ async def test_terminal_unknown_cleared_by_gateway_get_allows_a_new_task(tmp_pat
         lambda current: setattr(current, "status", AgentTaskStatus.CANCELLED),
         event_type="test_mark_terminal",
     )
-    with pytest.raises(AgentTaskBusyError):
-        coordinator.create_task(task_description="again", verification=_contract())
-
-    assert await coordinator.reconcile_nonterminal() is None
-    assert coordinator.get_task(task.task_id).execution_records[0].status == "cancelled"
-    assert client.action_calls == 1
-    assert client.status_calls == [invocation_id]
 
     created = coordinator.create_task(task_description="again", verification=_contract())
     assert created.task_id != task.task_id
 
+    # History is not re-queried on a new task or a new session.
+    reconciled = await coordinator.reconcile_nonterminal()
+    assert reconciled is not None
+    assert reconciled.task_id == created.task_id
+    assert coordinator.get_task(task.task_id).execution_records[0].status == "unknown"
+    assert client.action_calls == 1
+    assert client.status_calls == []
 
-async def test_unrecoverable_unknown_keeps_blocking_with_the_same_identity(tmp_path) -> None:
+
+async def test_unrecoverable_unknown_is_kept_without_blocking_a_new_task(tmp_path) -> None:
     client = UnreachableCancelClient()
     coordinator = _coordinator(tmp_path, client=client)
     task = coordinator.create_task(task_description="move", verification=_contract())
@@ -1003,11 +1039,11 @@ async def test_unrecoverable_unknown_keeps_blocking_with_the_same_identity(tmp_p
     )
 
     assert await coordinator.reconcile_nonterminal() is None
-    assert coordinator.get_task(task.task_id).execution_records[0].status == "unknown"
-    with pytest.raises(AgentTaskBusyError) as caught:
-        coordinator.create_task(task_description="again", verification=_contract())
-    assert caught.value.task_id == task.task_id
-    assert caught.value.invocation_id == invocation_id
+    stale = coordinator.get_task(task.task_id)
+    assert stale.execution_records[0].status == "unknown"
+    assert stale.execution_records[0].invocation_id == invocation_id
+    created = coordinator.create_task(task_description="again", verification=_contract())
+    assert created.task_id != task.task_id
     assert client.action_calls == 1
 
 

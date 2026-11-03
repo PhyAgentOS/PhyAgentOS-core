@@ -205,7 +205,10 @@ class ContextPolicy:
         trigger = (
             threshold * capacity if isinstance(threshold, float) else threshold
         )
-        self._limit = max(1, min(int(trigger), capacity - reserve_tokens))
+        # The pressure point can be lower than the hard ceiling; only the hard
+        # ceiling decides whether the request is actually too large to send.
+        self._input_limit = max(1, capacity - reserve_tokens)
+        self._limit = max(1, min(int(trigger), self._input_limit))
 
     @property
     def capacity(self) -> int:
@@ -215,6 +218,11 @@ class ContextPolicy:
     def limit_tokens(self) -> int:
         """Estimated request size above which ``prepare`` acts."""
         return self._limit
+
+    @property
+    def input_limit_tokens(self) -> int:
+        """Hard input ceiling; a request above it cannot be sent."""
+        return self._input_limit
 
     def estimated_tokens(
         self,
@@ -316,10 +324,10 @@ class ContextPolicy:
                 reason="tool_text_trimmed",
             )
             if trim_after <= self._limit or not self._can_summarize(messages) or not safe_to_summarize:
-                return trim_reduction
+                return self._checked_reduction(trim_reduction)
 
         if not self._can_summarize(messages) or not safe_to_summarize:
-            return trim_reduction
+            return self._checked_reduction(trim_reduction)
 
         try:
             summary = await self._summarize(
@@ -333,28 +341,57 @@ class ContextPolicy:
         except (CompactionError, CheckpointConflictError) as exc:
             # A failed summary does not erase a real deterministic reduction.
             if trim_reduction is not None:
-                return ContextReduction(
-                    messages=trim_reduction.messages,
-                    before_tokens=before,
-                    after_tokens=trim_reduction.after_tokens,
-                    reason=f"{trim_reduction.reason};summary_failed:{type(exc).__name__}",
+                return self._checked_reduction(
+                    ContextReduction(
+                        messages=trim_reduction.messages,
+                        before_tokens=before,
+                        after_tokens=trim_reduction.after_tokens,
+                        reason=(
+                            f"{trim_reduction.reason};"
+                            f"summary_failed:{type(exc).__name__}"
+                        ),
+                    )
                 )
             return None
 
         projected, after = summary
         if after >= before:
-            return trim_reduction
+            return self._checked_reduction(trim_reduction)
         if trim_reduction is not None and trim_reduction.after_tokens <= after:
-            return trim_reduction
-        return ContextReduction(
-            messages=projected,
-            before_tokens=before,
-            after_tokens=after,
-            reason=(
-                "tool_text_trimmed+prefix_summarized"
-                if trim_reduction is not None
-                else "prefix_summarized"
-            ),
+            return self._checked_reduction(trim_reduction)
+        return self._checked_reduction(
+            ContextReduction(
+                messages=projected,
+                before_tokens=before,
+                after_tokens=after,
+                reason=(
+                    "tool_text_trimmed+prefix_summarized"
+                    if trim_reduction is not None
+                    else "prefix_summarized"
+                ),
+            )
+        )
+
+    def _checked_reduction(
+        self, reduction: ContextReduction | None
+    ) -> ContextReduction | None:
+        """Refuse to return a reduction that still cannot be sent.
+
+        The pressure point is intentionally lower than the hard ceiling, so a
+        successful trim or summary that remains above the ceiling is reported
+        with explicit numbers instead of leading to a later unexplained
+        overflow. The caller still makes at most one forced retry.
+        """
+        if reduction is None:
+            return None
+        if reduction.after_tokens <= self._input_limit:
+            return reduction
+        raise CompactionError(
+            "context compaction reduced the estimated request to "
+            f"{reduction.after_tokens} tokens, but the input limit is "
+            f"{self._input_limit} (capacity {self._capacity}, reserve "
+            f"{self._reserve_tokens}); the request still exceeds the window "
+            "and was not sent"
         )
 
     async def preflight(

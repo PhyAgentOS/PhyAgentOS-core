@@ -35,9 +35,15 @@ The metadata key may be `PhyAgentOS` or `openclaw`; both are accepted.
 ## Built-in Skills
 
 - Forge execution uses the Gateway Tool API tools `forge_tool_*` only.
+- Before choosing a Tool, call `forge_tool_list` to read the current Gateway catalog, then call
+  `forge_tool_context(tool_id)` for the exact ToolSpec and live readiness. The list shows what the
+  Gateway currently exposes; it does not expand the Skill allowlist or guarantee readiness.
 - Use `forge_task_*` when Tool calls must be aggregated and semantically verified as one task.
 - A robot-specific Skill must discover live ToolSpec/context and must not construct Gateway HTTP
   requests or use the retired `/agent/sessions` execution path.
+- A workspace Skill at `skills/<skill-name>/SKILL.md` overrides the installed bundle with the same
+  name. Treat that as a local override source: after a Skill upgrade, check whether the workspace
+  copy is stale before following it, and update or remove the override deliberately.
 
 ## Authoring Rules
 

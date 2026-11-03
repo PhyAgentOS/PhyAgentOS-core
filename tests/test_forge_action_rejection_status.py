@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 
 from PhyAgentOS.config.schema import ForgeConfig
 from PhyAgentOS.forge.task import AgentTaskCoordinator, AgentTaskError
-from PhyAgentOS.forge.tool_client import ForgeToolAPIError, ForgeToolAPITimeoutError
+from PhyAgentOS.forge.tool_client import (
+    ForgeToolAPIError,
+    ForgeToolAPITimeoutError,
+    ForgeToolClient,
+)
 from PhyAgentOS.verification.contracts import (
     CriterionVerdict,
     TaskVerificationContract,
@@ -77,6 +82,15 @@ def _new_task(coordinator: AgentTaskCoordinator) -> str:
     return task.task_id
 
 
+def _seed_before(coordinator: AgentTaskCoordinator, task_id: str) -> None:
+    """Skip evidence HTTP calls; the dispatch path under test is unchanged."""
+    coordinator.store.update(
+        task_id,
+        lambda record: setattr(record, "before_snapshot_ref", "probe"),
+        event_type="test_seeded_snapshot",
+    )
+
+
 async def test_pre_dispatch_rejection_records_failed_and_allows_identical_resend(
     tmp_path,
 ) -> None:
@@ -142,6 +156,140 @@ async def test_http_timeout_stays_unknown_and_arms_identical_guard(tmp_path) -> 
 
     with pytest.raises(AgentTaskError, match="identical Action"):
         await coordinator.start_action(task_id, "motion.move_pose", {"distance_m": 0.05})
+
+
+@pytest.mark.parametrize("timeout_type", [httpx.ConnectTimeout, httpx.PoolTimeout])
+async def test_transport_timeout_before_connect_is_failed_and_resendable(
+    tmp_path, timeout_type
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise timeout_type("no connection was established", request=request)
+        return httpx.Response(
+            202,
+            json={
+                "ok": True,
+                "data": {
+                    "invocation_id": "inv_after_connect_retry",
+                    "attempt_id": "attempt_after_connect_retry",
+                },
+            },
+        )
+
+    client = ForgeToolClient(
+        "http://gateway.test",
+        timeout_s=1.0,
+        transport=httpx.MockTransport(handler),
+    )
+    coordinator = _coordinator(tmp_path, client)  # type: ignore[arg-type]
+    task_id = _new_task(coordinator)
+    _seed_before(coordinator, task_id)
+    try:
+        with pytest.raises(ForgeToolAPITimeoutError) as caught:
+            await coordinator.start_action(
+                task_id, "motion.move_pose", {"distance_m": 0.05}
+            )
+        record = coordinator.store.get(task_id).execution_records[0]
+        assert record.status == "failed"
+        assert record.rejected_before_dispatch is True
+        assert caught.value.dispatched is False
+
+        # The request provably never left PAOS, so an identical retry is safe.
+        response = await coordinator.start_action(
+            task_id, "motion.move_pose", {"distance_m": 0.05}
+        )
+    finally:
+        await client.close()
+
+    assert response["data"]["invocation_id"] == "inv_after_connect_retry"
+    assert calls == 2
+
+
+async def test_connect_error_is_failed_before_dispatch_and_resendable(tmp_path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(
+            202,
+            json={
+                "ok": True,
+                "data": {
+                    "invocation_id": "inv_after_connect_error",
+                    "attempt_id": "attempt_after_connect_error",
+                },
+            },
+        )
+
+    client = ForgeToolClient(
+        "http://gateway.test",
+        timeout_s=1.0,
+        transport=httpx.MockTransport(handler),
+    )
+    coordinator = _coordinator(tmp_path, client)  # type: ignore[arg-type]
+    task_id = _new_task(coordinator)
+    _seed_before(coordinator, task_id)
+    try:
+        with pytest.raises(ForgeToolAPIError) as caught:
+            await coordinator.start_action(
+                task_id, "motion.move_pose", {"distance_m": 0.05}
+            )
+        record = coordinator.store.get(task_id).execution_records[0]
+        assert record.status == "failed"
+        assert record.rejected_before_dispatch is True
+        assert caught.value.dispatched is False
+
+        response = await coordinator.start_action(
+            task_id, "motion.move_pose", {"distance_m": 0.05}
+        )
+    finally:
+        await client.close()
+
+    assert response["data"]["invocation_id"] == "inv_after_connect_error"
+    assert calls == 2
+
+
+async def test_real_read_timeout_is_unknown_and_never_resent(tmp_path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("gateway did not reply", request=request)
+
+    client = ForgeToolClient(
+        "http://gateway.test",
+        timeout_s=1.0,
+        transport=httpx.MockTransport(handler),
+    )
+    coordinator = _coordinator(tmp_path, client)  # type: ignore[arg-type]
+    task_id = _new_task(coordinator)
+    _seed_before(coordinator, task_id)
+    try:
+        with pytest.raises(ForgeToolAPITimeoutError) as caught:
+            await coordinator.start_action(
+                task_id, "motion.move_pose", {"distance_m": 0.05}
+            )
+        record = coordinator.store.get(task_id).execution_records[0]
+        assert record.status == "unknown"
+        assert record.rejected_before_dispatch is False
+        assert caught.value.dispatched is None
+
+        with pytest.raises(AgentTaskError, match="identical Action"):
+            await coordinator.start_action(
+                task_id, "motion.move_pose", {"distance_m": 0.05}
+            )
+    finally:
+        await client.close()
+
+    assert calls == 1
 
 
 async def test_invoke_timeout_error_code_is_not_treated_as_pre_dispatch(

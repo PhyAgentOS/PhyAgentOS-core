@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,7 +22,9 @@ from PhyAgentOS.forge.task import (
     AgentTaskBusyError,
     AgentTaskCoordinator,
     AgentTaskRecord,
+    AgentTaskStatus,
     PlanRevision,
+    ToolExecutionRecord,
 )
 from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest
 from PhyAgentOS.session.manager import SessionManager
@@ -355,7 +359,7 @@ class _GatedCoordinator(AgentTaskCoordinator):
         return result
 
 
-async def test_forge_single_slot_rejects_second_session(tmp_path):
+async def test_forge_creation_is_per_session(tmp_path):
     coordinator = _GatedCoordinator(
         workspace=tmp_path,
         config=ForgeConfig(),
@@ -376,11 +380,9 @@ async def test_forge_single_slot_rejects_second_session(tmp_path):
     )
 
     assert coordinator.arrived == 2
-    assert sum(isinstance(result, str) for result in results) == 1
-    assert sum(isinstance(result, AgentTaskBusyError) for result in results) == 1
-    active = coordinator.store.active()
-    assert active is not None
-    assert active.origin_session_key in {"sess-a", "sess-b"}
+    assert all(isinstance(result, str) for result in results)
+    active = coordinator.store.active_tasks()
+    assert {task.origin_session_key for task in active} == {"sess-a", "sess-b"}
 
 
 class _Activation:
@@ -393,9 +395,15 @@ class _ActivationManager:
         return _Activation()
 
 
+class _RuntimeRegistryStub:
+    def current(self):
+        return None
+
+
 class _StubResolver:
     def __init__(self) -> None:
         self.freeze_calls: list[str] = []
+        self.runtime_registry = _RuntimeRegistryStub()
 
     async def freeze(
         self,
@@ -447,32 +455,35 @@ def _bound_coordinator(tmp_path, monkeypatch, *, fail_after_freeze: bool = False
     return coordinator, resolver, binding_ids, frozen_task_ids
 
 
-async def test_bound_creation_rolls_back_the_losing_session(tmp_path, monkeypatch):
+async def test_bound_same_session_race_rolls_back_the_losing_binding(
+    tmp_path, monkeypatch
+):
     coordinator, resolver, binding_ids, frozen = _bound_coordinator(tmp_path, monkeypatch)
     tool = ForgeTaskCreateTool(coordinator)
 
-    async def create(session_key: str):
-        tool.set_context(session_key)
+    async def create(_session_key: str):
+        tool.set_context("sess-shared")
         return await tool.execute(
-            task_description=session_key,
+            task_description="shared",
             activation_id="activation_test",
             verification={"mode": "off"},
         )
 
     results = await asyncio.gather(
-        create("sess-a"), create("sess-b"), return_exceptions=True
+        create("sess-shared"), create("sess-shared"), return_exceptions=True
     )
 
     assert sum(isinstance(result, str) for result in results) == 1
     assert sum(isinstance(result, AgentTaskBusyError) for result in results) == 1
-    active = coordinator.store.active()
-    assert active is not None
-    assert active.origin_session_key in {"sess-a", "sess-b"}
+    active = coordinator.store.active_tasks()
+    assert len(active) == 1
+    winner = active[0]
+    assert winner.origin_session_key == "sess-shared"
     bindings = coordinator.interaction.store.bindings()
-    assert [item["task_id"] for item in bindings] == [active.task_id]
-    assert frozen == [active.task_id]
-    assert binding_ids == {active.primary_skill_binding.binding_id}
-    # The losing session resolved a candidate in memory but never reached freeze.
+    assert [item["task_id"] for item in bindings] == [winner.task_id]
+    assert frozen == [winner.task_id]
+    assert binding_ids == {winner.primary_skill_binding.binding_id}
+    # Both callers resolved a candidate, but only the winner froze a binding.
     assert len(resolver.freeze_calls) == 2
 
 
@@ -494,6 +505,235 @@ async def test_bound_creation_failure_removes_task_and_binding(tmp_path, monkeyp
     assert coordinator.interaction.store.bindings() == []
     assert binding_ids == set()
     assert frozen  # the binding was written before the rollback
+
+
+def _stale_unknown_task(tmp_path) -> AgentTaskRecord:
+    coordinator = AgentTaskCoordinator(
+        workspace=tmp_path, config=ForgeConfig(), client=object()  # type: ignore[arg-type]
+    )
+    task = coordinator.create_task(
+        task_description="stale dispatch",
+        verification=TaskVerificationContract(mode="off"),
+        origin_session_key="sess-shared",
+    )
+
+    def mark(current: AgentTaskRecord) -> None:
+        current.active_revision.execution_records.append(
+            ToolExecutionRecord(
+                record_id="tool_stale",
+                revision_id=current.active_revision_id,
+                tool_id="motion.move",
+                semantics="action",
+                caller_id="paos:stale",
+                status="unknown",
+            )
+        )
+
+    coordinator.store.update(
+        task.task_id, mark, event_type="test_seed_stale_unknown"
+    )
+    return task
+
+
+async def test_bound_freeze_failure_restores_superseded_unknown_task(
+    tmp_path, monkeypatch
+):
+    stale = _stale_unknown_task(tmp_path)
+    coordinator, _, binding_ids, frozen = _bound_coordinator(
+        tmp_path, monkeypatch, fail_after_freeze=True
+    )
+    coordinator.gate.set()
+
+    with pytest.raises(RuntimeError, match="freeze failed"):
+        await coordinator.create_task(
+            task_description="replacement",
+            activation_id="activation_test",
+            verification=TaskVerificationContract(mode="off"),
+            origin_session_key="sess-shared",
+        )
+
+    restored = coordinator.get_task(stale.task_id)
+    assert restored.status == AgentTaskStatus.EXECUTING
+    assert restored.terminal_at is None
+    assert restored.execution_records[0].status == "unknown"
+    assert not any("superseded locally" in item for item in restored.evidence_errors)
+    assert [task.task_id for task in coordinator.store.active_tasks()] == [
+        stale.task_id
+    ]
+    assert coordinator.interaction.store.bindings() == []
+    assert binding_ids == set()
+    assert len(frozen) == 1
+    events = [event["event_type"] for event in coordinator.store.events(stale.task_id)]
+    assert "task_superseded_locally" in events
+    assert "task_supersede_rolled_back" in events
+
+
+async def test_managed_stale_task_is_not_superseded_by_store(tmp_path, monkeypatch):
+    stale = _stale_unknown_task(tmp_path)
+    coordinator, resolver, binding_ids, frozen = _bound_coordinator(
+        tmp_path, monkeypatch
+    )
+    coordinator.gate.set()
+    monkeypatch.setattr(
+        coordinator.interaction,
+        "managed",
+        lambda task_id: task_id == stale.task_id,
+    )
+
+    with pytest.raises(AgentTaskBusyError):
+        await coordinator.create_task(
+            task_description="replacement",
+            activation_id="activation_test",
+            verification=TaskVerificationContract(mode="off"),
+            origin_session_key="sess-shared",
+        )
+
+    kept = coordinator.get_task(stale.task_id)
+    assert kept.status == AgentTaskStatus.EXECUTING
+    assert not any("superseded locally" in item for item in kept.evidence_errors)
+    assert coordinator.interaction.store.bindings() == []
+    assert binding_ids == set()
+    assert frozen == []
+    assert len(resolver.freeze_calls) == 1
+
+
+def _supersede_stale_task(tmp_path):
+    stale = _stale_unknown_task(tmp_path)
+    setup = AgentTaskCoordinator(
+        workspace=tmp_path, config=ForgeConfig(), client=object()  # type: ignore[arg-type]
+    )
+    snapshot = setup.get_task(stale.task_id)
+    replacement = setup.create_task(
+        task_description="replacement",
+        verification=TaskVerificationContract(mode="off"),
+        origin_session_key="sess-shared",
+    )
+    return setup, stale, snapshot, replacement
+
+
+def test_rollback_create_keeps_concurrent_execution_facts(tmp_path):
+    setup, stale, snapshot, replacement = _supersede_stale_task(tmp_path)
+
+    def record_external_fact(current: AgentTaskRecord) -> None:
+        record = current.execution_records[0]
+        record.status = "cancelled"
+        record.response = {"ok": True, "data": {"phase": "cancelled"}}
+        current.evidence_errors.append("external status update")
+
+    setup.store.update(
+        stale.task_id, record_external_fact, event_type="test_concurrent_update"
+    )
+    restored = setup.store.rollback_create(replacement.task_id, [snapshot])
+
+    assert restored == [stale.task_id]
+    kept = setup.get_task(stale.task_id)
+    assert kept.status == AgentTaskStatus.EXECUTING
+    assert kept.terminal_at is None
+    assert kept.execution_records[0].status == "cancelled"
+    assert kept.execution_records[0].response["data"]["phase"] == "cancelled"
+    assert "external status update" in kept.evidence_errors
+    assert not any("superseded locally" in item for item in kept.evidence_errors)
+    assert not any(
+        "rollback skipped" in item for item in kept.evidence_errors
+    )
+
+
+def test_rollback_create_does_not_restore_a_second_active_for_the_session(tmp_path):
+    setup, stale, snapshot, replacement = _supersede_stale_task(tmp_path)
+    setup.store.update(
+        replacement.task_id,
+        lambda current: setattr(current, "status", AgentTaskStatus.CANCELLED),
+        event_type="test_mark_replacement_terminal",
+    )
+    current = setup.create_task(
+        task_description="current",
+        verification=TaskVerificationContract(mode="off"),
+        origin_session_key="sess-shared",
+    )
+
+    restored = setup.store.rollback_create(replacement.task_id, [snapshot])
+
+    assert restored == []
+    kept = setup.get_task(stale.task_id)
+    assert kept.status == AgentTaskStatus.FAILED
+    assert any("rollback skipped" in item for item in kept.evidence_errors)
+    assert not any("superseded locally" in item for item in kept.evidence_errors)
+    active = setup.store.active_tasks()
+    assert [task.task_id for task in active] == [current.task_id]
+    events = [event["event_type"] for event in setup.store.events(stale.task_id)]
+    assert "task_supersede_rollback_skipped" in events
+
+
+def test_rollback_and_same_session_create_are_serialized(tmp_path):
+    setup, stale, snapshot, replacement = _supersede_stale_task(tmp_path)
+    other = AgentTaskCoordinator(
+        workspace=tmp_path, config=ForgeConfig(), client=object()  # type: ignore[arg-type]
+    )
+    barrier = threading.Barrier(2)
+
+    def rollback():
+        barrier.wait()
+        return setup.store.rollback_create(replacement.task_id, [snapshot])
+
+    def create():
+        barrier.wait()
+        try:
+            return other.create_task(
+                task_description="racing task",
+                verification=TaskVerificationContract(mode="off"),
+                origin_session_key="sess-shared",
+            )
+        except AgentTaskBusyError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(rollback), pool.submit(create)]
+        [future.result() for future in futures]
+
+    active = other.store.active_tasks()
+    assert len(active) <= 1
+    stale_now = other.get_task(stale.task_id)
+    if stale_now.status == AgentTaskStatus.EXECUTING:
+        assert [task.task_id for task in active] == [stale.task_id]
+    else:
+        assert stale_now.status == AgentTaskStatus.FAILED
+
+
+async def test_forge_stop_uses_the_latest_task_for_the_session_across_slots(tmp_path):
+    coordinator = AgentTaskCoordinator(
+        workspace=tmp_path, config=ForgeConfig(), client=object()  # type: ignore[arg-type]
+    )
+    other_session = coordinator.create_task(
+        task_description="other session",
+        verification=TaskVerificationContract(mode="off"),
+        origin_session_key="sess-a",
+    )
+    old = coordinator.create_task(
+        task_description="old task",
+        verification=TaskVerificationContract(mode="off"),
+        origin_session_key="sess-b",
+    )
+    await coordinator.cancel_task(old.task_id, reason="cleanup")
+    current = coordinator.create_task(
+        task_description="current task",
+        verification=TaskVerificationContract(mode="off"),
+        origin_session_key="sess-b",
+    )
+    loop = _loop(
+        tmp_path,
+        _GatedProvider(),
+        forge_task_coordinator=coordinator,
+    )
+
+    _, forge_cancelled = await loop._cancel_session_side_effects("sess-b")
+
+    assert forge_cancelled == 1
+    assert coordinator.get_task(current.task_id).status == AgentTaskStatus.CANCELLED
+    assert coordinator.get_task(old.task_id).status == AgentTaskStatus.CANCELLED
+    assert (
+        coordinator.get_task(other_session.task_id).status
+        == AgentTaskStatus.EXECUTING
+    )
 
 
 class _RecordingCoordinator:

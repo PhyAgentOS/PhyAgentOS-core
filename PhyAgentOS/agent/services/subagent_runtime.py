@@ -445,7 +445,13 @@ class CoreSubagent:
             capacity = _effective_context_capacity(
                 self._selection, self._context_window_cap
             )
-            if auto_compact and capacity is not None and capacity > self._max_tokens:
+            semantics = getattr(
+                self._selection, "context_window_semantics", "unknown"
+            )
+            # Match the parent rule: only a provider that explicitly proves an
+            # input-only window may skip the reply reserve.
+            reserve_tokens = 0 if semantics == "input" else self._max_tokens
+            if auto_compact and capacity is not None and capacity > reserve_tokens:
                 from .context_policy import ContextPolicy
 
                 context_policy = ContextPolicy(
@@ -453,7 +459,7 @@ class CoreSubagent:
                     provider,
                     model=self._selection.model,
                     capacity=capacity,
-                    reserve_tokens=self._max_tokens,
+                    reserve_tokens=reserve_tokens,
                     threshold=float(
                         getattr(performance, "compaction_threshold", 0.8)
                     ),

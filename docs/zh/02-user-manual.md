@@ -419,8 +419,8 @@ paos agent --runtime legacy
 
 选 Core（默认或显式）不会加载 `agent_legacy` 或 `cli.legacy`；只有真正选择
 `--runtime legacy` 时才导入这些模块。Core 失败时直接退出，不回退到旧 runtime。两套会话
-历史分开存放（`<workspace>/sessions/core.db` 与 `<workspace>/sessions/` 下的 JSONL），但
-未解决的远端状态与 AgentTask 保护是全 workspace 共享的，两条路径都受约束。
+历史分开存放（`<workspace>/sessions/core.db` 与 `<workspace>/sessions/` 下的 JSONL）。Forge
+AgentTask 记录存在 workspace，但任务准入只按调用方 origin session 计算。
 
 ### 会话
 
@@ -434,6 +434,10 @@ paos agent --runtime legacy
 session id。`core.db` 里已有的 Core 会话保留；旧 JSONL 会话不导入、不转换，也不会自动迁移
 legacy 会话。
 
+工作区规则文件（`AGENTS.md`、`SOUL.md`、`USER.md`、`IDENTITY.md`、`TOOLS.md`、`SKILLS.md`）
+在每回合开始时重新读取。修改从下一回合生效，包括排队中的回合或新 session；运行中的回合保留
+它开始时读到的文本，手动压缩也读取当前文件。
+
 ### 流式输出、context 与回合脚注
 
 provider 支持流式时，回复正文会在回合结束前先做实时预览（重定向输出时直接写出），最终答案
@@ -446,8 +450,10 @@ session 行显示 `context ...`：当前请求（system prompt、工具 schema �
 改写。只有**既无可靠元数据、也无显式上限**时才用文档化的 65,536 fallback；有显式上限时使用该
 configured cap，不会自动放大到 1M，状态里会标出容量来源（model/configured/fallback）。`≈`
 表示估算值；provider 报告的真实值不加 `≈`，也不显示字面 `exact`；上下文大小未知时显示
-`context --` 或 `used/--`，不是 `--%`。请求超过容量时仍显示超过 100%，不会被截断。工具按
-阶段显示：未激活 Skill 前不提供任务创建/变更工具；注册的工具定义仍在，只是当前步骤不可见。
+`context --` 或 `used/--`，不是 `--%`。请求超过容量时仍显示超过 100%，不会被截断。状态行只
+显示 `context 已用/窗口 百分比`；回复预算、输入上限和 token 估算来源记录在
+`request.prepared.request_budget` 和 guard 错误里，不再显示在行上。`(assumed)` 标记 fallback
+容量。工具按阶段显示：未激活 Skill 前不提供任务创建/变更工具；注册的工具定义仍在，只是当前步骤不可见。
 同一 Skill 的同一内容版本通常只保留一份完整文档；若正文很短，去掉后净省不足 128 字符，则保留
 重复副本，不加 marker。完整事件仍保留在 store。compact 摘要不是 Skill 文档副本；再次调用
 `activate_skill` 会按该回合重新授权并返回完整正文，不是压缩后自动从本地文件注入。
@@ -612,10 +618,13 @@ Core runtime 仍是实验入口，但 `/correct` 与 `/resume` 已可用，行�
 两份历史不导入、不合并。Core 失败时直接退出，不会回退到旧 runtime。fleet 模式仍要求
 `--runtime legacy`。
 
-workspace 内任一 session 留下未解决的远端状态，都会阻止新建 AgentTask。Core 提示词每步都会
-报告该阻塞的 task/invocation 身份；Gateway 从未确认 invocation 时明确写 `None`。它不会引用
-其他 session 的任务描述、工具参数或证据。不要重发旧的 Action/Session，不要猜 invocation id，
-也不要靠取消别人的任务绕过。只能用激活 Skill 或已取得 ToolSpec 声明的工具；如果当前末端位姿
+任务准入按调用方 origin session 计算，不再看整个 workspace：每个 session 最多一个非终态
+AgentTask，其他 session 的未完成或 unknown 工作既不阻止创建，也不进入本 session 的提示词。
+如果本 session 唯一未完成的工作是仍处于 unknown 的 Action/Session 调用，创建新 task 会把旧的
+本地 task 以 failed 关闭，并保留远端 unknown record；真实 operation 是否 busy 仍由 Gateway
+判断。unknown 记录也会到期：超过 `forge.unknownRecoveryTimeoutS`（默认 3600 秒）仍无法确认结果时，
+这次执行按本地失败结算并释放槽位。截止时间只写一次，轮询和重启都不会延长；远端结果仍为未确认。不要重发该 unknown Action/Session，不要猜 invocation id，也不要靠取消别人的
+任务绕过本地的拒绝。只能用激活 Skill 或已取得 ToolSpec 声明的工具；如果当前末端位姿
 或机器人状态拿不到，就不能声称相对位移已完成，也不要发送猜测的绝对目标。可选 `timeout_ms`
 不填时由 Gateway 用自己的默认超时。
 
@@ -624,6 +633,10 @@ workspace 内任一 session 留下未解决的远端状态，都会阻止新建 
 调用 Tool 前使用 `forge_tool_context(tool_id)`。它返回 ToolSpec，以及实时 binding、
 readiness、endpoint status 和机器人 frame 信息。Agent 必须遵循精确 input schema，不能猜测
 frame 或单位约定。
+
+`forge_tool_list` 读取实时 Gateway `GET /tools` catalog，把 catalog 对象原样放进
+`data.catalog`，并在 `data.source` 记录 endpoint、固定使用的 runtime/client 与读取时间。
+传入 AgentTask `task_id` 只追加该任务的冻结 allowlist；发现本身不会创建或扩大 allowlist。
 
 活动 Skill 工作流声明允许的 Tool ID 以及对应 Query、Action 或 Session semantics；不得用
 binding 中不存在的相似 Tool 替代。
@@ -644,8 +657,8 @@ forge_tool_query(tool_id, arguments)
 4. 按返回的 `invocation_id` 核对每个异步执行；未知 admission 后不得猜测 ID 或重复调用；
 5. 停止 task-owned Session，再调用 `forge_task_finalize(task_id)`。
 
-全局最多一个非终态 AgentTask。诊断 Query 不占此槽位，所有执行仍按 Gateway operation 的
-`max_concurrency` 竞争。
+每个 origin session（或无绑定槽位）最多一个非终态 AgentTask；诊断 Query 不占该槽位，不同
+session 可以各自创建，所有执行仍按 Gateway operation 的 `max_concurrency` 竞争。
 
 ## 7. 定义验证
 
@@ -676,8 +689,8 @@ forge_tool_query(tool_id, arguments)
 | `recovery` | 与 enforce 相同；`replan_required` 允许有预算的新 PlanRevision。 |
 
 finalize 返回 `awaiting_replan` 时调用
-`forge_task_begin_revision(task_id, reason)`，并继续使用同一 task ID。不要创建第二个任务，也
-不要重试物理效果未知的 invocation。
+`forge_task_begin_revision(task_id, reason)`，并继续使用同一 task ID。不要重试物理效果未知的
+invocation。
 
 ## 8. 取消与 unknown 结果
 

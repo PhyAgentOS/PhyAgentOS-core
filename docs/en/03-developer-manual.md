@@ -41,7 +41,7 @@ This manual covers Core implementation: AgentTask coordination, persistence, bin
 | `cli/legacy/legacy_agent.py`, `cli/legacy/legacy_support.py`, `cli/legacy/legacy_gateway.py` | Legacy `paos agent --runtime legacy`, its terminal interaction, the legacy prompt-session helpers, and the legacy gateway selected by `paos gateway --runtime legacy` |
 | `cli/interaction/interactive_session.py`, `cli/interaction/agent_output.py`, `cli/interaction/terminal_input.py`, `cli/interaction/terminal_display.py`, `cli/interaction/model_picker.py` | Core input scheduling and cancel, message rendering, terminal input, the live status/tool region, and provider/model/effort selectors |
 | `agent_legacy/loop.py` | Existing Agent loop, general tools, dynamic MCP, Forge tool registration, context, and lifecycle |
-| `agent_legacy/tools/forge_tool_api.py` | Compatibility wrappers for the ten Gateway Tool API tools |
+| `agent_legacy/tools/forge_tool_api.py` | Compatibility wrappers for the eleven Gateway Tool API tools |
 | `agent_legacy/tools/forge_task.py` | Compatibility wrappers for the five AgentTask lifecycle tools |
 | `forge/tool_client.py` | Strict asynchronous HTTP client and response validation |
 | `forge/binding.py`, `forge/task.py` | Immutable Runtime/ToolSpec binding, AgentTask models/store, evidence, verification, and recovery |
@@ -65,6 +65,10 @@ requires `attempt_id`. A timeout leaves an unknown record and recovery never rep
 
 The public Agent-facing tool catalog is maintained in the [API contract](../forge/README.md#6-agent-tools). Tool names, descriptions, JSON Schemas, and operations live in `agent/capabilities/forge_tool_api.py` and `agent/capabilities/forge_task_tools.py`; `agent_legacy/tools/` only keeps compatibility wrappers over them. Keep transport handling in `forge/tool_client.py` and coordination in `forge/task.py`.
 
+`forge_tool_list` returns the live `GET /tools` object unchanged under `data.catalog` and records the
+endpoint, pinned runtime/client and read time in `data.source`. An optional `task_id` only adds the
+frozen allowlist view; it never creates or expands an allowlist.
+
 The Core path also registers `activate_skill` from `agent/capabilities/skill_access_capability.py`. It reads a registered Skill document and returns a turn-scoped `activation_id`; it does not start a Skill runtime and is not a Forge tool.
 
 Diagnostic Query and bound calls invoke the same HTTP methods. Every mutating or task-attributed
@@ -73,11 +77,10 @@ never invent a Gateway identity or result.
 
 Optional `timeout_ms` is not defaulted by the Agent: when the Gateway's limit is unknown the model
 omits it and the Gateway applies its own default. An HTTP client timeout is a different setting and
-must not stand in for it. The Core prompt fragment reads unresolved Action/Session blockers from
-the coordinator on every step, across the whole workspace, and reports task/invocation identity,
-status and semantics only; a local `succeeded` never hides an older unknown, and `None` means the
-Gateway identity was never confirmed. The fragment is current blocking state, not proof of
-resolution.
+must not stand in for it. The Core prompt fragment reports only this session's latest non-terminal
+AgentTask; task state from other sessions and finished history are store facts, not prompt
+material, and can be read explicitly with `forge_task_get`. Nothing from another session's task is
+injected into a fresh prompt.
 
 ## 5. AgentTask contracts and transactions
 
@@ -85,9 +88,17 @@ resolution.
 append-only PlanRevisions, evidence references, verification attempts, cancellation state, and
 timestamps. Each `PlanRevision` contains its own Tool records, verdict, and verification attempts.
 
-`AgentTaskStore` uses SQLite WAL and `BEGIN IMMEDIATE`. Creation queries for any non-terminal task
-inside the same transaction, enforcing one global active slot across processes. Updates write the
-complete validated record and an append-only event. Callers do not modify tables directly.
+`AgentTaskStore` uses SQLite WAL and `BEGIN IMMEDIATE`. Creation queries non-terminal tasks for the
+same `origin_session_key` (the unbound slot for `None`) inside the same transaction, enforcing one
+active slot per session across processes. When that task's only unfinished work is an Action/Session
+invocation still marked `unknown`, creation closes the old local task as failed and keeps its
+unknown execution record, so the session can start a genuinely new task without reclassifying
+remote state. An unknown record carries `unknown_deadline`, set once on first entry and never
+extended by polling or restarts. Past `forge.unknownRecoveryTimeoutS` (3600 seconds by default) the
+execution is failed locally with `RecoveryTimeout`, and a task with no live or unresolved owned
+execution closes as failed so its slot is released.
+Updates write the complete validated record and an append-only event. Callers do not modify tables
+directly.
 
 The [AgentTask state contract](../forge/README.md#8-agenttask-model) defines public states. Store transitions must preserve those semantics; an `unknown` Tool record closes accounting without proving physical stop.
 
@@ -305,8 +316,9 @@ makes no promise that such text will run.
    can be submitted. `reconcile_nonterminal()` only issues Gateway GET requests; it never
    replays an Action or Session POST and never turns an unresolved unknown into a terminal
    state. Core has no interaction supervisor, so this path does not request a robot stop. If
-   recovery itself fails, the failure is reported and the session still opens; the unresolved
-   unknown state continues to block new tasks.
+   recovery itself fails, the failure is reported and the session still opens. After the GET-based
+   attempt, `expire_timed_out_unknowns()` fails any execution past its recovery deadline and
+   releases its slot; those records remain diagnostic history and do not block task admission.
 5. Create `SkillDocumentLoader` and `TurnSkillActivationManager`, then register the activation
    manager with the coordinator so `forge_task_create` can validate `activation_id`.
 6. Open the session store at `<workspace>/sessions/core.db`.
@@ -317,7 +329,10 @@ makes no promise that such text will run.
 8. Run one message or the interactive loop. Each turn reads its session's selection when it
    actually starts and builds a model-facing assembly that serves that one turn; the runtime is
    stopped as soon as the turn ends (its host stays open), rather than waiting for the next
-   submit. The store, Forge coordinator/client, and activation manager stay shared. Submits in
+   submit. The workspace rule files (`AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`,
+   `SKILLS.md`) are read at that same turn start and frozen for the turn, so an edit applies from
+   the next turn, including a queued turn or a new session; manual compaction reads the current
+   files. The store, Forge coordinator/client, and activation manager stay shared. Submits in
    the same session run serially in registration order; different sessions still run
    concurrently. `cancel` targets only the current assembly, so a queued turn never inherits an
    earlier cancellation.
@@ -327,12 +342,13 @@ makes no promise that such text will run.
    close the store. The Forge client and verifier are closed by the resource stack after the
    session.
 
-`forge_task_create` refuses to create a task while any earlier Action/Session invocation still
-has unknown remote state, including tasks from another session. The refusal names the blocking
-`task_id`, the confirmed `invocation_id` (or explicitly `None` when the Gateway identity was
-never confirmed), the record status and semantics, and the matching status tool to inspect. It
-does not suggest listing tools, does not resend the old request, and does not tell the operator
-to delete the store or restart to clear the blockage.
+`forge_task_create` refuses only while the calling session's latest task is still non-terminal with
+unfinished live work; a task from another session never refuses it. A task whose only unfinished
+work is an Action/Session invocation still marked `unknown` does not refuse: creation closes that
+old local task as failed and keeps the remote unknown record. The refusal names the blocking
+`task_id`, status and origin session; it does not resend the old request, and it does not tell the
+operator to delete the store or restart. Gateway, not PAOS, decides whether a real operation is
+busy.
 
 While a turn runs, Esc is the only stop entry point: the first Esc arms a two-second window and
 shows a yellow hint, the second Esc requests local cancellation through the same session cancel
@@ -387,7 +403,10 @@ still describes the unchanged request. `ProviderService.resolve` composes the ef
 reliable model metadata wins unless an explicit `context_window_tokens` cap is smaller; unknown
 metadata uses an explicit cap when present; only when there is neither reliable metadata nor an
 explicit cap does it use the documented 65,536 fallback and record source `fallback`. The raw model
-value and the effective guard stay separate. Model rounds count provider calls, not internal reasoning steps,
+value and the effective guard stay separate. The context label shows only the estimate and its
+share of the window; the reply budget, input limit and estimator source go to
+`request.prepared.request_budget` and the guard error, not the label. `(assumed)` marks fallback
+capacity. Model rounds count provider calls, not internal reasoning steps,
 and no reasoning step count is fabricated. The session cumulative
 line is rebuilt from stored events, so it survives a reload. The footer is a terminal rendering
 only; it is never inserted into the message history sent to a provider.
@@ -458,7 +477,7 @@ overlaps another call.
 
 With `cache_stable_prompts=True`, `PromptAssemblerImpl` keeps only the fixed system instructions in
 the system message and appends the step's live fragments as one runtime-context message after the
-history. The static prefix stays byte-identical across steps while Forge blockers and other live
+history. The static prefix stays byte-identical across steps while this session's Forge task and other live
 facts are re-read every step; the assembler never stores that runtime message in the caller's
 history.
 
@@ -535,8 +554,8 @@ estimator that also counts the system prompt and the visible tools, instead of e
 character counts; a checkpoint is written only when the next request's estimate actually shrinks.
 The UI switches the checkpoint projection only at `REQUEST_PREPARED`, so a turn start
 (`TURN_STARTED`) does not fall back to the old history. Compaction never dispatches a tool call and
-never changes an AgentTask or Forge record, so an unresolved `unknown` after compaction still
-blocks new tasks.
+never changes an AgentTask or Forge record; an unresolved `unknown` remains store history after
+compaction and is neither resent nor resolved automatically.
 
 ### Resume and correction
 
@@ -677,10 +696,10 @@ pytest -q
 ```
 
 Tests should cover response contracts, Session ownership, pending/cancel/stop/timeout/unknown
-semantics, one active task, diagnostic Query, immutable bindings, no-POST recovery, revision
+semantics, per-session task slots, diagnostic Query, immutable bindings, no-POST recovery, revision
 recovery, evidence, version-scoped episodes, archive attacks, transactional rollback, Registry
 verification, Runtime health/switching, mocked workflows, CLI runtime selection, Core per-turn
-assembly, interactive FIFO/cancel, Skill document precedence, and activation scope. Concrete
+assembly, workspace rule refresh, interactive FIFO/cancel, Skill document precedence, and activation scope. Concrete
 hardware/simulator tests are conditional on independently installed matching artifacts and Dora
 availability.
 

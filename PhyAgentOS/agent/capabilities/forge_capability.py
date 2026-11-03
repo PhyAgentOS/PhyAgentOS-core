@@ -40,7 +40,12 @@ from PhyAgentOS.agent.core.types import (
     ToolRegistration,
     ToolStatus,
 )
-from PhyAgentOS.forge.task import AgentTaskBusyError, AgentTaskCoordinator, AgentTaskRecord
+from PhyAgentOS.forge.task import (
+    AgentTaskBusyError,
+    AgentTaskCoordinator,
+    AgentTaskRecord,
+    _stale_dispatch_unknown,
+)
 from PhyAgentOS.forge.tool_client import ForgeToolClient
 
 from .forge_task_tools import TASK_TOOL_DEFINITIONS, execute_task_tool
@@ -464,7 +469,6 @@ _STAGE_HIDE_BEFORE_TASK = frozenset(
     {"forge_task_begin_revision", "forge_task_finalize",
      "forge_tool_start_action", "forge_tool_start_session"}
 )
-_TERMINAL_TASK_VALUES = frozenset({"succeeded", "failed", "cancelled"})
 
 
 class ForgeCapability:
@@ -597,73 +601,46 @@ class ForgeCapability:
 
         return handle
 
+    def _current_task(self, session_id: str) -> AgentTaskRecord | None:
+        """Return this session's newest non-terminal task, if the store can."""
+        store = self._coordinator.store
+        getter = getattr(store, "nonterminal_for_session", None)
+        if callable(getter):
+            return getter(session_id)
+        record = store.latest_for_session(session_id)
+        return None if record is None or record.terminal else record
+
     def has_active_task(self, session_id: str) -> bool:
         """Authoritative check: does this session own a non-terminal AgentTask?"""
-        record = self._coordinator.store.latest_for_session(session_id)
-        if record is None:
-            return False
-        status = getattr(record.status, "value", str(record.status))
-        return status not in _TERMINAL_TASK_VALUES
+        return self._current_task(session_id) is not None
 
     def prompt_context(self, context: ExecutionContext) -> str | None:
-        """Return live Forge state for this step: local task and global blockers.
+        """Return this session's current unfinished Forge task, if any.
 
-        The store and the coordinator are queried on every call; nothing is
-        cached and nothing is invented. An unresolved remote Action/Session
-        from any session in this workspace is a workspace-wide blocker, so it
-        is reported even when this session has no task or its own task has
-        already succeeded. Only task/invocation identity, status and semantics
-        are copied; task descriptions, tool arguments, evidence and user text
-        from other sessions are never quoted here.
+        Only the newest non-terminal task for the calling session is considered,
+        and only while it is not locally abandonable. A task whose only
+        unfinished dispatch has no Gateway identity cannot be advanced locally,
+        so it is not shown as the task to continue. Finished history and
+        unresolved remote state from other sessions are facts in the store, not
+        prompt material; the model can read them explicitly with
+        ``forge_task_get`` when the user asks. Nothing is cached and nothing is
+        invented.
         """
-        lines: list[str] = []
-        record = self._coordinator.store.latest_for_session(context.session_id)
-        if record is not None:
-            nonterminal = sum(
-                1 for item in record.execution_records if not item.terminal
-            )
-            unknown = sum(
-                1 for item in record.execution_records if item.status == "unknown"
-            )
-            lines.append(
-                f"Forge task {record.task_id}: status={record.status.value}; "
-                f"active_revision={record.active_revision_id}; "
-                f"cancellation_requested={record.cancellation_requested}; "
-                f"nonterminal_invocations={nonterminal}; unknown_invocations={unknown}."
-            )
-
-        blockers = self._coordinator.unknown_remote_blockers()
-        if blockers:
-            lines.append(
-                "Forge has unresolved remote Action/Session state in this workspace. "
-                "It blocks creating a new AgentTask from every session until it is "
-                "reconciled:"
-            )
-            for blocker in blockers:
-                invocation = blocker.get("invocation_id")
-                identity = (
-                    f'task_id="{blocker.get("task_id")}" invocation_id="{invocation}"'
-                    if invocation
-                    else f'task_id="{blocker.get("task_id")}" invocation_id=None '
-                    "(Gateway identity never confirmed)"
-                )
-                lines.append(
-                    f"- {identity} status={blocker.get('status')} "
-                    f"semantics={blocker.get('semantics')}"
-                )
-            lines.append(
-                "Do not invent an invocation_id, do not resend the old Action/Session, "
-                "do not call forge_task_create again while a blocker is unchanged, and "
-                "do not cancel another session's task to get around it. A record whose "
-                "invocation_id is None cannot be located by the status tools, which "
-                "require both task_id and invocation_id; keep it unknown and verify the "
-                "original Gateway record. This is current blocking state, not proof that "
-                "anything has been resolved."
-            )
-
-        if not lines:
+        record = self._current_task(context.session_id)
+        if record is None or _stale_dispatch_unknown(record):
             return None
-        return "\n".join(lines)
+        nonterminal = sum(
+            1 for item in record.execution_records if not item.terminal
+        )
+        unknown = sum(
+            1 for item in record.execution_records if item.status == "unknown"
+        )
+        return (
+            f"Forge task {record.task_id}: status={record.status.value}; "
+            f"active_revision={record.active_revision_id}; "
+            f"cancellation_requested={record.cancellation_requested}; "
+            f"nonterminal_invocations={nonterminal}; unknown_invocations={unknown}."
+        )
 
     async def cancel(
         self, session_id: str, context: ExecutionContext | None

@@ -67,7 +67,8 @@ Action/Session admission 不是完成。取消或停止被接受、本地超时�
 
 ## 5. AgentTask 生命周期
 
-全局最多一个非终态 AgentTask。任务从 revision 1 开始，可包含多个绑定 Query、Action 与 Session。
+每个 origin session（或无绑定槽位）最多一个非终态 AgentTask；不同 session 可以各自创建。
+任务从 revision 1 开始，可包含多个绑定 Query、Action 与 Session。
 PlanRevision 只追加，既有 execution record 和 verification attempt 不会被重写。
 
 ```text

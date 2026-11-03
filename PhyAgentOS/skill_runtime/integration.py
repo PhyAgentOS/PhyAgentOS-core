@@ -302,7 +302,7 @@ class SkillRuntimeController:
 
     def switch(self, skill_name: str, profile: str) -> ActiveSkillRuntime:
         with self._lock:
-            if self.task_store is not None and self.task_store.active() is not None:
+            if self.task_store is not None and self.task_store.active_tasks():
                 raise RuntimeError("cannot switch Forge runtime while an AgentTask is non-terminal")
             current = self.registry.current()
             manifest = self.catalog.get(skill_name)

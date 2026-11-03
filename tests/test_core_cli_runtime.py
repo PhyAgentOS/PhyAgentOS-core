@@ -66,11 +66,16 @@ class FakeCoordinator:
         self.store = SimpleNamespace(latest_for_session=lambda session: None)
         self.reconcile_calls = 0
         self.reconcile_error: Exception | None = None
+        self.expire_calls = 0
 
     def set_activation_manager(self, manager) -> None:
         self.activation_manager = manager
 
     def unknown_remote_blockers(self) -> list[dict]:
+        return []
+
+    def expire_timed_out_unknowns(self) -> list[str]:
+        self.expire_calls += 1
         return []
 
     async def reconcile_nonterminal(self):
@@ -308,6 +313,24 @@ async def test_open_core_session_recovers_forge_once_before_the_first_turn(
         assert second.status is TurnStatus.COMPLETED
         # Later turns do not rerun recovery.
         assert coordinator.reconcile_calls == 1
+
+
+async def test_each_turn_expires_unknowns_past_their_deadline(tmp_path, monkeypatch):
+    factory = _FakeForgeFactory()
+    monkeypatch.setattr(agent_commands, "ProviderService", _FakeProviderService)
+    monkeypatch.setattr(agent_commands, "build_forge_components", factory)
+    config = _config(tmp_path)
+    output = RecordingOutput()
+
+    async with open_core_session(config, output=output) as session:
+        coordinator = factory.coordinator
+        assert coordinator is not None
+        # Building the seed assembly already checks; a real turn must check again.
+        assert coordinator.expire_calls >= 1
+        coordinator.expire_calls = 0
+        result = await session.submit(TurnRequest("cli:test", "one"))
+        assert result.status is TurnStatus.COMPLETED
+        assert coordinator.expire_calls >= 1
 
 
 async def test_open_core_session_reports_recovery_failure_and_still_cleans_up(

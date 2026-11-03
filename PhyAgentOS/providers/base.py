@@ -792,3 +792,14 @@ class LLMProvider(ABC):
         reason to probe the endpoint.
         """
         return None
+
+    def get_context_window_semantics(self, model: str | None = None) -> str | None:
+        """Say whether ``get_context_window`` is input-only or shared.
+
+        Return ``"input"`` only when local metadata proves the number counts
+        input tokens alone, so a reply budget must not be subtracted from it.
+        Return ``"total"`` only when it proves a shared input+output window.
+        Return ``None`` when the provider cannot prove either; callers then
+        keep the conservative shared-window calculation and do not guess.
+        """
+        return None

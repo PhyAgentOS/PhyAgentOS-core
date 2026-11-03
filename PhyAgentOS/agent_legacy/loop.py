@@ -1140,6 +1140,16 @@ class AgentLoop:
         if not msg.turn_id:
             msg.turn_id = uuid.uuid4().hex
         turn_id = msg.turn_id
+        if self.forge_task_coordinator is not None:
+            # A stale unknown past its deadline must not hold this turn's slot.
+            expire = getattr(
+                self.forge_task_coordinator, "expire_timed_out_unknowns", None
+            )
+            if callable(expire):
+                try:
+                    expire()
+                except Exception:
+                    pass
         # A system turn is an internal hand-off (subagent result, Forge
         # notification). Its events belong to no channel; publishing them
         # produces one "Unknown channel: system" warning per token.

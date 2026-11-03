@@ -22,6 +22,7 @@ Runtime 选择与 Gateway URL 来自已安装 Skill manifest 和显式启动的 
 | `requestTimeoutS` | number | `10.0` | HTTP 请求 timeout，必须大于 0。 |
 | `pollIntervalS` | number | `0.5` | Action/Session status/result 建议对账间隔，范围 `[0.1, 5.0]` 秒。 |
 | `executionTimeoutS` | number | `300.0` | Agent 侧任务 deadline 指引；timeout 不能证明远端执行已停止。 |
+| `unknownRecoveryTimeoutS` | number | `3600.0` | Action/Session 保持 unknown 的最长时间；到期后按本地失败结算并释放 session 槽位。每条记录只设置一次，不因轮询或重启延长；远端结果仍为未确认。 |
 | `evidence` | object | 见下表 | AgentTask 的 best-effort 前后证据采集设置。 |
 | `interaction` | object | `{"enabled": false}` | 可选的受限交互扩展，见下文。 |
 
@@ -121,13 +122,13 @@ Session 必须带 `task_id`，并计入任务验证。
 
 任务生命周期工具为 `forge_task_create`、`forge_task_get`、`forge_task_begin_revision`、
 `forge_task_finalize`、`forge_task_cancel`。Tool 传输工具为 `forge_tool_context`、
-`forge_tool_query`、`forge_tool_start_action`、`forge_tool_action_status`、
+`forge_tool_list`、`forge_tool_query`、`forge_tool_start_action`、`forge_tool_action_status`、
 `forge_tool_action_result`、`forge_tool_cancel_action`、`forge_tool_start_session`、
 `forge_tool_session_status`、`forge_tool_session_result`、`forge_tool_stop_session`。
 
 `binding_id`、`task_id`、`revision_id`、execution record ID、PAOS `caller_id`、Gateway
 `invocation_id` 与 `attempt_id` 严格区分。
-全局只允许一个非终态 AgentTask；恢复时在同一 task 上追加 revision，并受
+每个 origin session（或无绑定槽位）最多一个非终态 AgentTask，不同 session 可各自创建；恢复时在同一 task 上追加 revision，并受
 `maxReplansPerEpisode` 与 `replanTimeoutS` 限制。
 
 ## 7. `TaskVerificationContract`

@@ -1,4 +1,4 @@
-"""Native definitions and operations for the ten Forge Gateway Tool API tools.
+"""Native definitions and operations for the Forge Gateway Tool API tools.
 
 This module is the single source for the Tool API tool names, descriptions,
 JSON Schemas and operations. ``forge_capability`` builds Core registrations
@@ -26,11 +26,129 @@ from PhyAgentOS.forge.tool_client import (
     ForgeToolAPITimeoutError,
     ForgeToolClient,
 )
+from PhyAgentOS.verification.contracts import utc_now
 
 __all__ = [
     "TOOL_API_DEFINITIONS",
     "execute_tool_api_tool",
 ]
+
+# Fields of the local active runtime identity. They describe the runtime this
+# PAOS process selected locally; none of them is a Gateway-declared version.
+_RUNTIME_IDENTITY_FIELDS = (
+    "skill_name",
+    "skill_version",
+    "profile",
+    "runtime_instance_id",
+    "gateway_url",
+    "gateway_identity",
+)
+
+
+def _active_client(
+    client: ForgeToolClient | None,
+) -> tuple[ForgeToolClient, dict[str, Any] | None]:
+    """Resolve one concrete client for the whole call, plus local runtime identity.
+
+    ``DynamicForgeToolClient`` follows the active runtime per attribute access,
+    so two calls could otherwise land on two runtimes. This helper reads
+    ``registry.current()`` once and pins ``active.client`` for every request in
+    the current operation. Clients without a registry (plain ``ForgeToolClient``
+    or test doubles) are used as-is and report no runtime identity.
+
+    A dynamic client with no active runtime is a hard error. The tool must not
+    fall back to a previous result or a previous runtime.
+    """
+    if client is None:
+        raise RuntimeError("no Forge Tool client is configured")
+
+    registry = getattr(client, "registry", None)
+    current = getattr(registry, "current", None)
+    if not callable(current):
+        return client, None
+
+    active = current()
+    if active is None:
+        raise RuntimeError(
+            "no ready Forge Skill runtime is active; live Forge tool discovery "
+            "is unavailable and no cached catalog is used"
+        )
+    pinned = getattr(active, "client", None)
+    if pinned is None:
+        raise RuntimeError("the active Forge Skill runtime has no Gateway client")
+    identity = {name: getattr(active, name, None) for name in _RUNTIME_IDENTITY_FIELDS}
+    return pinned, identity
+
+
+def _source(
+    client: ForgeToolClient,
+    runtime: dict[str, Any] | None,
+    *,
+    endpoint: str,
+    snapshot: str,
+) -> dict[str, Any]:
+    """Describe this read: live Gateway data read now through one pinned client.
+
+    ``read_at`` is the local time the read finished. It is not a Gateway
+    timestamp and it does not turn separate requests into one snapshot.
+    """
+    source: dict[str, Any] = {
+        "kind": "live_gateway",
+        "endpoint": endpoint,
+        "snapshot": snapshot,
+        "read_at": utc_now().isoformat(),
+        "runtime": dict(runtime) if runtime is not None else None,
+    }
+    if runtime is None:
+        # A plain client has no local runtime identity; only its URL is known.
+        base_url = getattr(client, "base_url", None)
+        if isinstance(base_url, str) and base_url:
+            source["gateway_url"] = base_url
+    return source
+
+
+def _binding_view(
+    coordinator: AgentTaskCoordinator | None, task_id: str | None
+) -> dict[str, Any] | None:
+    """Report one AgentTask's frozen Skill allowlist without changing it."""
+    if not task_id:
+        return None
+    if coordinator is None:
+        raise RuntimeError(
+            "task_id was supplied but no AgentTaskCoordinator is configured for "
+            "this tool; omit task_id for plain Gateway catalog discovery"
+        )
+    task = coordinator.get_task(task_id)
+    binding = getattr(task, "primary_skill_binding", None)
+    if binding is None:
+        return {
+            "task_id": task_id,
+            "available": False,
+            "allowlist": None,
+            "note": (
+                "this AgentTask has no frozen primary Skill binding; discovery "
+                "does not create or expand an invocation allowlist"
+            ),
+        }
+
+    required = getattr(binding, "required_tools", ()) or ()
+    allowlist = sorted(
+        item.tool_id for item in required if isinstance(getattr(item, "tool_id", None), str)
+    )
+    return {
+        "task_id": task_id,
+        "available": True,
+        "binding_id": getattr(binding, "binding_id", None),
+        "skill_name": getattr(binding, "skill_name", None),
+        "skill_version": getattr(binding, "skill_version", None),
+        "runtime_profile": getattr(binding, "runtime_profile", None),
+        "runtime_instance_id": getattr(binding, "runtime_instance_id", None),
+        "allowlist": allowlist,
+        "note": (
+            "the frozen AgentTask binding remains the only invocation allowlist; "
+            "forge_tool_list reports it and does not expand it"
+        ),
+    }
 
 
 async def _call(
@@ -68,16 +186,66 @@ async def _context(
     arguments: Mapping[str, Any],
 ) -> dict[str, Any]:
     del coordinator
-    assert client is not None
     tool_id = arguments["tool_id"]
 
     async def describe() -> dict[str, Any]:
+        # Pin one client first: both GETs in this call must hit the same runtime.
+        pinned, runtime = _active_client(client)
         spec, context = await asyncio.gather(
-            client.get_tool(tool_id), client.get_tool_context(tool_id)
+            pinned.get_tool(tool_id), pinned.get_tool_context(tool_id)
         )
-        return {"ok": True, "data": {"tool": spec["data"], "context": context["data"]}}
+        return {
+            "ok": True,
+            "data": {
+                "tool": spec["data"],
+                "context": context["data"],
+                "source": _source(
+                    pinned,
+                    runtime,
+                    endpoint=(
+                        f"GET /tools/{tool_id} and GET /tools/{tool_id}/context"
+                    ),
+                    snapshot="not_atomic_two_independent_get_requests",
+                ),
+            },
+        }
 
     return await _call(describe)
+
+
+async def _list(
+    client: ForgeToolClient | None,
+    coordinator: AgentTaskCoordinator,
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read the live Gateway catalog without interpreting its unknown shape."""
+    task_id = arguments.get("task_id")
+
+    async def catalog() -> dict[str, Any]:
+        pinned, runtime = _active_client(client)
+        response = await pinned.list_tools()
+        raw = response.get("data") if isinstance(response, Mapping) else None
+        if not isinstance(raw, dict):
+            raise ForgeToolAPIError(
+                "Forge Gateway GET /tools response omitted object data"
+            )
+        data: dict[str, Any] = {
+            # Copied unchanged. Field names inside the Gateway catalog are not
+            # assumed or rewritten here, because the Tool API shape is external.
+            "catalog": raw,
+            "source": _source(
+                pinned,
+                runtime,
+                endpoint="GET /tools",
+                snapshot="single_get_request",
+            ),
+        }
+        binding = _binding_view(coordinator, task_id)
+        if binding is not None:
+            data["binding"] = binding
+        return {"ok": True, "data": data}
+
+    return await _call(catalog)
 
 
 async def _query(
@@ -314,6 +482,22 @@ _CONTEXT_DEFINITION = ToolDefinition(
     parameters=_single_schema("tool_id"),
 )
 
+_LIST_DEFINITION = ToolDefinition(
+    name="forge_tool_list",
+    description=(
+        "List the live Forge Gateway tool catalog read from GET /tools. Discovery is "
+        "read-only: a newly discovered tool is callable only when the frozen Skill "
+        "binding already allows it. Pass task_id to report that AgentTask's frozen "
+        "allowlist; omit it for plain catalog discovery. The catalog keeps the "
+        "Gateway's own object shape and is not reinterpreted."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {"task_id": {"type": "string", "minLength": 1}},
+        "additionalProperties": False,
+    },
+)
+
 _QUERY_DEFINITION = ToolDefinition(
     name="forge_tool_query",
     description=(
@@ -391,6 +575,7 @@ _ToolOperation = Callable[..., Awaitable[dict[str, Any]]]
 # Order is the registration order every caller must keep.
 _TOOL_API_TOOLS: tuple[tuple[ToolDefinition, _ToolOperation], ...] = (
     (_CONTEXT_DEFINITION, _context),
+    (_LIST_DEFINITION, _list),
     (_QUERY_DEFINITION, _query),
     (_START_ACTION_DEFINITION, _start_action),
     (_ACTION_STATUS_DEFINITION, _action_status),

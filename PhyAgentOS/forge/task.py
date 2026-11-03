@@ -41,13 +41,13 @@ class AgentTaskError(RuntimeError):
 
 
 class AgentTaskBusyError(AgentTaskError):
-    """Raised when the global non-terminal AgentTask slot is occupied.
+    """Raised when this session's non-terminal AgentTask slot is occupied.
 
-    ``blocking`` carries the authoritative owner of the busy state: the task,
-    the invocation identity the Gateway confirmed (``None`` when dispatch was
-    never confirmed), the record status and semantics, and the originating
-    session. Callers can show these instead of asking the model to guess a
-    listing tool. It never reclassifies or resolves an unknown state.
+    The slot is per ``origin_session_key``; an unbound task (``None``) has its
+    own slot. ``blocking`` carries the authoritative owner of the busy state:
+    the task, the invocation identity the Gateway confirmed (``None`` when
+    dispatch was never confirmed), the record status and semantics, and the
+    originating session. It never reclassifies or resolves an unknown state.
     """
 
     def __init__(
@@ -124,6 +124,13 @@ class ToolExecutionRecord(BaseModel):
     # reached the provider. Such a record documents a tool call that never
     # executed, so task finalization must neither require nor be failed by it.
     rejected_before_dispatch: bool = False
+    # Absolute deadline for resolving ``unknown``. Set once when the record first
+    # becomes unknown and never extended: a later poll or restart must not keep
+    # the task occupied forever.
+    unknown_deadline: datetime | None = None
+    # True after the deadline passed without a confirmed outcome. The record is
+    # then failed local accounting; the remote state stays unconfirmed.
+    recovery_expired: bool = False
     evidence_refs: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -211,7 +218,12 @@ class AgentTaskRecord(BaseModel):
 
 
 class AgentTaskStore:
-    """Transactional SQLite store enforcing one global non-terminal AgentTask."""
+    """Transactional SQLite store enforcing one non-terminal AgentTask per session.
+
+    Unbound tasks (``origin_session_key is None``) share one independent slot.
+    Unresolved remote state from another session is retained as a fact but does
+    not occupy this session's slot.
+    """
 
     def __init__(self, workspace: str | Path) -> None:
         root = Path(workspace).expanduser().resolve() / ".paos" / "agent_tasks"
@@ -274,6 +286,17 @@ class AgentTaskStore:
                 return record
         return None
 
+    def nonterminal_for_session(self, session_key: str) -> AgentTaskRecord | None:
+        """Return the newest non-terminal task for one session, if any."""
+        tasks = [
+            task
+            for task in self.active_tasks()
+            if task.origin_session_key == session_key
+        ]
+        if not tasks:
+            return None
+        return max(tasks, key=lambda task: task.created_at)
+
     def tasks_with_unknowns(self) -> list[AgentTaskRecord]:
         """Return tasks that still carry an unknown Action/Session invocation."""
         with self._lock, self._connection() as connection:
@@ -313,35 +336,201 @@ class AgentTaskStore:
                     found.append((task, record))
         return found
 
-    def create(self, record: AgentTaskRecord) -> AgentTaskRecord:
+    def create(
+        self,
+        record: AgentTaskRecord,
+        *,
+        supersede_guard: Callable[[AgentTaskRecord], bool] | None = None,
+    ) -> tuple[AgentTaskRecord, list[AgentTaskRecord]]:
+        """Insert one task, superseding only locally abandonable same-session work.
+
+        Returns the new record plus snapshots of tasks that were closed locally.
+        ``rollback_create`` can delete the replacement and put those snapshots
+        back if a later side effect of creating the new task fails.
+        """
+        superseded: list[AgentTaskRecord] = []
         with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            active = connection.execute(
-                "SELECT task_id, status FROM agent_tasks "
-                "WHERE status NOT IN (?, ?, ?) LIMIT 1",
+            rows = connection.execute(
+                "SELECT record_json FROM agent_tasks "
+                "WHERE status NOT IN (?, ?, ?) ORDER BY created_at",
                 tuple(item.value for item in TERMINAL_TASK_STATUSES),
-            ).fetchone()
-            if active is not None:
+            ).fetchall()
+            for row in rows:
+                try:
+                    existing = AgentTaskRecord.model_validate_json(row["record_json"])
+                except Exception:
+                    continue
+                if existing.origin_session_key != record.origin_session_key:
+                    continue
+                if _stale_dispatch_unknown(existing) and (
+                    supersede_guard is None or supersede_guard(existing)
+                ):
+                    # The only unfinished work is an Action/Session whose dispatch
+                    # outcome was never confirmed and has no Gateway identity. Close
+                    # the stale task locally as failed, keep the execution records
+                    # unknown, and let this session start a genuinely new task. The
+                    # remote state is not reclassified.
+                    superseded.append(existing.model_copy(deep=True))
+                    self._supersede_locally(connection, existing, record.task_id)
+                    continue
+                scope = (
+                    "the unbound slot"
+                    if record.origin_session_key is None
+                    else f"session {record.origin_session_key!r}"
+                )
                 raise AgentTaskBusyError(
-                    f"AgentTask {active['task_id']} is still non-terminal "
-                    f"(status={active['status']}); finish or cancel it before "
-                    "creating a new AgentTask",
-                    task_id=active["task_id"],
-                    status=active["status"],
+                    f"AgentTask {existing.task_id} is still non-terminal "
+                    f"(status={existing.status.value}); finish or cancel it before "
+                    f"creating another AgentTask in {scope}",
+                    task_id=existing.task_id,
+                    status=existing.status.value,
                     blocking=[
                         {
-                            "task_id": active["task_id"],
+                            "task_id": existing.task_id,
                             "invocation_id": None,
-                            "status": active["status"],
+                            "status": existing.status.value,
                             "semantics": "task",
-                            "origin_session_key": None,
+                            "origin_session_key": existing.origin_session_key,
                         }
                     ],
                 )
             self._insert(connection, record)
             self._event(connection, record.task_id, "task_created", {})
             connection.commit()
-        return record
+        return record, superseded
+
+    def rollback_create(
+        self,
+        replacement_task_id: str,
+        snapshots: list[AgentTaskRecord],
+    ) -> list[str]:
+        """Delete a failed replacement and restore local superseded task state.
+
+        Both steps run in one transaction so no other writer can create a
+        same-session task between them. Restore is deliberately narrow: only
+        the task status, ``terminal_at`` and the supersede marker are changed;
+        execution records and other facts written after supersession stay as
+        they are. If another non-terminal task already exists for that session,
+        the old task stays failed with an explanatory evidence entry.
+        """
+        restored: list[str] = []
+        marker = (
+            f"superseded locally by AgentTask {replacement_task_id}; "
+            "the remote Action/Session state remains unknown"
+        )
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM agent_task_events WHERE task_id = ?",
+                (replacement_task_id,),
+            )
+            connection.execute(
+                "DELETE FROM agent_tasks WHERE task_id = ?",
+                (replacement_task_id,),
+            )
+            for original in snapshots:
+                row = connection.execute(
+                    "SELECT record_json FROM agent_tasks WHERE task_id = ?",
+                    (original.task_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                current = AgentTaskRecord.model_validate_json(row["record_json"])
+                if current.status != AgentTaskStatus.FAILED or not any(
+                    marker in item for item in current.evidence_errors
+                ):
+                    continue
+                current.evidence_errors = [
+                    item for item in current.evidence_errors if marker not in item
+                ]
+                current.updated_at = utc_now()
+                if self._session_has_other_active(
+                    connection, current.origin_session_key, current.task_id
+                ):
+                    current.evidence_errors.append(
+                        "supersede rollback skipped: another AgentTask for this "
+                        "session is non-terminal"
+                    )
+                    event_type = "task_supersede_rollback_skipped"
+                else:
+                    current.status = original.status
+                    current.terminal_at = original.terminal_at
+                    event_type = "task_supersede_rolled_back"
+                connection.execute(
+                    "UPDATE agent_tasks SET status = ?, record_json = ?, updated_at = ? "
+                    "WHERE task_id = ?",
+                    (
+                        current.status.value,
+                        current.model_dump_json(),
+                        current.updated_at.isoformat(),
+                        current.task_id,
+                    ),
+                )
+                self._event(
+                    connection,
+                    current.task_id,
+                    event_type,
+                    {"replacement_task_id": replacement_task_id},
+                )
+                if event_type == "task_supersede_rolled_back":
+                    restored.append(current.task_id)
+            connection.commit()
+        return restored
+
+    @staticmethod
+    def _session_has_other_active(
+        connection: sqlite3.Connection,
+        origin_session_key: str | None,
+        exclude_task_id: str,
+    ) -> bool:
+        rows = connection.execute(
+            "SELECT record_json FROM agent_tasks "
+            "WHERE task_id != ? AND status NOT IN (?, ?, ?)",
+            (
+                exclude_task_id,
+                *(item.value for item in TERMINAL_TASK_STATUSES),
+            ),
+        ).fetchall()
+        for row in rows:
+            try:
+                task = AgentTaskRecord.model_validate_json(row["record_json"])
+            except Exception:
+                continue
+            if task.origin_session_key == origin_session_key:
+                return True
+        return False
+
+    @staticmethod
+    def _supersede_locally(
+        connection: sqlite3.Connection,
+        existing: AgentTaskRecord,
+        new_task_id: str,
+    ) -> None:
+        message = (
+            f"superseded locally by AgentTask {new_task_id}; the remote "
+            "Action/Session state remains unknown"
+        )
+        existing.status = AgentTaskStatus.FAILED
+        existing.evidence_errors.append(message)
+        existing.updated_at = utc_now()
+        existing.terminal_at = existing.updated_at
+        connection.execute(
+            "UPDATE agent_tasks SET status = ?, record_json = ?, updated_at = ? "
+            "WHERE task_id = ?",
+            (
+                existing.status.value,
+                existing.model_dump_json(),
+                existing.updated_at.isoformat(),
+                existing.task_id,
+            ),
+        )
+        AgentTaskStore._event(
+            connection,
+            existing.task_id,
+            "task_superseded_locally",
+            {"reason": message, "superseded_by": new_task_id},
+        )
 
     def get(self, task_id: str) -> AgentTaskRecord:
         with self._lock, self._connection() as connection:
@@ -386,14 +575,25 @@ class AgentTaskStore:
             connection.commit()
             return record
 
-    def active(self) -> AgentTaskRecord | None:
+    def active_tasks(self) -> list[AgentTaskRecord]:
+        """Return every real non-terminal AgentTask across all sessions."""
         with self._lock, self._connection() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 "SELECT record_json FROM agent_tasks WHERE status NOT IN (?, ?, ?) "
-                "ORDER BY created_at LIMIT 1",
+                "ORDER BY created_at",
                 tuple(item.value for item in TERMINAL_TASK_STATUSES),
-            ).fetchone()
-        return None if row is None else AgentTaskRecord.model_validate_json(row["record_json"])
+            ).fetchall()
+        tasks: list[AgentTaskRecord] = []
+        for row in rows:
+            try:
+                tasks.append(AgentTaskRecord.model_validate_json(row["record_json"]))
+            except Exception:
+                continue
+        return tasks
+
+    def active(self) -> AgentTaskRecord | None:
+        tasks = self.active_tasks()
+        return tasks[0] if tasks else None
 
     def find_invocation(self, invocation_id: str) -> tuple[AgentTaskRecord, ToolExecutionRecord] | None:
         with self._lock, self._connection() as connection:
@@ -511,61 +711,154 @@ class AgentTaskCoordinator:
     def set_activation_manager(self, activation_manager: Any) -> None:
         self.activation_manager = activation_manager
 
-    def _assert_no_unknown_remote_state(self) -> None:
-        """Refuse a new AgentTask while an older invocation may still be moving.
+    def _can_supersede_locally(self, task: AgentTaskRecord) -> bool:
+        """Never close an interaction-managed task behind the supervisor's back."""
+        try:
+            return not self.interaction.managed(task.task_id)
+        except Exception as exc:
+            logger.warning(
+                "could not determine interaction ownership for {}: {}; keeping it",
+                task.task_id,
+                exc,
+            )
+            return False
 
-        The diagnostic names the authoritative blocking task and invocation,
-        including an explicitly absent invocation identity. It never asks the
-        caller to list tasks, resend the old Action/Session, or treat unknown
-        as terminal.
+    def _unknown_recovery_timeout(self) -> float:
+        return float(getattr(self.config, "unknown_recovery_timeout_s", 3600.0))
+
+    def expire_timed_out_unknowns(self) -> list[str]:
+        """Settle ``unknown`` executions whose recovery deadline has passed.
+
+        A record that stays unknown past its deadline cannot be confirmed by
+        PAOS. It is failed as local accounting with a ``RecoveryTimeout`` error:
+        the session slot is released, but the remote outcome stays unconfirmed
+        and the request is never resent. A task with no live or unresolved
+        owned execution closes as failed at the same time.
+
+        The deadline is recorded once when the record first becomes unknown and
+        is never extended by polling or a restart. Legacy records without a
+        deadline fall back to ``updated_at`` so an already old unknown does not
+        get a fresh hour.
         """
-        blockers = self.unknown_remote_blockers()
-        if not blockers:
-            return
-        first = blockers[0]
-        semantics = first["semantics"]
-        status_tool = (
-            "forge_tool_session_status"
-            if semantics == "session"
-            else "forge_tool_action_status"
+        timeout_s = self._unknown_recovery_timeout()
+        now = utc_now()
+        expired: list[str] = []
+        for task in self.store.active_tasks():
+            try:
+                expired.extend(self._expire_task_unknowns(task.task_id, now, timeout_s))
+            except AgentTaskError:
+                # A concurrent rollback or delete removed the row; nothing to settle.
+                continue
+        return expired
+
+    def _expire_task_unknowns(
+        self, task_id: str, now: datetime, timeout_s: float
+    ) -> list[str]:
+        """Expire one task's due unknowns; the caller tolerates concurrent deletion."""
+        task = self.store.get(task_id)
+        if any(
+            record.status == "unknown" and record.unknown_deadline is None
+            for record in task.execution_records
+        ):
+            def stamp(current: AgentTaskRecord) -> None:
+                for record in current.execution_records:
+                    if record.status == "unknown" and record.unknown_deadline is None:
+                        record.unknown_deadline = record.updated_at + timedelta(
+                            seconds=timeout_s
+                        )
+
+            self.store.update(
+                task_id,
+                stamp,
+                event_type="tool_execution_recovery_deadline_recorded",
+            )
+
+        task = self.store.get(task_id)
+        due = [
+            record.record_id
+            for record in task.execution_records
+            if record.status == "unknown"
+            and record.unknown_deadline is not None
+            and record.unknown_deadline <= now
+        ]
+        if not due:
+            return []
+
+        def fail(current: AgentTaskRecord, due_ids: tuple[str, ...] = tuple(due)) -> None:
+            for record in current.execution_records:
+                if record.record_id not in due_ids:
+                    continue
+                record.status = "failed"
+                record.recovery_expired = True
+                record.error = {
+                    "type": "RecoveryTimeout",
+                    "message": (
+                        "recovery deadline passed without a confirmed Gateway outcome; "
+                        "this execution is failed locally and was not resent"
+                    ),
+                    "deadline": record.unknown_deadline.isoformat()
+                    if record.unknown_deadline is not None
+                    else None,
+                }
+                record.updated_at = now
+                current.evidence_errors.append(
+                    f"Tool execution {record.record_id} ({record.tool_id}) recovery "
+                    "expired: the remote outcome stays unconfirmed"
+                )
+            current.updated_at = now
+
+        updated = self.store.update(
+            task_id,
+            fail,
+            event_type="tool_execution_recovery_expired",
+            payload={"record_ids": list(due)},
         )
-        task_id = first["task_id"]
-        invocation = first["invocation_id"]
-        if invocation:
-            recovery = (
-                "Reconcile it before creating a new AgentTask: call "
-                f'forge_task_get(task_id="{task_id}") and '
-                f'{status_tool}(task_id="{task_id}", invocation_id="{invocation}"). '
-                "Do not call forge_task_create again while this blocker is unchanged, "
-                "and do not resend the old Action/Session."
+
+        if (
+            updated.status == AgentTaskStatus.EXECUTING
+            and any(item.recovery_expired for item in _owned_executions(updated))
+            and not any(
+                item.status in {"pending", "accepted", "running", "unknown"}
+                for item in _owned_executions(updated)
             )
-        else:
-            recovery = (
-                "Gateway identity was never confirmed for this record, so the existing "
-                "status tools cannot locate it (they require both task_id and "
-                "invocation_id). Keep the record unknown and verify the original "
-                "Gateway record; do not invent an invocation_id and do not resend the "
-                "old Action/Session. Do not call forge_task_create again while this "
-                "blocker is unchanged."
+        ):
+            def close(current: AgentTaskRecord) -> None:
+                if current.status != AgentTaskStatus.EXECUTING:
+                    return
+                current.status = AgentTaskStatus.FAILED
+                current.terminal_at = now
+                current.updated_at = now
+                current.evidence_errors.append(
+                    "AgentTask failed locally because every unfinished execution "
+                    "passed its recovery deadline without a confirmed outcome"
+                )
+
+            self.store.update(
+                task_id,
+                close,
+                event_type="task_recovery_expired",
             )
-        raise AgentTaskBusyError(
-            "an earlier Action/Session invocation still has unknown remote state: "
-            f'task_id="{task_id}" '
-            + (
-                f'invocation_id="{invocation}"'
-                if invocation
-                else "invocation_id=None"
-            )
-            + f" status={first['status']} semantics={semantics}. "
-            + recovery,
-            task_id=task_id,
-            invocation_id=invocation,
-            status=first["status"],
-            blocking=blockers,
-        )
+            try:
+                managed = self.interaction.managed(task_id)
+            except Exception:
+                managed = True
+            if not managed:
+                try:
+                    self._schedule_experience(self.store.get(task_id))
+                except Exception as exc:  # maintenance must not fail the caller
+                    logger.warning(
+                        "could not schedule experience after task {} recovery expiry: {}",
+                        task_id,
+                        exc,
+                    )
+        return due
 
     def unknown_remote_blockers(self) -> list[dict[str, Any]]:
-        """Describe unresolved Action/Session records across every session."""
+        """Describe unresolved Action/Session records as read-only facts.
+
+        This is diagnostic state only: it no longer gates AgentTask creation
+        from other sessions or the same session after local supersession.
+        """
         return [
             {
                 "task_id": task.task_id,
@@ -602,6 +895,9 @@ class AgentTaskCoordinator:
             raise AgentTaskError(
                 "non-off AgentTask verification requires the verification service"
             )
+        # Release slot occupied only by executions whose recovery deadline
+        # passed before admitting a new task.
+        self.expire_timed_out_unknowns()
         task_id = f"task_{uuid4().hex[:16]}"
         revision_id = f"revision_{uuid4().hex[:16]}"
         task = AgentTaskRecord(
@@ -612,8 +908,9 @@ class AgentTaskCoordinator:
             active_revision_id=revision_id,
             origin_session_key=origin_session_key,
         )
-        self._assert_no_unknown_remote_state()
-        self.store.create(task)
+        task, _superseded = self.store.create(
+            task, supersede_guard=self._can_supersede_locally
+        )
         if self.experience is not None and origin_session_key:
             self.experience.bind_forge_task(
                 task_id,
@@ -633,6 +930,7 @@ class AgentTaskCoordinator:
             raise AgentTaskError(
                 "non-off AgentTask verification requires the verification service"
             )
+        self.expire_timed_out_unknowns()
         task_id = f"task_{uuid4().hex[:16]}"
         revision_id = f"revision_{uuid4().hex[:16]}"
         binding: ForgeSkillBinding | None = None
@@ -686,12 +984,14 @@ class AgentTaskCoordinator:
             ),
             origin_session_key=origin_session_key,
         )
-        # Reserve the single slot before writing any interaction binding. A
-        # busy slot must not leave journal state behind for a task that was
+        # Reserve this session's slot before writing any interaction binding.
+        # A busy slot must not leave journal state behind for a task that was
         # never created.
-        self._assert_no_unknown_remote_state()
-        self.store.create(task)
+        superseded: list[AgentTaskRecord] = []
         try:
+            task, superseded = self.store.create(
+                task, supersede_guard=self._can_supersede_locally
+            )
             await self.interaction.freeze(task)
             if binding is not None and self.runtime_task_binding_ids is not None:
                 self.runtime_task_binding_ids.add(binding.binding_id)
@@ -701,7 +1001,7 @@ class AgentTaskCoordinator:
             if binding is not None and self.runtime_task_binding_ids is not None:
                 self.runtime_task_binding_ids.discard(binding.binding_id)
             self._discard_interaction_binding(task_id)
-            self.store.delete(task_id)
+            self.store.rollback_create(task_id, superseded)
             raise
         if self.experience is not None and origin_session_key:
             self.experience.bind_forge_task(
@@ -806,7 +1106,7 @@ class AgentTaskCoordinator:
             item.semantics == "action"
             and item.tool_id == tool_id
             and item.arguments == arguments
-            and item.status == "unknown"
+            and (item.status == "unknown" or item.recovery_expired)
             for item in task.execution_records
         ):
             raise AgentTaskError(
@@ -985,10 +1285,13 @@ class AgentTaskCoordinator:
         if task.terminal:
             return
         status = _tool_status(response, default=record.status)
+        timeout_s = self._unknown_recovery_timeout()
 
         def mutate(current: AgentTaskRecord) -> None:
             target = _task_execution(current, record.record_id)
             target.status = status
+            if status == "unknown":
+                _stamp_unknown_deadline(target, timeout_s)
             target.response = response
             target.updated_at = utc_now()
 
@@ -1086,22 +1389,34 @@ class AgentTaskCoordinator:
                 remote_attempt_id = remote_attempt_id or failed_attempt
             invocation_id = remote_invocation_id or invocation_id
             attempt_id = remote_attempt_id or attempt_id
+            rejected_before_dispatch = (
+                failure is not None and _rejected_before_dispatch(failure)
+            )
             self._finish_execution(
                 task_id,
                 record_id,
-                status="unknown",
+                status="failed" if rejected_before_dispatch else "unknown",
                 invocation_id=invocation_id,
                 attempt_id=attempt_id,
                 response=response,
+                rejected_before_dispatch=rejected_before_dispatch,
                 error={
-                    "type": "CancelledError",
+                    "type": (
+                        type(failure).__name__
+                        if rejected_before_dispatch and failure is not None
+                        else "CancelledError"
+                    ),
                     "message": (
-                        "Session start was cancelled; remote state is unknown and "
-                        "the request was not resent"
-                        + (
-                            ""
-                            if invocation_id
-                            else "; Gateway invocation identity could not be confirmed"
+                        str(failure)
+                        if rejected_before_dispatch and failure is not None
+                        else (
+                            "Session start was cancelled; remote state is unknown and "
+                            "the request was not resent"
+                            + (
+                                ""
+                                if invocation_id
+                                else "; Gateway invocation identity could not be confirmed"
+                            )
                         )
                     ),
                 },
@@ -1130,13 +1445,15 @@ class AgentTaskCoordinator:
             remote_invocation_id, remote_attempt_id = _remote_identity(exc)
             invocation_id = remote_invocation_id or invocation_id
             attempt_id = remote_attempt_id or attempt_id
+            rejected_before_dispatch = _rejected_before_dispatch(exc)
             self._finish_execution(
                 task_id,
                 record_id,
-                status="unknown",
+                status="failed" if rejected_before_dispatch else "unknown",
                 invocation_id=invocation_id,
                 attempt_id=attempt_id,
                 error={"type": type(exc).__name__, "message": str(exc)},
+                rejected_before_dispatch=rejected_before_dispatch,
             )
             if invocation_id and self.runtime_session_ids is not None:
                 self._track_remote_identity(
@@ -1185,10 +1502,13 @@ class AgentTaskCoordinator:
         task = self.store.get(task_id)
         record = _owned_execution(task, invocation_id, semantics="session")
         status = _tool_status(response, default=record.status)
+        timeout_s = self._unknown_recovery_timeout()
 
         def mutate(current: AgentTaskRecord) -> None:
             target = _task_execution(current, record.record_id)
             target.status = status
+            if status == "unknown":
+                _stamp_unknown_deadline(target, timeout_s)
             target.response = response
             target.updated_at = utc_now()
 
@@ -1426,24 +1746,25 @@ class AgentTaskCoordinator:
         return result
 
     async def reconcile_nonterminal(self) -> AgentTaskRecord | None:
-        """Repair local execution facts from Gateway GETs without redispatching POSTs."""
+        """Repair every real non-terminal task from Gateway GETs, never POSTs.
+
+        Terminal tasks are history: their unknown records stay unknown and are
+        not re-queried here. Creation no longer depends on clearing them.
+        """
         if self.interaction.supervisor is not None:
             await self.interaction.supervisor.recover()
-        # Terminal tasks can still carry an unknown invocation. Settle those
-        # first so a new AgentTask is not blocked by stale state.
-        for stale in self.store.tasks_with_unknowns():
-            for record in stale.execution_records:
-                if (
-                    record.status == "unknown"
-                    and record.semantics in {"action", "session"}
-                    and record.invocation_id
-                ):
-                    await self._reconcile_unknown(stale.task_id, record)
-        task = self.store.active()
-        if task is not None and self.interaction.managed(task.task_id):
-            return task
-        if task is None:
-            return None
+        tasks = self.store.active_tasks()
+        for task in tasks:
+            if self.interaction.managed(task.task_id):
+                continue  # the interaction supervisor recovered its own runs
+            await self._reconcile_task(task)
+        # Only after the GET-based recovery attempt: an execution still unknown
+        # past its deadline is failed locally so it cannot hold the slot forever.
+        self.expire_timed_out_unknowns()
+        remaining = self.store.active_tasks()
+        return remaining[0] if remaining else None
+
+    async def _reconcile_task(self, task: AgentTaskRecord) -> None:
         binding = task.primary_skill_binding
         if binding is not None and self.runtime_task_binding_ids is not None:
             self.runtime_task_binding_ids.add(binding.binding_id)
@@ -1456,6 +1777,9 @@ class AgentTaskCoordinator:
             if record.terminal and not unknown_with_identity:
                 continue
             if not record.invocation_id:
+                if record.status == "unknown":
+                    # Keep the original dispatch-uncertain fact and its error.
+                    continue
                 self._finish_execution(
                     task.task_id,
                     record.record_id,
@@ -1494,7 +1818,6 @@ class AgentTaskCoordinator:
                 self.observe_session(task.task_id, record.invocation_id, response)
             else:
                 self.observe_action(task.task_id, record.invocation_id, response)
-        return self.store.get(task.task_id)
 
     async def _reconcile_unknown(
         self, task_id: str, record: ToolExecutionRecord
@@ -1741,12 +2064,14 @@ class AgentTaskCoordinator:
         error: dict[str, Any] = {"type": "CancellationUnconfirmed", "message": message}
         if exc is not None:
             error["cause"] = {"type": type(exc).__name__, "message": str(exc)}
+        timeout_s = self._unknown_recovery_timeout()
 
         def mutate(current: AgentTaskRecord) -> None:
             target = _task_execution(current, record_id)
             if target.terminal and target.status != "unknown":
                 return
             target.status = "unknown"
+            _stamp_unknown_deadline(target, timeout_s)
             target.error = error
             target.updated_at = utc_now()
 
@@ -1866,6 +2191,8 @@ class AgentTaskCoordinator:
         error: dict[str, Any] | None = None,
         rejected_before_dispatch: bool = False,
     ) -> None:
+        timeout_s = self._unknown_recovery_timeout()
+
         def mutate(current: AgentTaskRecord) -> None:
             record = _task_execution(current, record_id)
             record.status = status  # type: ignore[assignment]
@@ -1874,6 +2201,8 @@ class AgentTaskCoordinator:
             record.response = response
             record.error = error
             record.rejected_before_dispatch = rejected_before_dispatch
+            if status == "unknown":
+                _stamp_unknown_deadline(record, timeout_s)
             record.updated_at = utc_now()
 
         self.store.update(task_id, mutate, event_type="tool_execution_finished")
@@ -2081,6 +2410,71 @@ def _has_owned_execution(task: AgentTaskRecord) -> bool:
     )
 
 
+def _owned_executions(task: AgentTaskRecord) -> list[ToolExecutionRecord]:
+    return [
+        item
+        for item in task.execution_records
+        if item.semantics == "action"
+        or (item.semantics == "session" and item.ownership == "task")
+    ]
+
+
+def _stamp_unknown_deadline(
+    record: ToolExecutionRecord,
+    timeout_s: float,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Mark when an ``unknown`` record stops occupying its session.
+
+    The deadline is set once, on the first entry into ``unknown``. Later polls,
+    retries and restarts never extend it, so a lost Gateway receipt cannot keep a
+    task alive forever.
+    """
+    if record.unknown_deadline is None:
+        record.unknown_deadline = (now or utc_now()) + timedelta(seconds=timeout_s)
+
+
+def _stale_dispatch_unknown(task: AgentTaskRecord) -> bool:
+    """True when the task is locally abandonable without touching remote facts.
+
+    No task-owned Action/Session is live (``pending``/``accepted``/``running``),
+    and the task has at least one unfinished dispatch that PAOS can never resolve
+    locally:
+
+    * an ``unknown`` record with no ``invocation_id``; or
+    * a ``failed`` record that was rejected before dispatch; or
+    * a ``failed`` record whose recovery deadline expired without a confirmed
+      outcome.
+
+    Unknown records that already have a Gateway invocation identity stay
+    recoverable and are not a supersede candidate. An empty task is not
+    abandonable. The task still blocks its own session slot until the caller
+    cancels it or starts a new task; the latter closes the stale task locally as
+    failed without touching the execution records.
+    """
+    owned = [
+        item
+        for item in task.execution_records
+        if item.semantics == "action"
+        or (item.semantics == "session" and item.ownership == "task")
+    ]
+    if not owned:
+        return False
+    if any(item.status in {"pending", "accepted", "running"} for item in owned):
+        return False
+    unknown = [item for item in owned if item.status == "unknown"]
+    rejected = [
+        item
+        for item in owned
+        if item.status == "failed"
+        and (item.rejected_before_dispatch or item.recovery_expired)
+    ]
+    if not unknown and not rejected:
+        return False
+    return all(item.invocation_id is None for item in unknown)
+
+
 def _has_nonterminal_owned_execution(task: AgentTaskRecord) -> bool:
     return any(
         (
@@ -2203,6 +2597,10 @@ def _rejected_before_dispatch(exc: Exception) -> bool:
     invocation_id, attempt_id = _remote_identity(exc)
     if invocation_id is not None or attempt_id is not None:
         return False
+    if getattr(exc, "dispatched", None) is False:
+        # The transport failed while connecting or acquiring a pool connection,
+        # before any request bytes could reach the Gateway.
+        return True
     if error_code == "FORGE_TOOL_REQUEST_VALIDATION_REJECTED":
         # This code is the Gateway's typed pre-dispatch validation rejection and
         # is emitted as HTTP 400. Keep the status check explicit so the same code

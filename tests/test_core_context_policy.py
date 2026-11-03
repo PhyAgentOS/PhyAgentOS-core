@@ -23,7 +23,11 @@ from PhyAgentOS.agent.core.types import (
     ExecutionContext,
     ToolDefinition,
 )
-from PhyAgentOS.agent.services.context_policy import ContextPolicy, ContextReduction
+from PhyAgentOS.agent.services.context_policy import (
+    CompactionError,
+    ContextPolicy,
+    ContextReduction,
+)
 
 SESSION = "cli:context-policy"
 
@@ -458,6 +462,51 @@ async def test_force_recovers_below_threshold_with_one_trim(tmp_path: Path) -> N
         assert result.reason == "tool_text_trimmed"
         assert provider.calls == []
         assert len(provider.calls) <= 1
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_summary_that_stays_over_the_input_limit_fails_with_numbers(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "core.db")
+    try:
+        # A long summary can shrink the request but still not fit the hard
+        # input ceiling. That must be an explicit numeric failure, not a
+        # reduction that later produces an unexplained overflow.
+        provider = FakeProvider(reply="x" * 8_000)
+        policy = _policy(
+            store,
+            provider,
+            capacity=2_000,
+            reserve_tokens=100,
+            threshold=1.0,
+        )
+        history = [
+            {"role": "user", "content": "FIRST TASK: " + "x" * 12_000},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "CURRENT TASK"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "type": "function",
+                                "function": {"name": "echo", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "name": "echo", "content": "ok"},
+        ]
+
+        with pytest.raises(CompactionError) as error:
+            await policy.prepare(_context(), history, [])
+
+        text = str(error.value)
+        assert "still exceeds" in text
+        assert "input limit is 1900" in text
+        assert "capacity 2000" in text
+        assert "reserve 100" in text
+        assert policy.input_limit_tokens == 1900
+        # One summary attempt only; no second loop.
+        assert len(provider.calls) == 1
     finally:
         await store.aclose()
 

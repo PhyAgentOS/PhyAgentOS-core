@@ -25,6 +25,7 @@ __all__ = [
     "ForgeToolActionStatusTool",
     "ForgeToolCancelActionTool",
     "ForgeToolContextTool",
+    "ForgeToolListTool",
     "ForgeToolQueryTool",
     "ForgeToolSessionResultTool",
     "ForgeToolSessionStatusTool",
@@ -73,6 +74,42 @@ class ForgeToolContextTool(Tool):
     async def execute(self, tool_id: str) -> str:
         payload = await execute_tool_api_tool(
             self.name, self.client, self.coordinator, {"tool_id": tool_id}  # type: ignore[arg-type]
+        )
+        return _dump(payload)
+
+
+class ForgeToolListTool(Tool):
+    """List the live Gateway catalog; discovery never expands the allowlist."""
+
+    def __init__(
+        self,
+        client: ForgeToolClient,
+        coordinator: AgentTaskCoordinator | None = None,
+    ) -> None:
+        self.client = client
+        self.coordinator = coordinator
+
+    @property
+    def name(self) -> str:
+        return _definition("forge_tool_list").name
+
+    @property
+    def description(self) -> str:
+        return _definition("forge_tool_list").description
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return _parameters("forge_tool_list")
+
+    async def execute(self, task_id: str | None = None) -> str:
+        call_arguments: dict[str, Any] = {}
+        if task_id:
+            call_arguments["task_id"] = task_id
+        payload = await execute_tool_api_tool(
+            self.name,
+            self.client,
+            self.coordinator,  # type: ignore[arg-type]
+            call_arguments,
         )
         return _dump(payload)
 
@@ -324,6 +361,7 @@ class ForgeToolStopSessionTool(Tool):
 
 _TOOL_API_CLASSES = {
     "forge_tool_context": ForgeToolContextTool,
+    "forge_tool_list": ForgeToolListTool,
     "forge_tool_query": ForgeToolQueryTool,
     "forge_tool_start_action": ForgeToolStartActionTool,
     "forge_tool_action_status": ForgeToolActionStatusTool,
@@ -345,7 +383,7 @@ def build_forge_tool_api_tools(
     """Build Query/Action/Session wrappers; all mutation requires a Coordinator."""
     del invocation_ids
     if coordinator is None:
-        return [ForgeToolContextTool(client)]
+        return [ForgeToolContextTool(client), ForgeToolListTool(client)]
     tools: list[Tool] = []
     coordinator_only = {
         ForgeToolStartActionTool,
@@ -356,6 +394,8 @@ def build_forge_tool_api_tools(
         tool_class = _TOOL_API_CLASSES[definition.name]
         if tool_class is ForgeToolContextTool:
             tools.append(tool_class(client))
+        elif tool_class is ForgeToolListTool:
+            tools.append(tool_class(client, coordinator))
         elif tool_class in coordinator_only:
             tools.append(tool_class(coordinator))
         else:

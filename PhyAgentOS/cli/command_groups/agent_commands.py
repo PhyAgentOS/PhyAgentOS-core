@@ -59,6 +59,7 @@ from PhyAgentOS.agent.services.turn_budget import TurnBudget, TurnBudgetRegistry
 from PhyAgentOS.agent.services.turn_control import TurnControl
 from PhyAgentOS.agent.services.usage import (
     ContextSnapshot,
+    context_input_limit,
     estimate_context,
     estimate_context_from_conversation,
 )
@@ -92,6 +93,12 @@ def load_agent_config(config_path: str | None, workspace: str | None):
 
 
 def _instructions(config) -> str:
+    """Build the static system text from the workspace files as they are now.
+
+    Callers read this once at each turn start, so a workspace edit applies from
+    the next turn (including a queued or new session) and stays frozen for the
+    turn that already assembled it.
+    """
     parts = [
         "You are PhyAgentOS. Report only observed results; never invent ids, state or "
         "success. Physical execution goes only through the Forge Tool API: activate a "
@@ -100,12 +107,11 @@ def _instructions(config) -> str:
         "success; poll an admitted action to a terminal result before finalizing. Unknown "
         "remote state is never resent automatically, and local cancellation is not "
         "evidence that remote work stopped.",
-        "Query Forge context, ToolSpecs and status instead of guessing. An unresolved "
-        "remote blocker is authoritative across sessions: keep its task/invocation "
-        "identity (None when unconfirmed), do not resend, and do not cancel another "
-        "session's task to bypass it. Omit timeout_ms when the Gateway limit is unknown. "
-        "Respect the user's verification requirement and explain missing evidence; "
-        "execution facts alone do not prove the user's goal.",
+        "Query Forge context, ToolSpecs and status instead of guessing. Do not "
+        "resend an unresolved remote action, and report its task/invocation identity "
+        "when known. Omit timeout_ms when the Gateway limit is unknown. Respect the "
+        "user's verification requirement and explain missing evidence; execution "
+        "facts alone do not prove the user's goal.",
     ]
     # Workspace instructions are data for the model; they cannot affect runtime
     # authorization or move the Forge execution path out of registered tools.
@@ -203,10 +209,20 @@ class _SelectedProvider:
     connection that never produced a stream.
     """
 
-    def __init__(self, selection, context_window, max_tokens, *, notice=None, window_source="configured"):
+    def __init__(
+        self,
+        selection,
+        context_window,
+        max_tokens,
+        *,
+        notice=None,
+        window_source="configured",
+        window_semantics="unknown",
+    ):
         self.selection = selection
         self.context_window = context_window
         self.window_source = window_source
+        self.window_semantics = window_semantics
         self.max_tokens = max_tokens
         self._notice = notice
         self._fallback_notified = False
@@ -220,23 +236,75 @@ class _SelectedProvider:
             and bool(getattr(underlying, "supports_native_stream", True))
         )
 
-    def _check_budget(self, *, messages, tools, model) -> None:
+    def _reply_budget(self, kwargs) -> int:
+        """Use the max_tokens actually sent, not the selection's old default."""
+        value = kwargs.get("max_tokens")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+            return value
+        fallback = self.max_tokens
+        if isinstance(fallback, int) and not isinstance(fallback, bool) and fallback >= 1:
+            return fallback
+        return 0
+
+    def _input_limit(self, reply_budget: int) -> int:
+        limit = context_input_limit(
+            self.context_window, reply_budget, self.window_semantics
+        )
+        return self.context_window if limit is None else limit
+
+    def _check_budget(self, *, messages, tools, model, max_tokens=None) -> None:
         if not self.context_window:
             return
-        estimated, _ = estimate_prompt_tokens_chain(
+        reply_budget = self._reply_budget({"max_tokens": max_tokens})
+        estimated, source = estimate_prompt_tokens_chain(
             self.selection.provider, model, messages, tools
         )
-        if estimated and estimated + self.max_tokens > self.context_window:
+        limit = self._input_limit(reply_budget)
+        if estimated and estimated > limit:
             raise _ContextLimitError(
-                f"Context limit reached (estimated prompt {estimated}, reply budget "
-                f"{self.max_tokens}, limit {self.context_window}). Use /compact to "
-                "summarize older history, or /new to start a new session. No further "
-                "model call was sent."
+                f"Context limit reached (estimated input {estimated}, input limit "
+                f"{limit}, reply budget {reply_budget}, window {self.context_window}, "
+                f"window source {self.window_source}/{self.window_semantics}, "
+                f"estimate source {source}). Use /compact to summarize older "
+                "history, or /new to start a new session. No further model call "
+                "was sent."
             )
+
+    def request_budget_snapshot(self, *, messages, tools, model, max_tokens=None):
+        """Describe the exact local budget this wrapper will enforce.
+
+        The Core loop persists this mapping on ``request.prepared`` so a
+        later failure or status line can be compared with the real send. It
+        uses the same estimator and limit as the guard, never a provider call.
+        """
+        reply_budget = self._reply_budget({"max_tokens": max_tokens})
+        estimated, source = estimate_prompt_tokens_chain(
+            self.selection.provider, model, messages, tools
+        )
+        limit = (
+            self._input_limit(reply_budget) if self.context_window else None
+        )
+        return {
+            "estimated_input": estimated or None,
+            "estimate_source": source if estimated else None,
+            "context_window": self.context_window,
+            "window_source": self.window_source,
+            "window_semantics": self.window_semantics,
+            "reply_budget": reply_budget,
+            "reserve_tokens": (
+                0 if self.window_semantics == "input" else reply_budget
+            ),
+            "input_limit": limit,
+        }
 
     async def chat_with_retry(self, *, messages, tools=None, **kwargs):
         model = kwargs.get("model") or self.selection.model
-        self._check_budget(messages=messages, tools=tools, model=model)
+        self._check_budget(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=kwargs.get("max_tokens"),
+        )
         return await self.selection.provider.chat_with_retry(
             messages=messages, tools=tools, **kwargs
         )
@@ -245,7 +313,12 @@ class _SelectedProvider:
         """Forward one stream with the same budget guard as the blocking path."""
         selected = self.selection
         model = kwargs.get("model") or selected.model
-        self._check_budget(messages=messages, tools=tools, model=model)
+        self._check_budget(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=kwargs.get("max_tokens"),
+        )
         stream = getattr(selected.provider, "chat_stream", None)
         if self.supports_native_stream and callable(stream):
             events = stream(messages=messages, tools=tools, **kwargs)
@@ -390,6 +463,9 @@ class CoreAgentSession:
         # Attached by the composition root; other entries may leave them unset.
         self.catalog: SessionCatalog | None = None
         self.instructions: str = ""
+        # Composition roots attach a live reader so compaction sees the
+        # workspace text as it is now, not the snapshot of the last request.
+        self.instructions_reader = None
         self.config = None
         self._canonical_capabilities = seed.capabilities
         self._slots: dict[str, _SessionSlot] = {}
@@ -633,9 +709,21 @@ class CoreAgentSession:
         reply_budget = getattr(defaults, "max_tokens", None)
         # Same effective window the request guard and status line use.
         window, _window_source = _effective_window(self.config, selection)
+        semantics = getattr(selection, "context_window_semantics", "unknown")
+        reserve_tokens = 0 if semantics == "input" else reply_budget
 
         events = list(await self.raw_store.read_session(session_id))
-        system_text = _last_request_system(events) or self.instructions or None
+        reader = self.instructions_reader
+        # Compaction runs at a turn boundary, so read the workspace rules now
+        # instead of reusing the last request's snapshot. The snapshot remains
+        # the fallback when no live reader was attached.
+        current_instructions = reader() if callable(reader) else None
+        system_text = (
+            current_instructions
+            or _last_request_system(events)
+            or self.instructions
+            or None
+        )
         tools = _last_request_tools(events)
 
         def token_estimator(messages):
@@ -667,7 +755,7 @@ class CoreAgentSession:
             provider_name=selection.name,
             max_tokens=reply_budget,
             context_window_tokens=window,
-            reserve_tokens=reply_budget,
+            reserve_tokens=reserve_tokens,
             token_estimator=token_estimator,
             request_token_estimator=request_token_estimator,
         )
@@ -770,15 +858,25 @@ def _compose_for_selection(
     """
     defaults = config.agents.defaults
     window, window_source = _effective_window(config, selection)
+    window_semantics = getattr(selection, "context_window_semantics", "unknown")
     provider = _SelectedProvider(
-        selection, window, defaults.max_tokens, notice=notice, window_source=window_source
+        selection,
+        window,
+        defaults.max_tokens,
+        notice=notice,
+        window_source=window_source,
+        window_semantics=window_semantics,
     )
     performance = defaults.performance
     context_policy = None
-    if performance.auto_compact and window is not None and window > defaults.max_tokens:
+    # An input-only catalog window already excludes the reply budget. Reserve
+    # it only for a shared or unknown window, where the old conservative
+    # behavior is still the honest choice.
+    reserve_tokens = 0 if window_semantics == "input" else defaults.max_tokens
+    if performance.auto_compact and window is not None and window > reserve_tokens:
         context_policy = ContextPolicy(
             getattr(store, "store", store), selection.provider,
-            model=selection.model, capacity=window, reserve_tokens=defaults.max_tokens,
+            model=selection.model, capacity=window, reserve_tokens=reserve_tokens,
             threshold=performance.compaction_threshold,
             system_instructions=instructions, provider_name=selection.name,
             effort=selection.effort, max_tokens=defaults.max_tokens,
@@ -866,8 +964,9 @@ async def open_core_session(
         except Exception as exc:  # recovery must not make the CLI unusable
             output.error(
                 "Forge startup recovery could not complete "
-                f"({type(exc).__name__}); unresolved remote state stays unknown "
-                "and blocks new AgentTasks until a later reconcile resolves it."
+                f"({type(exc).__name__}); unresolved remote state stays unconfirmed. "
+                "Executions past their recovery deadline are failed locally; other "
+                "session tasks are unaffected."
             )
         documents = SkillDocumentLoader(
             config.workspace_path, runtime_availability_provider=availability
@@ -889,13 +988,21 @@ async def open_core_session(
         display_store = _DisplayStore(store, output)
         skill_capability = SkillAccessCapability(activations)
         forge_capability = ForgeCapability(coordinator, client=client)
-        instructions = _instructions(config)
         notice = getattr(output, "info", None)
         runtimes = SessionRuntimes(service, selected)
         steering = TurnControl()
         budget_registry = TurnBudgetRegistry()
         resources.callback(steering.close)
         session = None
+        latest_instructions = {"text": ""}
+
+        def read_instructions() -> str:
+            """Read the workspace rules at the moment a turn (or seed) starts."""
+            text = _instructions(config)
+            latest_instructions["text"] = text
+            if session is not None:
+                session.instructions = text
+            return text
 
         def tool_selection(session_id):
             if session is None:
@@ -982,13 +1089,25 @@ async def open_core_session(
         )
 
         def build(selection: RuntimeSelection) -> AgentAssembly:
+            # Called once per turn, when the turn really starts (not when its
+            # submit was queued). The returned assembly freezes this text for
+            # the turn, so later edits apply from the next turn.
+            expire = getattr(coordinator, "expire_timed_out_unknowns", None)
+            if callable(expire):
+                # Settle unknown executions whose recovery deadline passed so a
+                # stale slot does not outlive this turn's start. Maintenance must
+                # not prevent the turn from assembling.
+                try:
+                    expire()
+                except Exception:
+                    pass
             return _compose_for_selection(
                 selection,
                 config=config,
                 store=display_store,
                 coordinator=coordinator,
                 client=client,
-                instructions=instructions,
+                instructions=read_instructions(),
                 skill_capability=skill_capability,
                 forge_capability=forge_capability,
                 additional_capabilities=tool_capabilities,
@@ -1014,10 +1133,25 @@ async def open_core_session(
             await seed.host.aclose()
             raise
         session.catalog = catalog
-        session.instructions = instructions
+        session.instructions = latest_instructions["text"]
+        session.instructions_reader = read_instructions
         session.config = config
         resources.push_async_callback(session.aclose)
         yield session
+
+
+def _turn_is_running(events) -> bool:
+    """True while the last turn has not reached a terminal event."""
+    for event in reversed(events):
+        if event.type in (
+            EventType.TURN_COMPLETED,
+            EventType.TURN_FAILED,
+            EventType.TURN_INTERRUPTED,
+        ):
+            return False
+        if event.type is EventType.TURN_STARTED:
+            return True
+    return False
 
 
 def _project_request_messages(messages):
@@ -1168,8 +1302,67 @@ class _ContextStatus:
         self._system[session_id] = self._system_text(events)
 
     def _system_text(self, events) -> str | None:
-        """Keep the status line on the same system prompt the model receives."""
-        return _last_request_system(events) or getattr(self._session, "instructions", "") or None
+        """Use the rules in force now, but keep the last request as a fallback.
+
+        A workspace edit changes the system text before the next turn starts.
+        The live reader (attached by the composition root) is therefore the
+        first choice; the last prepared request still supplies capability and
+        runtime text that the static files do not contain.
+        """
+        last_system = _last_request_system(events)
+        reader = getattr(self._session, "instructions_reader", None)
+        current = None
+        if callable(reader):
+            try:
+                current = reader()
+            except Exception:
+                current = None
+        if not current:
+            current = getattr(self._session, "instructions", "") or None
+        if current and last_system and current not in last_system:
+            return current
+        return last_system or current or None
+
+    def _reply_budget(self, events, selection, covers=None) -> int | None:
+        """The output budget of the next send, without mixing in a stale model.
+
+        A ``request.prepared`` snapshot is the durable record of the last real
+        send. It may name another model if this session switched models since;
+        that budget still applies to the *next* turn only when the model is the
+        same. Otherwise the current configured default is the honest answer.
+        A request already represented by a checkpoint is not the current send.
+        """
+        config = getattr(self._session, "config", None)
+        defaults = getattr(getattr(config, "agents", None), "defaults", None)
+        configured = getattr(defaults, "max_tokens", None)
+        reverted = reverted_turn_ids(events)
+        current_model = getattr(selection, "model", None)
+        for event in reversed(events):
+            if event.type is not EventType.REQUEST_PREPARED:
+                continue
+            if event.turn_id is not None and event.turn_id in reverted:
+                continue
+            if (
+                covers is not None
+                and event.sequence is not None
+                and event.sequence <= covers
+            ):
+                continue
+            payload = event.payload
+            prepared_model = payload.get("model")
+            if (
+                isinstance(prepared_model, str)
+                and prepared_model
+                and isinstance(current_model, str)
+                and current_model
+                and prepared_model != current_model
+            ):
+                return configured
+            value = payload.get("max_tokens")
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+                return value
+            return configured
+        return configured
 
     def ingest(self, event) -> None:
         self._events.setdefault(event.session_id, []).append(event)
@@ -1205,10 +1398,23 @@ class _ContextStatus:
     def snapshot(self, session_id: str) -> ContextSnapshot:
         selection = self._session.sessions.get(session_id)
         capacity, window_source = _effective_window(getattr(self._session, "config", None), selection)
-        system_text = self._system.get(session_id)
-        if system_text is None:
-            system_text = self._system_text(self._events.get(session_id, []))
+        window_semantics = getattr(selection, "context_window_semantics", "unknown")
         events = self._events.get(session_id, [])
+        last_system = _last_request_system(events)
+        system_text = self._system.get(session_id)
+        if system_text is None or not _turn_is_running(events):
+            # Between turns the files may have changed; re-read once per status
+            # refresh so the next request is measured with the rules in force.
+            fresh = self._system_text(events)
+            if fresh is not None:
+                system_text = fresh
+                self._system[session_id] = fresh
+        # A workspace edit makes the old prepared system text and its provider
+        # count describe a different request. Prefer the current rules and do
+        # not call that old count exact.
+        rules_changed = bool(
+            last_system and system_text and system_text != last_system
+        )
         # Prefer the exact prepared request: it already carries the assembler's
         # request projection (deduplicated Skill docs, projected tool results)
         # and the visible tool set. Raw events remain the replay source.
@@ -1218,7 +1424,8 @@ class _ContextStatus:
             if event.type is EventType.REQUEST_PREPARED and event.sequence is not None
         ]
         covers = self._checkpoint_covers.get(session_id)
-        prepared_is_current = bool(prepared_sequences) and (
+        reply_budget = self._reply_budget(events, selection, covers)
+        prepared_is_current = bool(prepared_sequences) and not rules_changed and (
             covers is None or max(prepared_sequences) > covers
         )
         if prepared_is_current:
@@ -1229,6 +1436,8 @@ class _ContextStatus:
                 capacity=capacity,
                 capacity_source=window_source,
                 instructions=system_text,
+                reply_budget=reply_budget,
+                capacity_kind=window_semantics,
             )
         conversation = self._conversation.get(session_id)
         if conversation is not None:
@@ -1240,6 +1449,8 @@ class _ContextStatus:
                 model=selection.model,
                 capacity=capacity,
                 capacity_source=window_source,
+                reply_budget=reply_budget,
+                capacity_kind=window_semantics,
             )
         return estimate_context(
             events,
@@ -1247,7 +1458,11 @@ class _ContextStatus:
             model=selection.model,
             capacity=capacity,
             capacity_source=window_source,
+            reply_budget=reply_budget,
+            capacity_kind=window_semantics,
             instructions=system_text,
+            allow_provider_usage=not rules_changed,
+            replace_system=system_text if rules_changed else None,
         )
 
 

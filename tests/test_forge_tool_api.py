@@ -308,7 +308,7 @@ def test_mutating_tools_are_not_registered_without_a_coordinator() -> None:
     )
     names = {tool.name for tool in build_forge_tool_api_tools(client)}
 
-    assert names == {"forge_tool_context"}
+    assert names == {"forge_tool_context", "forge_tool_list"}
     assert not names & {
         "forge_execute_task",
         "forge_get_session",

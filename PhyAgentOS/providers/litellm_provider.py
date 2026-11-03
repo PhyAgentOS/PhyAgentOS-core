@@ -433,6 +433,9 @@ class LiteLLMProvider(LLMProvider):
         direct endpoints return ``None`` because their real limit is not in the
         catalog. This performs no API request and never probes the endpoint.
         """
+        return self._catalog_context_window(model)
+
+    def _catalog_context_window(self, model: str | None = None) -> int | None:
         target = (model or self.default_model or "").strip()
         if not target:
             return None

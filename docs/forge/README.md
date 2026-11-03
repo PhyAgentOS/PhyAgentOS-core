@@ -32,6 +32,14 @@ A ToolSpec declares stable identity, implementation/Endpoint binding, operation,
 semantics, strict input/output schema, readiness, and robot frame profile. Context is read live
 before invocation; callers do not infer frame, unit, readiness, or binding.
 
+`forge_tool_list` performs a live `GET /tools` read and copies the Gateway's `data` object unchanged
+into `data.catalog`; `data.source` records the endpoint, the pinned runtime/client and the read time.
+The catalog shape is not reinterpreted. An optional `task_id` adds a read-only `binding` view with
+that AgentTask's frozen allowlist; discovery never creates or expands an allowlist.
+
+`forge_tool_context` pins one runtime/client for both the ToolSpec and context GETs and returns the
+same `data.source` provenance. The two GETs are independent requests, not one atomic snapshot.
+
 ## 3. Query contract
 
 `forge_tool_query` reads the configured ToolSpec, verifies `semantics=query`, then invokes:
@@ -94,6 +102,7 @@ also accounts for all active Sessions.
 | Tool | Contract |
 |:-----|:---------|
 | `forge_tool_context` | Read ToolSpec and live context. |
+| `forge_tool_list` | Read the live `GET /tools` catalog; optional `task_id` reports that task's frozen allowlist. |
 | `forge_tool_query` | Invoke synchronous Query; diagnostic without a task or governed with `task_id`. |
 | `forge_tool_start_action` | Admit an asynchronous Action for a bound `task_id`. |
 | `forge_tool_action_status` | Read invocation phase/status. |
@@ -101,7 +110,7 @@ also accounts for all active Sessions.
 | `forge_tool_cancel_action` | Request cancellation without asserting stop. |
 | `forge_tool_start_session` | Admit a bound Session with explicit ownership. |
 | `forge_tool_session_status/result/stop_session` | Reconcile or stop an owned Session. |
-| `forge_task_create` | Create the one active AgentTask and revision 1. |
+| `forge_task_create` | Create this session's next AgentTask and revision 1. |
 | `forge_task_get` | Read task, revisions, Tool records, evidence, and verdict. |
 | `forge_task_begin_revision` | Append a revision after an allowed recovery verdict. |
 | `forge_task_finalize` | Capture after evidence and apply aggregate task verification. |
@@ -132,9 +141,19 @@ Correlation is explicit. IDs are not aliases and are not derived from one anothe
 
 ## 8. AgentTask model
 
-Only one AgentTask may be non-terminal globally; diagnostic Query does not occupy the slot. Creation and
-updates use SQLite WAL and immediate transactions. A task contains an append-only list of
+Each origin session (or the unbound slot) has at most one non-terminal AgentTask; diagnostic Query
+does not occupy that slot, and different sessions create independently. When the session's only
+unfinished work is an Action/Session invocation still marked `unknown`, creating a
+new task closes the old local task as failed and keeps the unknown execution record; it does not
+reclassify or resolve remote state. An `unknown` record also carries a recovery deadline
+(`forge.unknownRecoveryTimeoutS`, 3600 seconds by default), set once when it first becomes unknown
+and never extended by polling or a restart. Past that deadline the execution is failed locally with
+`RecoveryTimeout`, the session slot is released, and the remote outcome stays unconfirmed. Creation
+and updates use SQLite WAL and immediate transactions.
+A task contains an append-only list of
 PlanRevisions. Each revision contains Tool records, a semantic verdict, and verification attempts.
+PAOS serializes task admission per origin session; whether a real operation is already busy remains
+a Gateway decision.
 
 ```text
 executing

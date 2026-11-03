@@ -100,6 +100,7 @@ _FORGE_RESULT_TOOLS = frozenset(
         "forge_task_begin_revision",
         "forge_task_finalize",
         "forge_tool_context",
+        "forge_tool_list",
         "forge_tool_query",
         "forge_tool_action_status",
         "forge_tool_action_result",
@@ -206,6 +207,33 @@ def _contains_unsafe_state(node: Any, depth: int = 0) -> bool:
     return False
 
 
+def _forge_result_dedup_content(
+    name: str, payload: Mapping[str, Any], content: str
+) -> str:
+    """Return the identity text used only for duplicate detection.
+
+    Live catalog/context reads carry ``data.source.read_at``. That timestamp
+    changes on every call, but it does not make two otherwise identical results
+    different observations for prompt compaction. Ignore only that field when
+    comparing; the kept result and the marker still use the original content.
+    """
+    if name not in {"forge_tool_context", "forge_tool_list"}:
+        return content
+    data = payload.get("data")
+    source = data.get("source") if isinstance(data, Mapping) else None
+    if not isinstance(source, Mapping) or "read_at" not in source:
+        return content
+    normalized = copy.deepcopy(payload)
+    normalized_data = normalized.get("data")
+    normalized_source = (
+        normalized_data.get("source") if isinstance(normalized_data, dict) else None
+    )
+    if not isinstance(normalized_source, dict):
+        return content
+    normalized_source.pop("read_at", None)
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
 def project_forge_tool_results(
     messages: list[dict[str, Any]], *, keep_earliest: bool = False
 ) -> int:
@@ -220,9 +248,15 @@ def project_forge_tool_results(
     replaced copy keeps only the full hash marker, and only when that
     serialization is strictly shorter than the text it replaces; short results
     are left verbatim.
+
+    For ``forge_tool_context`` and ``forge_tool_list`` the live ``read_at``
+    field is ignored when deciding whether two results are duplicates, so a
+    repeated unchanged read still compacts. The retained copy keeps its real
+    timestamp.
     """
     kept: dict[tuple[str, str], int] = {}
     candidates: dict[int, tuple[str, str]] = {}
+    keys: dict[int, tuple[str, str]] = {}
     for index, message in enumerate(messages):
         name = message.get("name")
         content = message.get("content")
@@ -236,8 +270,12 @@ def project_forge_tool_results(
         if _contains_unsafe_state(payload):
             continue
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        key = (name, digest)
+        identity = hashlib.sha256(
+            _forge_result_dedup_content(name, payload, content).encode("utf-8")
+        ).hexdigest()
+        key = (name, identity)
         candidates[index] = (name, digest)
+        keys[index] = key
         if keep_earliest:
             kept.setdefault(key, index)
         else:
@@ -245,7 +283,7 @@ def project_forge_tool_results(
 
     replaced = 0
     for index, (name, digest) in candidates.items():
-        if kept[(name, digest)] == index:
+        if kept[keys[index]] == index:
             continue
         marker = "duplicate_of_earlier_result" if keep_earliest else "duplicate_of_later_result"
         replacement = json.dumps(

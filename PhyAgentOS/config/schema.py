@@ -323,6 +323,10 @@ class ForgeConfig(Base):
     request_timeout_s: float = Field(default=10.0, gt=0)
     poll_interval_s: float = Field(default=0.5, ge=0.1, le=5.0)
     execution_timeout_s: float = Field(default=300.0, gt=0)
+    # How long an Action/Session may stay ``unknown`` before PAOS settles this
+    # execution as a local failure. The deadline is set when the record first
+    # becomes unknown and is never extended; the remote state stays unconfirmed.
+    unknown_recovery_timeout_s: float = Field(default=3600.0, gt=0)
     evidence: ForgeEvidenceConfig = Field(default_factory=ForgeEvidenceConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
 

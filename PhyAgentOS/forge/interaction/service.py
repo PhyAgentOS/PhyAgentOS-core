@@ -20,6 +20,8 @@ SAFE_TOOLS = frozenset(
         "forge_task_cancel",
         "forge_task_finalize",
         "forge_task_begin_revision",
+        "forge_tool_context",
+        "forge_tool_list",
         "forge_tool_start_session",
         "forge_tool_session_status",
         "forge_tool_session_result",

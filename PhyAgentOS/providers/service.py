@@ -95,6 +95,11 @@ class RuntimeSelection(ProviderSelection):
     # What the provider's local metadata reported, when it reported anything.
     # Kept so a configured cap can be shown without re-querying the provider.
     model_context_window_tokens: int | None = None
+    # "input" when the effective window counts input only (a catalog
+    # max_input_tokens), "total" when it genuinely shares input+output, and
+    # "unknown" when no local metadata proves either. Unknown keeps the
+    # conservative shared-window calculation; it is never guessed.
+    context_window_semantics: str = "unknown"
 
 
 _MAX_PLAUSIBLE_MODEL_CONTEXT_WINDOW = 16_000_000
@@ -413,6 +418,12 @@ class ProviderService:
         context_window_tokens, context_window_source = compose_context_capacity(
             reported=reported, configured=defaults.context_window_tokens
         )
+        semantics = "unknown"
+        if context_window_source == "model":
+            reader = getattr(provider, "get_context_window_semantics", None)
+            declared = reader(selection.model) if callable(reader) else None
+            if declared in {"input", "total"}:
+                semantics = declared
         return RuntimeSelection(
             selection.name,
             selection.model,
@@ -422,6 +433,7 @@ class ProviderService:
             context_window_tokens,
             context_window_source,
             reported,
+            semantics,
         )
 
     @staticmethod
@@ -574,6 +586,10 @@ class SessionRuntimes:
         if command == "/status":
             capacity = current.context_window_tokens
             detail = context_window_source_label(current.context_window_source)
+            if current.context_window_semantics == "input":
+                detail = f"{detail}; input-only window"
+            elif current.context_window_semantics == "unknown":
+                detail = f"{detail}; input+output sharing unverified, reply budget reserved"
             if current.model_context_window_tokens is not None:
                 detail = f"{detail}; model reports {current.model_context_window_tokens}"
             return (

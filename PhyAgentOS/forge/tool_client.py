@@ -19,16 +19,20 @@ class ForgeToolAPIError(RuntimeError):
         error_code: str | None = None,
         retryable: bool | None = None,
         payload: dict[str, Any] | None = None,
+        dispatched: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error_code = error_code
         self.retryable = retryable
         self.payload = payload
+        # False only when the transport provably never sent the request;
+        # None means the outcome (or the fact of dispatch) is unknown.
+        self.dispatched = dispatched
 
 
 class ForgeToolAPITimeoutError(ForgeToolAPIError):
-    """The HTTP exchange timed out; remote execution state is not implied."""
+    """An HTTP timeout; whether the request reached the Gateway depends on its kind."""
 
 
 class ForgeToolClient:
@@ -149,10 +153,19 @@ class ForgeToolClient:
         caller_id: str | None = None,
     ) -> dict[str, Any]:
         """Start a Gateway Session; Sessions deliberately have no deadline."""
-        tool = await self.get_tool(tool_id)
+        try:
+            tool = await self.get_tool(tool_id)
+        except ForgeToolAPIError as exc:
+            # The invoke POST has not been built yet, so nothing was dispatched.
+            exc.dispatched = False
+            raise
         spec = tool.get("data")
         if not isinstance(spec, dict) or spec.get("semantics") != "session":
-            raise ForgeToolAPIError(f"Forge Tool {tool_id!r} is not a Session", payload=tool)
+            raise ForgeToolAPIError(
+                f"Forge Tool {tool_id!r} is not a Session",
+                payload=tool,
+                dispatched=False,
+            )
         return await self._request(
             "POST",
             f"/tools/{_path_component(tool_id, 'tool_id')}:invoke",
@@ -206,12 +219,31 @@ class ForgeToolClient:
         try:
             response = await self._client.request(method, path, json=payload)
         except httpx.TimeoutException as exc:
+            # ConnectTimeout and PoolTimeout happen while establishing or
+            # acquiring a connection, so no request bytes were sent. A read or
+            # write timeout cannot prove that, so it stays unknown.
+            before_dispatch = isinstance(
+                exc, (httpx.ConnectTimeout, httpx.PoolTimeout)
+            )
             raise ForgeToolAPITimeoutError(
-                f"Forge Gateway Tool API {method} {path} timed out; remote state is unknown"
+                f"Forge Gateway Tool API {method} {path} timed out; "
+                + (
+                    "the request was not sent and remote state is unchanged"
+                    if before_dispatch
+                    else "remote state is unknown"
+                ),
+                dispatched=False if before_dispatch else None,
             ) from exc
         except httpx.HTTPError as exc:
+            before_dispatch = isinstance(exc, httpx.ConnectError)
             raise ForgeToolAPIError(
                 f"Forge Gateway Tool API {method} {path} transport failed: {exc}"
+                + (
+                    "; the request was not sent and remote state is unchanged"
+                    if before_dispatch
+                    else ""
+                ),
+                dispatched=False if before_dispatch else None,
             ) from exc
 
         data = _decode_object(response, path)

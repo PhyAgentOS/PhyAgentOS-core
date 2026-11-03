@@ -26,6 +26,7 @@ from .command_groups.gateway_commands import register_gateway_commands
 from .command_groups.provider_commands import register_provider_commands
 from .command_groups.skill_commands import register_skill_commands
 from .command_groups.system_commands import register_system_commands
+from .command_groups.workspace_commands import register_workspace_commands
 
 app = typer.Typer(
     name="paos",
@@ -62,6 +63,7 @@ register_skill_commands(app)
 register_forge_node_commands(app)
 register_channel_commands(app)
 register_provider_commands(app)
+register_workspace_commands(app)
 
 
 if __name__ == "__main__":

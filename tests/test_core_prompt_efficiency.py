@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from PhyAgentOS.agent.core.prompt import (
     PromptAssemblerImpl,
     project_forge_tool_results,
@@ -531,6 +533,51 @@ def test_cache_stable_forge_dedup_keeps_earliest_and_safety() -> None:
     assert messages[2]["content"] == unsafe
 
 
+def test_live_forge_read_at_does_not_prevent_identical_result_dedup() -> None:
+    import hashlib
+
+    def message(call_id: str, read_at: str, ready: bool = True) -> dict:
+        payload = {
+            "ok": True,
+            "data": {
+                "tool": {"tool_id": "demo.tool"},
+                "context": {"tool_id": "demo.tool", "ready": ready},
+                "source": {
+                    "kind": "live_gateway",
+                    "snapshot": "not_atomic_two_independent_get_requests",
+                    "read_at": read_at,
+                    "runtime": None,
+                },
+                "blob": "Z" * 400,
+            },
+        }
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": "forge_tool_context",
+            "content": json.dumps(payload),
+        }
+
+    first = message("c1", "2026-11-03T00:00:00+00:00")
+    second = message("c2", "2026-11-03T00:00:01+00:00")
+    first_content = first["content"]
+    messages = [first, second]
+
+    assert project_forge_tool_results(messages) == 1
+    assert messages[1]["content"] == second["content"]
+    marker = json.loads(messages[0]["content"])
+    assert marker["duplicate_of_later_result"]["sha256"] == hashlib.sha256(
+        first_content.encode("utf-8")
+    ).hexdigest()
+
+    # A real context change is still a different result and stays full.
+    changed = message("c3", "2026-11-03T00:00:02+00:00", ready=False)
+    messages = [second, changed]
+    assert project_forge_tool_results(messages) == 0
+    assert messages[0]["content"] == second["content"]
+    assert messages[1]["content"] == changed["content"]
+
+
 def test_cache_stable_skill_versions_keep_separate_full_bodies() -> None:
     from PhyAgentOS.agent.core.prompt import project_skill_documents
 
@@ -644,3 +691,321 @@ def test_runtime_block_carries_standard_name_and_user_copy_is_preserved() -> Non
     assert replayed.messages[1].get("name") is None
     assert is_runtime_context_message(replayed.messages[-1])
     assert replayed.messages[-1]["name"] == "paos_runtime_context"
+
+
+# -- request budget guard ------------------------------------------------
+
+
+class _FixedCounterProvider:
+    def __init__(self, tokens: int, *, answer="ok") -> None:
+        self.tokens = tokens
+        self.answer = answer
+        self.calls = 0
+
+    def estimate_prompt_tokens(self, messages, tools, model):
+        self.calls += 1
+        return self.tokens, "test_counter"
+
+    async def chat_with_retry(self, **kwargs):
+        return self.answer
+
+    async def chat_stream(self, **kwargs):
+        yield {"type": "done", "finish_reason": "stop"}
+
+
+def test_guard_rejects_8520_with_16384_window_and_8192_reply_budget() -> None:
+    from types import SimpleNamespace
+
+    from PhyAgentOS.cli.command_groups.agent_commands import (
+        _ContextLimitError,
+        _SelectedProvider,
+    )
+
+    selection = SimpleNamespace(
+        provider=_FixedCounterProvider(8520), model="fake-model"
+    )
+    provider = _SelectedProvider(
+        selection, 16384, 8192, window_source="configured"
+    )
+    with pytest.raises(_ContextLimitError) as error:
+        asyncio.run(
+            provider.chat_with_retry(
+                messages=[{"role": "user", "content": "x"}],
+                max_tokens=8192,
+            )
+        )
+    text = str(error.value)
+    assert "estimated input 8520" in text
+    assert "input limit 8192" in text
+    assert "reply budget 8192" in text
+    assert "window 16384" in text
+    assert "test_counter" in text
+
+
+def test_guard_accepts_the_exact_input_limit_and_rejects_one_token_more() -> None:
+    from types import SimpleNamespace
+
+    from PhyAgentOS.cli.command_groups.agent_commands import (
+        _ContextLimitError,
+        _SelectedProvider,
+    )
+
+    def call(tokens):
+        selection = SimpleNamespace(
+            provider=_FixedCounterProvider(tokens), model="fake-model"
+        )
+        provider = _SelectedProvider(selection, 16384, 8192)
+        return asyncio.run(
+            provider.chat_with_retry(
+                messages=[{"role": "user", "content": "x"}], max_tokens=8192
+            )
+        )
+
+    assert call(8192) == "ok"
+    with pytest.raises(_ContextLimitError):
+        call(8193)
+
+
+def test_guard_uses_the_request_max_tokens_not_the_selection_default() -> None:
+    from types import SimpleNamespace
+
+    from PhyAgentOS.cli.command_groups.agent_commands import _SelectedProvider
+
+    selection = SimpleNamespace(
+        provider=_FixedCounterProvider(8520), model="fake-model"
+    )
+    provider = _SelectedProvider(selection, 16384, 8192)
+    assert (
+        asyncio.run(
+            provider.chat_with_retry(
+                messages=[{"role": "user", "content": "x"}], max_tokens=4096
+            )
+        )
+        == "ok"
+    )
+
+
+def test_fallback_65536_allows_a_52_percent_request() -> None:
+    from types import SimpleNamespace
+
+    from PhyAgentOS.cli.command_groups.agent_commands import _SelectedProvider
+
+    selection = SimpleNamespace(
+        provider=_FixedCounterProvider(34078), model="fake-model"
+    )
+    provider = _SelectedProvider(
+        selection, 65536, 8192, window_source="fallback"
+    )
+    assert (
+        asyncio.run(
+            provider.chat_with_retry(
+                messages=[{"role": "user", "content": "x"}], max_tokens=8192
+            )
+        )
+        == "ok"
+    )
+
+
+def test_blocking_and_streaming_share_one_budget_rule() -> None:
+    from types import SimpleNamespace
+
+    from PhyAgentOS.cli.command_groups.agent_commands import (
+        _ContextLimitError,
+        _SelectedProvider,
+    )
+
+    async def consume(stream):
+        async for _event in stream:
+            pass
+
+    selection = SimpleNamespace(
+        provider=_FixedCounterProvider(8520), model="fake-model"
+    )
+    provider = _SelectedProvider(selection, 16384, 8192)
+    with pytest.raises(_ContextLimitError):
+        asyncio.run(
+            provider.chat_with_retry(
+                messages=[{"role": "user", "content": "x"}], max_tokens=8192
+            )
+        )
+    with pytest.raises(_ContextLimitError):
+        asyncio.run(
+            consume(
+                provider.chat_stream(
+                    messages=[{"role": "user", "content": "x"}], max_tokens=8192
+                )
+            )
+        )
+
+
+def test_request_budget_snapshot_matches_the_guard_numbers() -> None:
+    from types import SimpleNamespace
+
+    from PhyAgentOS.cli.command_groups.agent_commands import _SelectedProvider
+
+    selection = SimpleNamespace(
+        provider=_FixedCounterProvider(8520), model="fake-model"
+    )
+    provider = _SelectedProvider(
+        selection, 16384, 8192, window_source="fallback"
+    )
+    budget = provider.request_budget_snapshot(
+        messages=[{"role": "user", "content": "x"}],
+        tools=None,
+        model="fake-model",
+        max_tokens=4096,
+    )
+    assert budget["estimated_input"] == 8520
+    assert budget["context_window"] == 16384
+    assert budget["window_source"] == "fallback"
+    assert budget["reply_budget"] == 4096
+    assert budget["reserve_tokens"] == 4096
+    assert budget["input_limit"] == 12288
+
+    input_only = _SelectedProvider(
+        selection, 16384, 8192, window_semantics="input"
+    )
+    budget = input_only.request_budget_snapshot(
+        messages=[{"role": "user", "content": "x"}],
+        tools=None,
+        model="fake-model",
+        max_tokens=4096,
+    )
+    assert budget["reserve_tokens"] == 0
+    assert budget["input_limit"] == 16384
+
+
+def test_prepared_payload_carries_the_request_budget() -> None:
+    from types import SimpleNamespace
+
+    from PhyAgentOS.agent.core.loop import _prepared_payload
+    from PhyAgentOS.agent.core.model import ModelAdapter
+    from PhyAgentOS.agent.core.types import ModelRequest
+    from PhyAgentOS.cli.command_groups.agent_commands import _SelectedProvider
+
+    selection = SimpleNamespace(
+        provider=_FixedCounterProvider(8520), model="fake-model"
+    )
+    provider = _SelectedProvider(selection, 16384, 8192)
+    adapter = ModelAdapter(provider, stream=False)
+    request = ModelRequest(
+        "m1",
+        ({"role": "user", "content": "x"},),
+        model="fake-model",
+        max_tokens=4096,
+    )
+    budget = adapter.request_budget(request)
+    assert budget is not None
+    payload = _prepared_payload(request, budget)
+    assert payload["request_budget"]["estimated_input"] == 8520
+    assert payload["request_budget"]["input_limit"] == 12288
+    assert payload["request_budget"]["reply_budget"] == 4096
+
+
+def test_status_reply_budget_does_not_reuse_a_prepared_request_from_another_model() -> None:
+    from types import SimpleNamespace
+
+    from PhyAgentOS.agent.core.events import EventType, RuntimeEvent
+    from PhyAgentOS.cli.command_groups.agent_commands import _ContextStatus
+
+    events = [
+        RuntimeEvent(
+            type=EventType.REQUEST_PREPARED,
+            session_id="s",
+            turn_id="t",
+            step_id="t:step:1",
+            payload={"model_call_id": "m", "model": "old-model", "max_tokens": 8192},
+        )
+    ]
+    session = SimpleNamespace(
+        config=SimpleNamespace(
+            agents=SimpleNamespace(defaults=SimpleNamespace(max_tokens=4096))
+        ),
+        instructions="SYS",
+        raw_store=None,
+        sessions=SimpleNamespace(get=lambda session_id: _selection(32768)),
+    )
+    status = _ContextStatus(session, None)
+    status._events["s"] = events
+    assert status._reply_budget(events, _selection(32768)) == 4096
+    same_model = [
+        RuntimeEvent(
+            type=EventType.REQUEST_PREPARED,
+            session_id="s",
+            turn_id="t",
+            step_id="t:step:1",
+            payload={"model_call_id": "m", "model": "fake-model", "max_tokens": 8192},
+        )
+    ]
+    assert status._reply_budget(same_model, _selection(32768)) == 8192
+
+
+def test_edited_rules_make_the_old_provider_usage_an_estimate_not_the_send(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import PhyAgentOS.agent.services.usage as usage
+    from PhyAgentOS.agent.core.events import EventType, RuntimeEvent
+    from PhyAgentOS.cli.command_groups.agent_commands import _ContextStatus
+
+    seen = {}
+
+    def estimate(provider, model, messages, tools=None):
+        seen["messages"] = messages
+        return 1234, "tiktoken"
+
+    monkeypatch.setattr(usage, "estimate_prompt_tokens_chain", estimate)
+
+    messages = [
+        {"role": "system", "content": "OLD RULES"},
+        {"role": "user", "content": "hi"},
+    ]
+    events = [
+        RuntimeEvent(
+            type=EventType.REQUEST_PREPARED,
+            session_id="s",
+            turn_id="t",
+            step_id="t:step:1",
+            payload={
+                "model_call_id": "m",
+                "model": "fake-model",
+                "messages": messages,
+                "tools": [],
+            },
+        ),
+        RuntimeEvent(
+            type=EventType.MODEL_ATTEMPT_COMPLETED,
+            session_id="s",
+            turn_id="t",
+            step_id="t:step:1",
+            payload={
+                "model_call_id": "m",
+                "content": "hello",
+                "usage": {"prompt_tokens": 500},
+            },
+        ),
+    ]
+    session = SimpleNamespace(
+        config=SimpleNamespace(
+            agents=SimpleNamespace(defaults=SimpleNamespace(max_tokens=4096))
+        ),
+        instructions="NEW RULES",
+        raw_store=None,
+        sessions=SimpleNamespace(get=lambda session_id: _selection(32768)),
+    )
+    status = _ContextStatus(session, None)
+    status._events["s"] = events
+    snapshot = status.snapshot("s")
+    assert snapshot.exact is False
+    assert snapshot.tokens == 1234
+    assert snapshot.tokens_source != "provider_usage"
+    # The actual measured messages carry the new rules, not only a flag.
+    assert any(
+        message.get("role") == "system" and message.get("content") == "NEW RULES"
+        for message in seen["messages"]
+    )
+    assert all(
+        message.get("content") != "OLD RULES" for message in seen["messages"]
+    )
+    assert "last request usage" not in snapshot.label()

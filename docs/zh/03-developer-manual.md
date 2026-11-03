@@ -41,7 +41,7 @@
 | `cli/legacy/legacy_agent.py`、`cli/legacy/legacy_support.py`、`cli/legacy/legacy_gateway.py` | 旧的 `paos agent --runtime legacy`、其终端交互、旧 prompt 会话 helper，以及 `paos gateway --runtime legacy` 选中的旧 gateway |
 | `cli/interaction/interactive_session.py`、`cli/interaction/agent_output.py`、`cli/interaction/terminal_input.py`、`cli/interaction/terminal_display.py`、`cli/interaction/model_picker.py` | Core 的输入调度与取消、消息展示、终端输入、实时状态与工具区，以及 provider/model/effort 选择器 |
 | `agent_legacy/loop.py` | 现有 Agent Loop、通用工具、动态 MCP、Forge tools 注册、上下文与生命周期 |
-| `agent_legacy/tools/forge_tool_api.py` | 十个 Gateway Tool API 工具的兼容 wrapper |
+| `agent_legacy/tools/forge_tool_api.py` | 十一个 Gateway Tool API 工具的兼容 wrapper |
 | `agent_legacy/tools/forge_task.py` | 五个 AgentTask 生命周期工具的兼容 wrapper |
 | `forge/tool_client.py` | 严格异步 HTTP client 与响应校验 |
 | `forge/binding.py`、`forge/task.py` | 不可变 Runtime/ToolSpec binding、AgentTask model/store、证据、验证与恢复 |
@@ -65,16 +65,20 @@ Timeout 形成 unknown record，恢复不会重复 POST。
 
 公开的 Agent 工具清单统一维护在 [API 契约](../forge/README_zh.md#6-agent-tools)。工具名、描述、JSON Schema 与操作位于 `agent/capabilities/forge_tool_api.py` 和 `agent/capabilities/forge_task_tools.py`；`agent_legacy/tools/` 只保留兼容 wrapper。传输处理放在 `forge/tool_client.py`，任务协调放在 `forge/task.py`。
 
+`forge_tool_list` 把实时 `GET /tools` 返回的 data 对象原样放进 `data.catalog`，并在 `data.source`
+记录 endpoint、固定使用的 runtime/client 与读取时间。可选 `task_id` 只追加冻结 allowlist
+视图，不会创建或扩大 allowlist。
+
 Core 路径还注册 `agent/capabilities/skill_access_capability.py` 提供的 `activate_skill`。它读取已注册的 Skill 文档并返回本轮有效的 `activation_id`；不启动 Skill runtime，也不属于 Forge 工具。
 
 诊断 Query 与绑定调用使用相同 HTTP 方法；每个变更或任务归因 wrapper 都在网络访问前校验
 ownership 与冻结 binding。Tool wrapper 不能自行生成 Gateway identity 或 result。
 
 可选 `timeout_ms` 不由 Agent 填默认值：Gateway 上限未知时模型省略该字段，由 Gateway 用自己
-的默认超时。HTTP client timeout 是另一项设置，不能拿它代替。Core 的 prompt fragment 每步从
-coordinator 实时读取全 workspace 的未解决 Action/Session blocker，只给 task/invocation 身份、
-状态和 semantics；本 session 的 `succeeded` 不会掩盖更早的 unknown，`None` 表示 Gateway 身份
-从未确认。它只说明当前阻塞，不代表已经解决。
+的默认超时。HTTP client timeout 是另一项设置，不能拿它代替。Core 的 prompt fragment 只报告
+本 session 最新的非终态 AgentTask；其他 session 的任务状态和已完成历史都属于 store 事实，
+不是提示词材料，需要时可用 `forge_task_get` 显式读取。新回合的提示词不会注入其他
+session 的任务内容。
 
 ## 5. AgentTask 契约与事务
 
@@ -82,8 +86,14 @@ coordinator 实时读取全 workspace 的未解决 Action/Session blocker，只�
 PlanRevision、evidence refs、verification attempts、取消状态和时间戳。每个 PlanRevision 都有
 自己的 Tool records、verdict 和 verification attempts。
 
-`AgentTaskStore` 使用 SQLite WAL 与 `BEGIN IMMEDIATE`。创建时在同一事务内查询非终态任务，
-保证跨进程全局单活动槽位。更新写入完整的已校验 record 和 append-only event；业务代码不直接
+`AgentTaskStore` 使用 SQLite WAL 与 `BEGIN IMMEDIATE`。创建时在同一事务内查询相同
+`origin_session_key` 的非终态任务（`None` 使用无绑定槽位），保证跨进程的每 session 单活动
+槽位。若旧 task 唯一未完成的工作是仍标为 unknown 的 Action/Session 调用，创建会把旧本地
+task 以 failed 关闭并保留其 unknown execution record，使本 session 能开始真正的新 task，
+unknown record 还带一次写入、不会因轮询或重启延长的 `unknown_deadline`；超过
+`forge.unknownRecoveryTimeoutS`（默认 3600 秒）后按 `RecoveryTimeout` 本地失败结算，没有实时或
+未解决执行的 task 同时关闭为 failed 并释放槽位；同时不重新分类远端状态。更新写入完整的已校验
+record 和 append-only event；业务代码不直接
 修改表。
 
 公开状态由 [AgentTask 状态契约](../forge/README_zh.md#8-agenttask-模型)定义。Store 转移必须保持这些语义；`unknown` Tool record 结束记账，但不证明物理停止。
@@ -231,14 +241,15 @@ settled 步骤单独成行写入滚动记录。显示偏好跨回合保留直到
 1. 读取并校验配置，应用 `--workspace`，拒绝 fleet 模式。
 2. 解析 provider/model/effort 选择；选择在回合真正开始时读取，排队中的提交因此会用运行前的最新选择，运行中的回合保留它开始时的选择。
 3. 构造 Forge 组件：Skill catalog 与 runtime availability、`ForgeToolClient`、`AgentTaskCoordinator` 和可选验证器。
-4. 在这个 coordinator 上做一次 Forge 未知 Action/Session 恢复，且在任何一个回合被提交之前完成。`reconcile_nonterminal()` 只发 Gateway GET 查询；不重发 Action 或 Session 的 POST，也不把仍未确认的 unknown 改成终态。Core 没有交互 supervisor，因此这里不会请求机器人停止。恢复本身失败时会报告一次并继续打开会话；未解决的 unknown 仍然阻塞新任务。
+4. 在这个 coordinator 上做一次 Forge 未知 Action/Session 恢复，且在任何一个回合被提交之前完成。`reconcile_nonterminal()` 只发 Gateway GET 查询；不重发 Action 或 Session 的 POST，也不把仍未确认的 unknown 改成终态。Core 没有交互 supervisor，因此这里不会请求机器人停止。恢复本身失败时会报告一次并继续打开会话。GET 恢复尝试之后，`expire_timed_out_unknowns()`
+会把超过恢复截止时间的执行按本地失败结算并释放槽位；这些记录只作诊断历史，不阻塞任务准入。
 5. 创建 `SkillDocumentLoader` 与 `TurnSkillActivationManager`，把激活管理器注册给 coordinator，使 `forge_task_create` 能校验 `activation_id`。
 6. 打开会话存储 `<workspace>/sessions/core.db`。
 7. 建立共用工具能力，在装配前完成 MCP 发现，再用 `compose_agent` 建种子装配；Skill 访问在前，通用工具、图片、条件模式管理、MCP、spawn、有 MCP 工具时的 `tool_search` 与 code mode 打开时的 `execute_program` 居中，Forge 在后。
-8. 跑单条消息或交互循环。每回合在真正开始时读取该 session 的选择并新建面向模型的装配；这份装配只服务一个回合，回合结束立即 `runtime.stop()`（不关 host），不再等下次 submit。store、Forge coordinator/client 与激活管理器保持共享。同一 session 的提交按登记顺序串行，不同 session 可并发；`cancel` 只取消当前装配，排队中的回合不会继承这次取消。
+8. 跑单条消息或交互循环。每回合在真正开始时读取该 session 的选择并新建面向模型的装配；这份装配只服务一个回合，回合结束立即 `runtime.stop()`（不关 host），不再等下次 submit。工作区规则文件（`AGENTS.md`、`SOUL.md`、`USER.md`、`IDENTITY.md`、`TOOLS.md`、`SKILLS.md`）也在同一回合开始读取，并在本回合内冻结；修改从下一回合生效，包括排队中的回合或新 session，手动压缩读取当前文件。store、Forge coordinator/client 与激活管理器保持共享。同一 session 的提交按登记顺序串行，不同 session 可并发；`cancel` 只取消当前装配，排队中的回合不会继承这次取消。
 9. 只关闭一次：先拒绝新提交并让排队中的提交在开回合前退出，再停仍可能持有回合的 runtime，等已进入本 session 的提交返回，对每个已接受的 session 通知各能力，关闭规范能力一次，最后关 store。Forge client 与验证器由资源栈在会话之后关闭。
 
-只要还有更早的 Action/Session 调用处于 unknown，`forge_task_create` 就拒绝建新任务，跨 session 的旧任务也算在内。拒绝结果会给出权威的 `task_id`、已确认的 `invocation_id`（Gateway 身份从未确认时明确写 `None`）、记录状态与语义，以及该用哪个 status 工具查询；不会建议去试列表工具，不会重发旧请求，也不会建议删 store 或靠重启清除。
+只有本 session 最新的 task 仍有未完成的实时工作时，`forge_task_create` 才拒绝；别的 session 的 task 不会阻止它。若旧 task 唯一未完成的工作是仍标为 unknown 的 Action/Session 调用，则不会拒绝：创建会把旧的本地 task 以 failed 关闭，并保留远端 unknown record。拒绝结果会给出阻塞的 `task_id`、状态与 origin session；不会重发旧请求，也不会建议删 store 或靠重启清除。真实 operation 是否 busy 由 Gateway 判断，不由 PAOS 代替判断。
 
 运行中只用 Esc 停止：第一次 Esc 进入两秒窗口并显示黄色提示，第二次 Esc 通过原有 session cancel 路径请求本地取消。超时、其他按键、方向键或新回合都会清除已 arm 状态，单次 Esc 和方向/Alt 组合不会停止任务；模型菜单里的 Esc 只关闭菜单。取消会请求 Forge 取消该 session 的最新任务，但不能证明远端动作已停止；状态明确写"本地"和"远端未确认"。本地命令（`/help`、`/display_all_step`、`/correct`，以及被拒绝的未知斜杠命令）由 reader 立即处理；`/stop` 只返回提示，不取消也不发模型。非终端输入捕获不到 Esc，只能靠 Ctrl+C。普通文本和模型命令仍按 FIFO 顺序，模型命令只在回合之间执行；程序注入的排队消息只回执序号，不再打印逐条 `Queued`/`Processing` 消息，也不回显内容。
 
@@ -272,7 +283,7 @@ tokens 内，都不再加进输入、输出或合计。`total_tokens` 优先用 
 provider 报告的 prompt 大小仍对应未变化的请求时才标记为 `exact`。`ProviderService.resolve`
 组合有效窗口：可靠的模型元数据优先，显式 `context_window_tokens` 只在上限更小时覆盖；元数据
 未知时先看显式 cap；有 cap 用 configured 值。只有既无可靠元数据也无显式 cap 时才用文档化的
-65,536 fallback，并记录 source=`fallback`。模型原始值与 effective guard 分开保存。模型轮次统计 provider 调用次数，不是内部推理步数，也不伪造推理步数。会话累计行
+65,536 fallback，并记录 source=`fallback`。模型原始值与 effective guard 分开保存。context 标签只显示估算值和占窗口比例；回复预算、输入上限与估算来源写入 `request.prepared.request_budget` 和 guard 错误，不再显示在标签里。`(assumed)` 标记 fallback 容量。模型轮次统计 provider 调用次数，不是内部推理步数，也不伪造推理步数。会话累计行
 从已存事件重建，重新载入后仍可用。脚注只是终端渲染，绝不插入发给 provider 的消息历史。
 
 ### Prompt 投影、工具阶段与启动读取
@@ -328,7 +339,8 @@ provider 确实发来的 usage 键。
 
 `cache_stable_prompts=True` 时，`PromptAssemblerImpl` 只把固定 system 指令放进 system 消息，并把
 本步骤的实时 fragment 作为一条 runtime-context 消息附在历史之后。静态前缀在各步骤间逐字节
-不变，Forge blocker 与其他实时事实仍每步重读；assembler 不会把这条 runtime 消息写进调用方历史。
+不变，本 session 的 Forge task 与其他实时事实仍每步重读；assembler 不会把这条 runtime 消息
+写进调用方历史。
 
 `TurnBudget`（`agent/services/turn_budget.py`）只统计 provider 确实报告的用量。缺失的 total 不当
 0，已知的部分合计不当成完整用量，这些都不是计费上限。`max_turn_tokens` 在已报告合计达到该值时
@@ -384,7 +396,7 @@ undo 能继续往上。`UndoOutcome.request_text` 优先读取 `turn.started` �
 预检，用的是同一个真实 token 估算器，并把 system 与当前可见工具一并计入，不再按字符数
 估算；只有下一次请求的估算确实变小才写 checkpoint。UI 只在收到 `REQUEST_PREPARED` 时才
 切换 checkpoint 投影，回合开始（`TURN_STARTED`）不回退到旧历史。压缩从不派发工具调用，
-也不改 AgentTask 或 Forge 记录，因此压缩后未解决的 `unknown` 仍然阻塞新任务。
+也不改 AgentTask 或 Forge 记录；压缩后的 unknown 仍是历史事实，不会被重发或自动解决。
 
 ### Resume 与修正
 
@@ -484,10 +496,10 @@ python -m compileall -q PhyAgentOS tests
 pytest -q
 ```
 
-测试应覆盖响应契约、Session ownership、pending/cancel/stop/timeout/unknown、单活动任务、
+测试应覆盖响应契约、Session ownership、pending/cancel/stop/timeout/unknown、每 session 任务槽位、
 诊断 Query、不可变 binding、无 POST 恢复、revision recovery、evidence、按版本 episode、归档
 攻击、事务回滚、Registry 校验、Runtime health/切换、模拟工作流、CLI 运行时选择、Core 逐回合
-装配、交互 FIFO/取消、Skill 文档优先级与激活作用域。具体硬件/仿真测试以独立安装匹配制品和
+装配、工作区规则重读、交互 FIFO/取消、Skill 文档优先级与激活作用域。具体硬件/仿真测试以独立安装匹配制品和
 Dora 可用为条件。
 
 ## 后续阅读

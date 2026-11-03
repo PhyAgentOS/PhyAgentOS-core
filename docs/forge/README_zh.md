@@ -31,6 +31,14 @@ ToolSpec 声明稳定 identity、implementation/Endpoint binding、operation、`
 semantics、严格 input/output schema、readiness 与 robot frame profile。调用前实时读取 context，
 调用方不能猜测 frame、unit、readiness 或 binding。
 
+`forge_tool_list` 实时执行 `GET /tools`，把 Gateway 的 `data` 对象原样放进 `data.catalog`；
+`data.source` 记录 endpoint、固定使用的 runtime/client 与读取时间。catalog 形状不做二次解释。
+可选 `task_id` 只追加只读 `binding` 视图，报告该 AgentTask 的冻结 allowlist；发现本身不会创建
+或扩大 allowlist。
+
+`forge_tool_context` 为 ToolSpec 与 context 两个 GET 固定同一个 runtime/client，并返回同样的
+`data.source` 来源信息。两次 GET 是独立请求，不是一次原子快照。
+
 ## 3. Query 契约
 
 `forge_tool_query` 读取配置 ToolSpec，确认 `semantics=query`，再调用：
@@ -91,6 +99,7 @@ Session；shared Session 可跨 task finalize 存续；runtime-owned Session 由
 | Tool | 契约 |
 |:-----|:-----|
 | `forge_tool_context` | 读取 ToolSpec 与实时 context。 |
+| `forge_tool_list` | 读取实时 `GET /tools` catalog；可选 `task_id` 报告该任务的冻结 allowlist。 |
 | `forge_tool_query` | 调用同步 Query，可作无任务诊断或绑定 `task_id`。 |
 | `forge_tool_start_action` | 为绑定的 `task_id` 接纳异步 Action。 |
 | `forge_tool_action_status` | 读取 invocation phase/status。 |
@@ -98,7 +107,7 @@ Session；shared Session 可跨 task finalize 存续；runtime-owned Session 由
 | `forge_tool_cancel_action` | 请求取消，不宣称停止。 |
 | `forge_tool_start_session` | 以显式 ownership 接纳绑定 Session。 |
 | `forge_tool_session_status/result/stop_session` | 核对或停止有所有权的 Session。 |
-| `forge_task_create` | 创建唯一活动 AgentTask 与 revision 1。 |
+| `forge_task_create` | 创建本 session 的下一个 AgentTask 与 revision 1。 |
 | `forge_task_get` | 读取 task、revisions、Tool records、evidence 与 verdict。 |
 | `forge_task_begin_revision` | 在允许 recovery verdict 后追加 revision。 |
 | `forge_task_finalize` | 后置采集并执行聚合任务验证。 |
@@ -128,9 +137,15 @@ ToolSpec hash 与 Node artifact ID。每次执行都复核 allowlist、semantics
 
 ## 8. AgentTask 模型
 
-全局最多一个非终态 AgentTask；诊断 Query 不占槽位。创建与更新使用 SQLite WAL 和 immediate
-transaction。Task 包含只追加 PlanRevision；每个 revision 包含 Tool records、semantic verdict
-和 verification attempts。
+每个 origin session（或无绑定槽位）最多一个非终态 AgentTask；诊断 Query 不占该槽位，不同
+session 可以各自创建。若本 session 唯一未完成的工作是仍标为 unknown 的 Action/Session 调用，
+创建新 task 会把旧的本地 task 以 failed 关闭，并保留那条 unknown execution record；
+这不会重新分类或解决远端状态。unknown 记录还带恢复截止时间
+（`forge.unknownRecoveryTimeoutS`，默认 3600 秒），在首次进入 unknown 时写入一次，轮询或重启
+都不会延长。超过该时间后该次执行按本地失败结算（`RecoveryTimeout`），释放 session 槽位，
+远端结果保持未确认。创建与更新使用 SQLite WAL 和 immediate transaction。Task 包含
+只追加 PlanRevision；每个 revision 包含 Tool records、semantic verdict 和 verification attempts。
+PAOS 只按 origin session 串行化任务准入；真实 operation 是否已经 busy 仍由 Gateway 判断。
 
 ```text
 executing

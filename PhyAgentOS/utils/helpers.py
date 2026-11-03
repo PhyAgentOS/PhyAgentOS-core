@@ -544,4 +544,14 @@ def sync_workspace_templates(
         from rich.console import Console
         for name in added:
             Console().print(f"  [dim]Created {name}[/dim]")
+
+    # Record which bundled templates the workspace still has verbatim. This is
+    # what lets a later upgrade tell an untouched old file from a custom one.
+    try:
+        from PhyAgentOS.workspace.baseline import record_template_baseline
+
+        record_template_baseline(workspace)
+    except Exception:
+        # Baseline recording is auxiliary; onboarding must still succeed.
+        pass
     return added

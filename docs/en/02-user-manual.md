@@ -452,8 +452,8 @@ paos agent --runtime legacy
 Selecting `core` (explicitly or by default) does not load `agent_legacy` or `cli.legacy`;
 those modules are imported only when `--runtime legacy` is actually chosen. A Core failure
 exits; it does not fall back to the legacy runtime. Both runtimes write separate session
-history (`<workspace>/sessions/core.db` vs `<workspace>/sessions/` JSONL), but unresolved
-remote state and AgentTask protection are workspace-wide and shared by both.
+history (`<workspace>/sessions/core.db` vs `<workspace>/sessions/` JSONL). Forge AgentTask records
+are stored in the workspace, while task admission is scoped to the calling origin session.
 
 ### Sessions
 
@@ -469,6 +469,11 @@ to choose from (an inline picker on a terminal), and `/session <id>` loads an ex
 where `/new` only clears history, the Core `/new` allocates a new session id. Existing Core sessions
 in `core.db` are preserved. Legacy JSONL sessions are not imported or converted, and there is no
 automatic legacy migration.
+
+Workspace rule files (`AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`, `SKILLS.md`)
+are re-read when each turn starts. An edit applies from the next turn, including a queued turn or a
+new session; the running turn keeps the text it started with, and manual compaction also reads the
+current files.
 
 ### Streaming, context and the turn footer
 
@@ -486,8 +491,11 @@ documented 65,536 fallback applies only when there is **neither reliable metadat
 cap**. With an explicit cap, that configured value is used (never silently raised to 1M), and the
 status shows the source (model/configured/fallback). `≈` marks an estimate; a provider-reported
 value has no `≈` and no literal `exact` text; an unknown context size shows `context --` or
-`used/--`, not `--%`. A request above capacity stays above 100% instead of being clamped. Tools are
-stage-gated: task creation/change tools are not offered before a Skill is activated; registered
+`used/--`, not `--%`. A request above capacity stays above 100% instead of being clamped. The
+status line shows only `context used/window percent`; the reply budget, the input limit and the
+token estimator source are recorded in `request.prepared.request_budget` and in the guard error
+instead of the line. `(assumed)` marks a fallback capacity. Tools are stage-gated: task creation/change
+tools are not offered before a Skill is activated; registered
 definitions still exist, they are just not visible on that step. One exact Skill content version
 normally keeps one full document per request; if the body is short and dropping it would save fewer
 than 128 characters, the duplicate stays unchanged without a marker. Durable events keep the full text. A compact
@@ -706,11 +714,16 @@ display setting, plus hidden and total counts. Its history lives in `<workspace>
 history under `<workspace>/sessions/`. The two stores are not imported or merged. A Core failure
 exits; it does not fall back to the legacy runtime. Fleet mode still requires `--runtime legacy`.
 
-Unresolved remote state from any session in the workspace blocks new AgentTasks. The Core prompt
-reports that blocker on every step, including its task/invocation identity and `None` when the
-Gateway never confirmed an invocation; it does not quote another session's description, arguments
-or evidence. Do not retry the old Action/Session, invent an invocation id, or cancel another
-session's task to get around the block. Use only tools declared by the activated Skill or a fetched
+Task admission is scoped to the calling origin session, not the whole workspace: each session may
+have one non-terminal AgentTask, and another session's unfinished or unknown work neither blocks
+creation nor appears in this session's prompt. If this session's only unfinished work is an
+Action/Session invocation still marked `unknown`, creating a new task closes the
+old local task as failed and keeps the remote unknown record; Gateway still decides whether a real
+operation is busy. An `unknown` record also expires: after `forge.unknownRecoveryTimeoutS`
+(3600 seconds by default) without a confirmed outcome, that execution is failed locally and the
+slot is released. The deadline is set once and is not extended by polling or a restart; the remote
+outcome stays unconfirmed. Do not resend that unknown Action/Session, invent an invocation id, or cancel
+another session's task to get around a local refusal. Use only tools declared by the activated Skill or a fetched
 ToolSpec. If the current end-effector pose or robot state is unavailable, a relative displacement
 cannot be claimed and no guessed absolute target is sent; leaving optional `timeout_ms` unset lets
 the Gateway apply its own timeout.
@@ -720,6 +733,11 @@ the Gateway apply its own timeout.
 Before a Tool call, use `forge_tool_context(tool_id)`. It returns the ToolSpec together with live
 binding, readiness, endpoint status, and robot frame information. The Agent must use the exact
 input schema and must not infer frame or unit conventions.
+
+`forge_tool_list` reads the live Gateway `GET /tools` catalog. It copies the Gateway catalog object
+unchanged into `data.catalog` and records the endpoint, pinned runtime/client and read time in
+`data.source`. Passing an AgentTask `task_id` adds that task's frozen allowlist; discovery never
+creates or expands an allowlist.
 
 The active Skill workflow declares the allowed Tool IDs and their Query, Action, or Session
 semantics. Do not substitute a similar-looking Tool that is absent from its binding.
@@ -740,8 +758,9 @@ For a user-visible multi-call task:
 4. Reconcile every asynchronous invocation by its returned `invocation_id`; never invent or retry it after an unknown admission.
 5. Stop task-owned Sessions, then call `forge_task_finalize(task_id)`.
 
-Only one AgentTask may be non-terminal globally. Diagnostic Query does not occupy this slot, and all
-execution still competes according to Gateway operation `max_concurrency`.
+Each origin session (or the unbound slot) has at most one non-terminal AgentTask; diagnostic Query
+does not occupy that slot, different sessions create independently, and all execution still
+competes according to Gateway operation `max_concurrency`.
 
 ## 7. Define verification
 
@@ -772,8 +791,8 @@ For `audit`, `enforce`, or `recovery`, provide a goal and at least one success c
 | `recovery` | Same as enforce; `replan_required` permits a bounded new PlanRevision. |
 
 If finalization returns `awaiting_replan`, call
-`forge_task_begin_revision(task_id, reason)` and continue using the same task ID. Do not create a
-second task or retry an invocation whose physical effect is unknown.
+`forge_task_begin_revision(task_id, reason)` and continue using the same task ID. Do not retry an
+invocation whose physical effect is unknown.
 
 ## 8. Cancellation and unknown outcomes
 

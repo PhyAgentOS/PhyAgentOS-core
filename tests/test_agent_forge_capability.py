@@ -232,6 +232,7 @@ def test_registers_the_existing_task_and_tool_api_groups() -> None:
     }
     assert set(api_names) == {
         "forge_tool_context",
+        "forge_tool_list",
         "forge_tool_query",
         "forge_tool_start_action",
         "forge_tool_action_status",
@@ -554,7 +555,7 @@ def _blocker(**overrides: Any) -> dict[str, Any]:
     return blocker
 
 
-def test_prompt_context_reports_cross_session_blocker_without_local_task() -> None:
+def test_prompt_context_has_no_old_task_for_a_new_session() -> None:
     coordinator = _FakeCoordinator()
     coordinator.blockers.append(
         _blocker(
@@ -566,47 +567,27 @@ def test_prompt_context_reports_cross_session_blocker_without_local_task() -> No
     )
     capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
 
-    text = capability.prompt_context(_context("fresh-session"))
-
-    assert text is not None
-    assert 'task_id="task_remote"' in text
-    assert "invocation_id=None" in text
-    assert "Gateway identity never confirmed" in text
-    assert "status=unknown" in text
-    assert "semantics=action" in text
-    assert "cannot be located by the status tools" in text
-    # Only task/invocation identity and status leave this capability.
-    assert "private plan" not in text
-    assert "secret" not in text
+    assert capability.prompt_context(_context("fresh-session")) is None
 
 
-def test_prompt_context_keeps_global_blocker_after_local_success() -> None:
+def test_prompt_context_drops_finished_history_and_ignores_blockers() -> None:
     coordinator = _FakeCoordinator()
     coordinator.records["session-1"] = _task(task_id="task_local", status="succeeded")
     coordinator.blockers.append(_blocker())
     capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
 
-    text = capability.prompt_context(_context("session-1"))
-
-    assert text is not None
-    assert "task_local" in text
-    assert "status=succeeded" in text
-    assert "task_remote" in text
+    assert capability.prompt_context(_context("session-1")) is None
 
 
-def test_prompt_context_reads_blockers_live_and_drops_them_when_clear() -> None:
+def test_prompt_context_ignores_unknown_history_from_other_sessions() -> None:
     coordinator = _FakeCoordinator()
     coordinator.blockers.append(_blocker())
     capability = ForgeCapability(coordinator)  # type: ignore[arg-type]
 
-    assert "task_remote" in (capability.prompt_context(_context("fresh")) or "")
-
-    coordinator.blockers.clear()
-
-    assert capability.prompt_context(_context("fresh")) is None
+    assert "task_remote" not in (capability.prompt_context(_context("fresh")) or "")
 
 
-async def test_first_model_request_carries_global_blocker_without_dispatch(
+async def test_first_model_request_does_not_carry_another_sessions_unknown(
     tmp_path: Path,
 ) -> None:
     coordinator = _FakeCoordinator()
@@ -619,7 +600,7 @@ async def test_first_model_request_carries_global_blocker_without_dispatch(
         async def chat_with_retry(self, *, messages, tools=None, **kwargs):
             del kwargs
             calls.append({"messages": messages, "tools": tools})
-            return LLMResponse(content="blocked", finish_reason="stop")
+            return LLMResponse(content="new task", finish_reason="stop")
 
     assembly = compose_agent(
         provider=Provider(),  # type: ignore[arg-type]
@@ -640,10 +621,9 @@ async def test_first_model_request_carries_global_blocker_without_dispatch(
     assert len(calls) == 1
     system = calls[0]["messages"][0]
     assert system["role"] == "system"
-    assert 'task_id="task_remote"' in system["content"]
-    assert "invocation_id=None" in system["content"]
+    assert "task_remote" not in system["content"]
     assert "private plan" not in system["content"]
-    # The model saw the blocker before dispatch and no action was started.
+    # A new session is not told to recover or repeat another session's task.
     assert coordinator.started == []
 
 

@@ -259,13 +259,47 @@ def test_context_is_exact_only_while_the_measured_request_is_the_last_event():
         payload={"model_call_id": "m1", "content": "hello", "usage": {"prompt_tokens": 500}},
     )
     assert estimate_context([request, completed], capacity=1000).exact is True
-    assert estimate_context([request, completed], capacity=1000).label() == "context 500/1k 50%"
+    assert (
+        estimate_context([request, completed], capacity=1000).label()
+        == "context 500/1k 50%"
+    )
 
     terminal = _event(EventType.TURN_COMPLETED, payload={"reply": "hello"})
     snapshot = estimate_context([request, completed, terminal], capacity=1000)
     assert snapshot.exact is False
     assert snapshot.label().startswith("context ")
     assert "≈" in snapshot.label() and snapshot.label().endswith("%")
+
+
+def test_provider_usage_from_another_model_is_not_the_current_send(monkeypatch):
+    import PhyAgentOS.agent.services.usage as usage
+
+    request = _event(
+        EventType.REQUEST_PREPARED,
+        payload={
+            "model_call_id": "m1",
+            "model": "old-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [],
+        },
+    )
+    completed = _event(
+        EventType.MODEL_ATTEMPT_COMPLETED,
+        payload={"model_call_id": "m1", "content": "hello", "usage": {"prompt_tokens": 500}},
+    )
+    monkeypatch.setattr(
+        usage, "estimate_prompt_tokens_chain", lambda *args, **kwargs: (1234, "tiktoken")
+    )
+    snapshot = estimate_context(
+        [request, completed], model="new-model", capacity=32768, reply_budget=4096
+    )
+    assert snapshot.exact is False
+    assert snapshot.tokens == 1234
+    assert snapshot.tokens_source == "tiktoken"
+    # The window and reply budget come from the current selection, not the log.
+    assert snapshot.capacity == 32768
+    assert snapshot.reply_budget == 4096
+    assert "last request usage" not in snapshot.label()
 
 
 def test_context_over_100_percent_is_not_clamped():

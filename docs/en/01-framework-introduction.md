@@ -68,7 +68,8 @@ Tool execution facts; AgentTask stores references and task-level interpretation.
 
 ## 5. AgentTask lifecycle
 
-Only one AgentTask may be non-terminal globally. A task starts with revision 1 and can contain
+Each origin session (or the unbound slot) has at most one non-terminal AgentTask; different
+sessions can create tasks independently. A task starts with revision 1 and can contain
 multiple bound Queries, Actions, and Sessions. PlanRevisions are append-only; prior execution records and
 verification attempts are never rewritten.
 
