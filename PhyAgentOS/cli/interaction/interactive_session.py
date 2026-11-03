@@ -1,7 +1,7 @@
 """Interactive input scheduling over an injected, entry-facing session.
 
 The reader stays alive during turns. Ordinary input, model commands and
-session switches share one FIFO; local commands (stop, help, display_all_step,
+session switches share one FIFO; local commands (stop, help,
 correct, undo, unknown slash commands) bypass it so a running turn never
 delays them.
 Every queued ordinary message carries the session binding that was current
@@ -26,7 +26,7 @@ from typing import Protocol
 
 from PhyAgentOS.agent.core.types import TurnRequest, TurnResult, require_non_empty
 
-__all__ = ["HELP_TEXT", "InteractiveAgent"]
+__all__ = ["HELP_TEXT", "InteractiveAgent", "STARTUP_HINT"]
 
 _EXIT_COMMANDS = frozenset({"exit", "quit", "/exit", "/quit", ":q"})
 _MODEL_COMMANDS = frozenset({"/provider", "/model", "/effort", "/status"})
@@ -34,7 +34,7 @@ _SESSION_COMMANDS = frozenset({"/new", "/session"})
 _COMPACT_COMMANDS = frozenset({"/compact"})
 _RESUME_COMMANDS = frozenset({"/resume"})
 _LOCAL_COMMANDS = (
-    frozenset({"/help", "/stop", "/display_all_step", "/correct", "/undo"})
+    frozenset({"/help", "/stop", "/correct", "/undo"})
     | _MODEL_COMMANDS
     | _SESSION_COMMANDS
     | _COMPACT_COMMANDS
@@ -42,12 +42,15 @@ _LOCAL_COMMANDS = (
 )
 _COMMAND_SHAPE = re.compile(r"^/[A-Za-z][A-Za-z0-9_-]*$")
 
+# Printed once when an interactive Core session starts. The command list and
+# the Esc explanation live in HELP_TEXT; repeating them here was noise.
+STARTUP_HINT = (
+    "Type /help for local commands. Accepted or running is not task success."
+)
+
 HELP_TEXT = """\
 Local commands (handled by the CLI; none of them is sent to the model):
   /help            Show this help.
-  /display_all_step [on|off]
-                   Show every intermediate step, or a limited view; no
-                   argument toggles. Display only; execution is unchanged.
   /new             Create and switch to a new session.
   /session         List sessions, or pick one on a terminal.
   /session <id>    Load an existing session.
@@ -90,8 +93,6 @@ class _Output(Protocol):
     def turn_finished(self) -> None: ...
 
     def cancel_requested(self) -> None: ...
-
-    def tool_view(self, argument: str) -> str: ...
 
 
 @dataclass(slots=True)
@@ -242,8 +243,6 @@ class InteractiveAgent:
             )
         elif command == "/help":
             self._output.info(HELP_TEXT)
-        elif command == "/display_all_step":
-            self._output.info(self._output.tool_view(argument))
         elif command == "/correct":
             await self._correct(argument)
         elif command == "/undo":

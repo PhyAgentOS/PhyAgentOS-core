@@ -203,9 +203,13 @@ attempt。Outcome source 将每个 revision verdict 映射到该 revision
 | `--runtime core`（默认） | `cli/command_groups/agent_commands.py` | Core 路径；不 import legacy 包 |
 | `--runtime legacy` | `cli/legacy/legacy_agent.py` | 旧实现；显式选择，用于对比 |
 
-`commands.py` 保留 Typer app、全局 callback 和唯一的注册点；各命令组自己持有 Typer app 或 `register_*` 函数。`register_agent` 只在显式 `--runtime legacy` 分支里 import legacy runner；建 app 或跑 Core 都不会 import `agent_legacy` 或 `cli.legacy`。`configuration.py` 存放 gateway 与 legacy 路径共用的配置加载及启动时的 provider/evolution 选择。`agent_commands.py` 只负责 Core 路径：读配置、建依赖、每回合建一次装配、结束时关闭会话；它目前仍持有 `CoreAgentSession` 和 Core 依赖装配，不是单一职责模块。`interaction/interactive_session.py` 调度 Core 输入，`interaction/agent_output.py` 负责消息展示，`interaction/terminal_input.py` 负责 prompt_toolkit 输入和终端状态，`interaction/terminal_display.py` 持有实时状态与工具区，`interaction/model_picker.py` 存放共用的终端选择器。Core 的 prompt 代理使用原始 ANSI 直通，Rich 样式会正常显示，不再变成可见的 `?[36m`；模型、工具和异常文本在渲染前会去掉控制字符，转义序列只由 Rich 产生。
+`commands.py` 保留 Typer app、全局 callback 和唯一的注册点；各命令组自己持有 Typer app 或 `register_*` 函数。`register_agent` 只在显式 `--runtime legacy` 分支里 import legacy runner；建 app 或跑 Core 都不会 import `agent_legacy` 或 `cli.legacy`。`configuration.py` 存放 gateway 与 legacy 路径共用的配置加载及启动时的 provider/evolution 选择。`agent_commands.py` 只负责 Core 路径：读配置、建依赖、每回合建一次装配、结束时关闭会话；它目前仍持有 `CoreAgentSession` 和 Core 依赖装配，不是单一职责模块。`interaction/interactive_session.py` 调度 Core 输入，`interaction/agent_output.py` 负责消息展示，`interaction/terminal_input.py` 负责 prompt_toolkit 输入和终端状态，`interaction/terminal_display.py` 持有实时状态与已落定的工具行，`interaction/model_picker.py` 存放共用的终端选择器。Core 的 prompt 代理使用原始 ANSI 直通，Rich 样式会正常显示，不再变成可见的 `?[36m`；模型、工具和异常文本在渲染前会去掉控制字符，转义序列只由 Rich 产生。
 
-终端只有一个实时区域写入者：prompt_toolkit 的 prompt message 在输入行上方渲染回合阶段（准备、思考、调用工具、本地停止）、转圈和耗时，以及本回合的步骤行、隐藏数量和总数。这些行紧贴 session 行和输入行，不挂到终端底部的工具栏，因此请求块、状态和输入之间不会留下大段空白。没有第二个 `Live` 或 `status` 写入者，因此输入框、动画和工具区不会互相移动光标。动画只由 prompt_toolkit 的刷新定时器驱动；状态变化只来自已经持久化的事件和会话的提交/取消回调。工具调用按 `(session_id, turn_id, tool_call_id)` 建键，从 `tool.intent` 到 `tool.dispatched` 再到 `tool.settled` 原地更新，重复事件不会增加总数；新回合开始时清空旧行，避免继承上一回合状态。没有 prompt 时（单次 `-m`、启动阶段、重定向流），同一份状态按变化打印普通行，不做动画，也不输出转义序列。`/display_all_step` 决定实时区域只保留最近有限步骤，还是保留完整步骤记录，见“回合边界与步骤显示”；步骤行只有工具名、本地状态和限长错误摘要，不打印参数、结果或凭证。
+终端只有一个实时区域写入者：prompt_toolkit 的 prompt message 在输入行上方渲染回合阶段（准备、思考、调用工具、本地停止）、转圈和耗时，以及当前模型调用的流式文本。这些行紧贴 session 行和输入行，不挂到终端底部的工具栏，因此请求块、状态和输入之间不会留下大段空白。没有第二个 `Live` 或 `status` 写入者，因此输入框、动画和输出不会互相移动光标。动画只由 prompt_toolkit 的刷新定时器驱动；状态变化只来自已经持久化的事件和会话的提交/取消回调。
+
+滚动记录按事件顺序写入：工具调用一 settled 就由 `_print_row` 打印一行（标记、加粗名称、一个关键参数、状态、耗时、限长错误摘要；颜色按结果），所以工具行不会滞留在实时区域，也不会被后来的行覆盖；关键参数由 `argument_detail` 从 `tool.intent` 的参数快照里按 `_DETAIL_KEYS` 顺序取第一个非空字符串（`path`、`tool_id`、`name`、`command`、`query`、`url` 等），去控制字符、脱敏凭证、URL 只保留 scheme/host/path，并截断到 60 个显示列；调用工具之前的模型文本由 `_print_intermediate` 以暗色纯文本打在它自己的位置上，不当作答复；最终回复由 `result()` 以 Markdown 打印一次。工具调用按 `(session_id, turn_id, tool_call_id)` 建键，重复事件不增加总数；新回合开始时清空旧状态，避免继承上一回合。行内不打印完整参数字典、结果或凭证，只打印这一个白名单键的值。没有 prompt 时（单次 `-m`、启动阶段、重定向流），同一份状态按变化打印普通行，不做动画，也不输出转义序列。
+
+实时区域里的流式块按 Markdown 渲染：Rich 以终端宽度减一渲染文本，剥掉 OSC 8 超链接序列后交给 prompt_toolkit 的 ANSI 解析器转成带样式片段；渲染结果按宽度和内容缓存，文本超过 `_PREVIEW_CHARS` 时只预览尾部，完整文本由 `result()` 打印。没有 prompt 的终端用 Rich `Live` + `Markdown`，重定向输出保持纯文本增量且不重复打印。
 
 session/provider/model/effort 一行（含 `context`）放在 prompt message 里、cyan 竖线输入标识上方；状态、工具和流式预览行同在 prompt message 中，紧贴它们和输入行。运行中通过 layout 的 `always_hide_cursor` 隐藏请求标识和真实光标，buffer 只读，Enter 被拦截；普通按键不进入 buffer，也不会被偷偷排进模型队列，回合开始前已有的草稿保留，回合结束恢复提示和光标。提交一条请求后，输入提示块在 `prompt_async` 完成最终渲染之后被精确清除，再由永久请求块接替，因此不会留下空竖线，也不会与请求块重复。非终端输入仍保持逐行文本行为：不写输入提示，提交后由永久请求块显示请求正文，全程不输出 ANSI 样式。
 
@@ -227,10 +231,9 @@ session、provider/model 与 `context` 行渲染在请求输入上方。状态�
 提交后输入提示块被清除，永久请求块是屏幕上唯一的请求标识。逐条的 `Queued` 与
 `Processing` 行不再渲染；程序注入的排队输入仍只回执序号。
 
-`/display_all_step` 取代 `/tools`，由本地处理。不带参数时切换设置。默认 `off` 只在实时区域保留
-最近有限个已 settled 步骤，并给出隐藏数量与总数；`on` 立即完整打印本回合已有步骤，之后每个新
-settled 步骤单独成行写入滚动记录。显示偏好跨回合保留直到再次切换，每回合自己的展开状态仍随
-实时区域关闭。设置只改变显示：工具执行、`tool.*` 事件、已存结果和发给模型的上下文都不变。
+工具行没有显示开关，也没有“最近 N 条”窗口：每一次 settled 调用都写一行，隐藏数量、总数和
+展开状态都不再存在，`/display_all_step` 与 `/tools` 已从 CLI 移除。显示层只读已持久化的
+`tool.*` 事件；执行、事件日志、已存结果和发给模型的上下文都不受影响。
 
 回答渲染器会拦截 DSML 协议块。完整或未闭合的块不会当普通答复原文铺开；CLI 打印简短警告，原文
 仍保留在事件日志。Core 不执行、也不解析 DSML 块，所以这个拦截不是工具调用路径，也不承诺这类
@@ -251,7 +254,7 @@ settled 步骤单独成行写入滚动记录。显示偏好跨回合保留直到
 
 只有本 session 最新的 task 仍有未完成的实时工作时，`forge_task_create` 才拒绝；别的 session 的 task 不会阻止它。若旧 task 唯一未完成的工作是仍标为 unknown 的 Action/Session 调用，则不会拒绝：创建会把旧的本地 task 以 failed 关闭，并保留远端 unknown record。拒绝结果会给出阻塞的 `task_id`、状态与 origin session；不会重发旧请求，也不会建议删 store 或靠重启清除。真实 operation 是否 busy 由 Gateway 判断，不由 PAOS 代替判断。
 
-运行中只用 Esc 停止：第一次 Esc 进入两秒窗口并显示黄色提示，第二次 Esc 通过原有 session cancel 路径请求本地取消。超时、其他按键、方向键或新回合都会清除已 arm 状态，单次 Esc 和方向/Alt 组合不会停止任务；模型菜单里的 Esc 只关闭菜单。取消会请求 Forge 取消该 session 的最新任务，但不能证明远端动作已停止；状态明确写"本地"和"远端未确认"。本地命令（`/help`、`/display_all_step`、`/correct`，以及被拒绝的未知斜杠命令）由 reader 立即处理；`/stop` 只返回提示，不取消也不发模型。非终端输入捕获不到 Esc，只能靠 Ctrl+C。普通文本和模型命令仍按 FIFO 顺序，模型命令只在回合之间执行；程序注入的排队消息只回执序号，不再打印逐条 `Queued`/`Processing` 消息，也不回显内容。
+运行中只用 Esc 停止：第一次 Esc 进入两秒窗口并显示黄色提示，第二次 Esc 通过原有 session cancel 路径请求本地取消。超时、其他按键、方向键或新回合都会清除已 arm 状态，单次 Esc 和方向/Alt 组合不会停止任务；模型菜单里的 Esc 只关闭菜单。取消会请求 Forge 取消该 session 的最新任务，但不能证明远端动作已停止；状态明确写"本地"和"远端未确认"。本地命令（`/help`、`/correct`，以及被拒绝的未知斜杠命令）由 reader 立即处理；`/stop` 只返回提示，不取消也不发模型。非终端输入捕获不到 Esc，只能靠 Ctrl+C。普通文本和模型命令仍按 FIFO 顺序，模型命令只在回合之间执行；程序注入的排队消息只回执序号，不再打印逐条 `Queued`/`Processing` 消息，也不回显内容。
 
 `agent/services/forge_verifier.py` 是两条路径共用的唯一验证器实现；`agent_legacy/session_verifier.py` 只是重新导出，原有 import 和模块 patch 仍然生效。
 

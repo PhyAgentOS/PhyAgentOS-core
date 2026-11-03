@@ -56,7 +56,6 @@ __all__ = [
 _TERMINAL_TURNS = frozenset(
     {EventType.TURN_COMPLETED, EventType.TURN_FAILED, EventType.TURN_INTERRUPTED}
 )
-_STREAM_TEXT_LIMIT = 4000
 # The repository has no DSML parser. A model may still print its own tool-call
 # protocol as body text; that text is not an executable call and must not be
 # presented as the answer. Only the exact delimiters below are recognized.
@@ -398,9 +397,6 @@ class AgentOutput:
     def compact_finished(self) -> None:
         self.display.end_turn()
 
-    def tool_view(self, argument: str = "") -> str:
-        return self.display.tool_view(argument)
-
     # -- transcript blocks -----------------------------------------------
 
     def _print_request(self, request_text: str) -> None:
@@ -529,7 +525,15 @@ class AgentOutput:
                     "This provider has no native streaming; the answer is shown "
                     "once it is complete."
                 )
-            self._end_attempt(tool_calls=bool(event.payload.get("tool_calls")))
+            streamed = self._stream_active
+            tool_calls = bool(event.payload.get("tool_calls"))
+            self._end_attempt(tool_calls=tool_calls)
+            if not streamed and tool_calls:
+                # A blocking provider has no deltas; its intermediate body is
+                # only known here, and still belongs before the tool rows.
+                content = event.payload.get("content")
+                if isinstance(content, str):
+                    self._print_intermediate(content)
             self.refresh_status(event.session_id)
             return
         if event.type in _TERMINAL_TURNS:
@@ -597,23 +601,35 @@ class AgentOutput:
     def _emit_stream(self, chunk: str) -> None:
         mode = self._stream_mode()
         if mode == "preview":
-            text = self._current_text()
-            self.display.set_stream_text(text[-_STREAM_TEXT_LIMIT:])
+            # The display only previews what fits and renders Markdown itself;
+            # pass the accumulated text, not the last chunk.
+            self.display.set_stream_text(self._current_text())
             return
         if mode == "live":
             self._live_buffer = self._current_text()
             if self._live is None:
                 self._live = Live(
-                    Text(""),
+                    Markdown(""),
                     console=self._console,
                     refresh_per_second=10,
                     transient=True,
                     vertical_overflow="visible",
                 )
                 self._live.start()
-            self._live.update(Text(self._live_buffer))
+            self._live.update(Markdown(self._live_buffer))
             return
         self._print_chunk(chunk)
+
+    def _print_intermediate(self, text: str) -> None:
+        """Print text the model wrote before it called a tool.
+
+        It belongs to the transcript at this position and is not the answer:
+        plain text, dim, never Markdown.
+        """
+        content = display_text(text)
+        if not content.strip():
+            return
+        self._console.print(Text(content), style="dim")
 
     def _print_chunk(self, chunk: str) -> None:
         if not chunk:
@@ -636,10 +652,15 @@ class AgentOutput:
         visible = "".join(self._stream_parts) + extra
         mode = self._stream_mode()
         if mode == "preview":
+            # Clear the preview before printing, so the block appears once at
+            # the position this call owns in the transcript: after the tool
+            # rows that already settled, before the next ones.
             self.display.set_stream_text("")
             if terminal:
                 self._partial_text = visible
-            elif not tool_calls:
+            elif tool_calls:
+                self._print_intermediate(visible)
+            else:
                 self._stream_final_text = visible
         elif mode == "live":
             if self._live is not None:
@@ -647,7 +668,9 @@ class AgentOutput:
                 self._live = None
             if terminal:
                 self._partial_text = visible
-            elif not tool_calls:
+            elif tool_calls:
+                self._print_intermediate(visible)
+            else:
                 self._stream_final_text = visible
         else:
             if extra and not terminal:
@@ -656,13 +679,12 @@ class AgentOutput:
                 self._print_chunk(extra)
             if visible and not visible.endswith("\n"):
                 self._console.print()
-            if tool_calls:
-                if visible.strip():
-                    self._console.print(
-                        Text("（以上为工具调用前的中间回复，不是最终答复）"), style="dim"
-                    )
-            elif terminal:
+            if terminal:
                 self._partial_text = visible
+            elif tool_calls:
+                # The deltas already carried this text; only make sure the next
+                # tool row starts on its own line.
+                pass
             else:
                 self._stream_final_text = visible
                 self._raw_final_written = bool(visible.strip())

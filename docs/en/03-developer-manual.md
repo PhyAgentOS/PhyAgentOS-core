@@ -226,7 +226,7 @@ loading and startup provider/evolution selection shared by the gateway and legac
 one assembly per turn, and closes the session; it also still holds `CoreAgentSession` and the
 Core dependency assembly. `interaction/interactive_session.py` schedules Core input,
 `interaction/agent_output.py` renders messages, `interaction/terminal_input.py` owns prompt_toolkit
-input and terminal state, `interaction/terminal_display.py` owns the live status and tool region,
+input and terminal state, `interaction/terminal_display.py` owns the live status and the settled tool rows,
 and `interaction/model_picker.py` holds the shared terminal selectors.
 The Core prompt proxy runs with raw ANSI passthrough so Rich styling reaches the terminal instead
 of appearing as literal `?[36m` text; untrusted model, tool and exception text is stripped of
@@ -234,20 +234,35 @@ control characters before rendering, so only Rich introduces escape sequences.
 
 The prompt is the only writer of the live region: its prompt message renders the turn phase
 (preparing, thinking, calling a tool, stopping locally) with a spinner and elapsed time, plus the
-current turn's step rows, the hidden count and the total, directly above the session line and the
-input line. It is not a terminal-anchored bottom toolbar, so the request block, the live rows and
-the input stay close together without a large blank gap. There is no separate
-`Live`/`status` renderer, so the input line, animation and tool area cannot move the cursor against
-each other. `prompt_toolkit`'s refresh timer animates the message; state changes only come from
-persisted runtime events and the session's submit/cancel callbacks. A tool call is keyed by
-`(session_id, turn_id, tool_call_id)` and updated in place from `tool.intent` to
-`tool.dispatched` to `tool.settled`, so repeated events do not increase the total. Turning the turn
-over resets the rows, which keeps a new turn from inheriting an older turn's state. When no prompt
-is attached (a one-shot `-m` run, startup, or redirected streams) the same state prints one plain
-line per transition with no animation and no escape sequences. The `/display_all_step` setting
-described under “Turn boundaries and step display” selects whether the live region keeps only the
-limited recent rows or the complete step record. Step rows show the tool name, local status and a
-length-limited error summary, never tool arguments, outcomes or credentials.
+streamed text of the current model call, directly above the session line and the input line. It is
+not a terminal-anchored bottom toolbar, so the request block, the live rows and the input stay
+close together without a large blank gap. There is no separate `Live`/`status` renderer, so the
+input line, animation and output cannot move the cursor against each other. `prompt_toolkit`'s
+refresh timer animates the message; state changes only come from persisted runtime events and the
+session's submit/cancel callbacks.
+
+The transcript keeps event order. A settled tool call prints one row through `_print_row`
+(marker, bold name, one argument detail, status, elapsed time and a length-limited error summary;
+colour follows the outcome) as soon as it settles, so it never lingers in the live region and is
+never overwritten. The detail comes from `argument_detail`, which reads the `tool.intent` argument
+snapshot and keeps the first non-empty string found in `_DETAIL_KEYS` (`path`, `tool_id`, `name`,
+`command`, `query`, `url`, ...). It strips control characters, redacts credentials, keeps only
+scheme/host/path of a URL and cuts to 60 display columns.
+Model text written before a tool call is printed dim and plain in its own position by
+`_print_intermediate` and is never treated as the answer. The final reply is printed once as
+Markdown by `result()`. A tool call is keyed by `(session_id, turn_id, tool_call_id)`, so repeated
+events do not increase the total; a new turn resets the state instead of inheriting the previous
+one. Rows never dump a whole argument object, an outcome or a credential: they show one
+whitelisted key, redacted and truncated. When no prompt is attached (a one-shot `-m` run, startup, or
+redirected streams) the same state prints one plain line per transition with no animation and no
+escape sequences.
+
+The streamed block in the live region is rendered as Markdown: Rich renders it one column narrower
+than the terminal, the OSC 8 hyperlink sequences are stripped, and prompt_toolkit's ANSI parser
+turns the result into styled fragments. The render is cached by width and content, a text longer
+than `_PREVIEW_CHARS` previews only its tail, and the complete text is printed by `result()`. A
+terminal without a prompt uses Rich `Live` with `Markdown`; a redirected stream keeps the plain
+text deltas and never prints the body twice.
 
 The session/provider/model/effort line, including `context`, is part of the prompt message above
 the cyan vertical-bar input marker; the status, tool and stream-preview rows share that message,
@@ -291,13 +306,10 @@ line is cleared afterwards, so the permanent block is the only request marker. P
 `Queued` and `Processing` lines are no longer rendered; a programmatically injected queued input
 still gets its position-only receipt.
 
-`/display_all_step` replaces `/tools` and is handled locally. With no argument it toggles the
-setting. The default `off` keeps only a limited number of recent settled steps in the live region
-and reports the hidden and total counts. `on` immediately prints all steps already recorded for the
-current turn and then appends each newly settled step as its own line to the scroll record. The
-preference survives turn boundaries until changed; the per-turn expanded flag still closes with
-its live region. The setting changes display only: tool execution, `tool.*` events, stored results
-and the context sent to the model are unchanged.
+Tool rows have no display switch and no “recent N” window: every settled call writes one line,
+so hidden counts, totals and an expanded flag no longer exist, and `/display_all_step` and `/tools`
+are gone from the CLI. The display reads persisted `tool.*` events only; execution, the event log,
+stored results and the context sent to the model are unchanged.
 
 The answer renderer guards against DSML protocol blocks. A complete or unterminated block is not
 laid out as ordinary answer text; the CLI prints a short warning and the original text stays in the
@@ -356,7 +368,7 @@ path used before. A timeout, any other key, an arrow key, or a new turn clears t
 a single Esc and cursor/meta keys never stop a turn. Esc in a model menu only closes that menu.
 Cancellation asks Forge to cancel the session's latest task but does not prove a remote action
 stopped; the status says "local" and "remote unconfirmed". Local commands (`/help`,
-`/display_all_step`, `/correct`, and rejected unknown slash commands) are answered by the reader
+`/correct`, and rejected unknown slash commands) are answered by the reader
 immediately; `/stop`
 only returns a hint and never cancels or submits a model turn. Non-terminal input cannot capture
 Esc, so it relies on Ctrl+C. Ordinary text and model commands keep their FIFO order, model

@@ -1473,7 +1473,7 @@ async def run_core_agent(
     from loguru import logger
 
     from ..interaction.agent_output import AgentOutput
-    from ..interaction.interactive_session import InteractiveAgent
+    from ..interaction.interactive_session import STARTUP_HINT, InteractiveAgent
     from ..interaction.model_picker import _interactive_model_command
 
     config = load_agent_config(config_path, workspace)
@@ -1628,12 +1628,7 @@ async def run_core_agent(
                 output.turn_finished()
             return {TurnStatus.COMPLETED: 0, TurnStatus.FAILED: 1, TurnStatus.INTERRUPTED: 130}[result.status]
 
-        output.info(
-            "Local commands: /help · /display_all_step · /new · /session · /compact · "
-            "/undo · /correct (Ctrl+G while busy) · /resume · /model · /effort · /status · exit. "
-            "Press Esc twice while a turn runs to stop it locally. "
-            "Accepted or running is not task success."
-        )
+        output.info(STARTUP_HINT)
 
         from ..interaction.model_picker import _session_picker
         from ..interaction.terminal_input import TerminalInput

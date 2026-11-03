@@ -532,13 +532,19 @@ Per-message `Queued` and `Processing` notices are no longer printed. While a tur
 region shows a spinner with elapsed time and the turn phase, and it is the only writer of that
 area. The live rows stay directly above the session line and the input line instead of a
 terminal-anchored bottom toolbar, so there is no large gap between the request and the status.
-`/display_all_step [on|off]` controls the intermediate steps. With no argument the command
-toggles the setting. The default `off` keeps a limited number of recent steps in the scrolling
-display and reports the hidden and total counts. `on` immediately prints every step already
-recorded for the turn in full, then appends each newly settled step as its own line to the scroll
-record. The selection stays in effect across turns until you change it. The command only changes
-the display; execution, the event log, tool results and the model context are unchanged. `/tools`
-is no longer a CLI command.
+
+The transcript keeps the order things happened. A tool call prints one line as soon as it settles
+(`✓ name · detail · 1.2s`, coloured by outcome: green succeeded, red failed, yellow unknown or
+cancelled), so the next model output lands after it. `detail` is the one argument that says what
+the call acts on: the Skill name for `activate_skill`, the `tool_id` for a Forge query or action,
+the path for `read_file`/`write_file`/`edit_file`/`list_dir`, the command for `exec`, the query for
+a search, the host and path for a fetched URL, a job or task id. It is redacted (credentials
+removed, URL query strings dropped) and cut to 60 columns; tools with no such key show the name
+alone. Text the model writes before
+calling a tool is printed dim and plain at that spot and is never treated as the answer. The final
+reply is previewed live as Markdown and then printed once as the formatted block when the call
+ends. Every tool call is shown; there is no switch that hides steps, and `/display_all_step` and
+`/tools` are no longer CLI commands.
 
 `/help` lists the local commands. If answer text contains a DSML protocol block, the CLI display
 guard does not lay it out as ordinary answer text; it prints a short warning instead and the
@@ -700,8 +706,7 @@ above. On a terminal, `/model` and `/effort` without an argument open the same i
 the legacy runtime; text commands (`/model 2`, `/effort high`) and non-terminal input keep the text
 list.
 Interrupting a selector with Esc or Ctrl+C leaves the session and its selection unchanged. Locally,
-`/help` lists the commands and `/display_all_step [on|off]` switches the intermediate-step display
-described under “Turn display and intermediate steps”.
+`/help` lists the commands.
 To stop a running turn, press Esc twice within two seconds: the first Esc shows a yellow hint and
 the second requests local cancellation; it never proves that remote actions stopped. Non-terminal
 input cannot capture Esc, so use Ctrl+C to interrupt the local turn. `/stop` is not a command and
@@ -709,8 +714,9 @@ never submits a model turn. Unknown slash commands are rejected without a model 
 session, provider/model and `context` line sits above the input; while a turn runs the vertical-bar
 request marker and cursor are hidden and ordinary keys are ignored (an existing draft is kept), so nothing is
 silently queued. The running turn shows a spinner with elapsed time, switching between preparing,
-thinking, calling a tool, and stopping locally; the live region shows the steps kept by the current
-display setting, plus hidden and total counts. Its history lives in `<workspace>/sessions/core.db`; the legacy runtime keeps JSONL
+thinking, calling a tool, and stopping locally; the live region holds only the status line and the
+current streamed block, because finished tool calls are already in the transcript in order. Its
+history lives in `<workspace>/sessions/core.db`; the legacy runtime keeps JSONL
 history under `<workspace>/sessions/`. The two stores are not imported or merged. A Core failure
 exits; it does not fall back to the legacy runtime. Fleet mode still requires `--runtime legacy`.
 

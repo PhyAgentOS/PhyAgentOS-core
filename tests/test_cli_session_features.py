@@ -871,9 +871,6 @@ async def test_request_stop_cancels_a_compacting_command():
         def cancel_requested(self):
             self.cancels += 1
 
-        def tool_view(self, argument):
-            return ""
-
     session, output = Session(), Output()
     started = asyncio.Event()
 

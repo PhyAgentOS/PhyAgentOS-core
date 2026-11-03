@@ -68,26 +68,18 @@ async def test_two_real_turns_keep_requests_in_order_without_queue_notices():
     assert text.index("reply:second request") < text.index("End Turn 2")
 
 
-async def test_display_all_step_is_the_only_local_step_display_command():
+async def test_step_display_commands_are_gone_and_never_reach_the_model():
     buffer = StringIO()
     output = AgentOutput(Console(file=buffer, width=120, color_system=None))
     session = FakeSession()
     reader = FakeInput()
-    calls: list[str] = []
-    original = output.tool_view
-
-    def record(argument: str = "") -> str:
-        calls.append(argument)
-        return original(argument)
-
-    output.tool_view = record
     agent = InteractiveAgent(session, session_id="cli:test", output=output, read_input=reader)
-    reader.send("/display_all_step on", "/display_all_step off", "/display_all_step", "/tools on", "exit")
+    reader.send("/display_all_step on", "/tools on", "exit")
     await asyncio.wait_for(agent.run(), 2)
 
-    assert calls == ["on", "off", ""]
     assert session.requests == []
     text = buffer.getvalue()
+    assert "Unknown command /display_all_step" in text
     assert "Unknown command /tools" in text
     assert "not sent to the model" in text
 
@@ -152,32 +144,17 @@ async def test_real_tty_keeps_two_turn_transcripts_above_the_live_prompt(
     assert text.index("│ second tty request") < text.index("PhyAgentOS · Turn 2")
 
 
-def test_display_all_step_preference_survives_turn_boundaries_until_disabled():
+def test_tool_rows_print_in_every_turn_without_a_display_setting():
     display, buffer = _display(live=True)
-    display.tool_view("on")  # Selected while idle, before the first request.
-    display.begin_turn()
-    display.note_event(_event(EventType.TURN_STARTED, turn="turn-one"))
-    for index in range(6):
-        _tool(display, "turn-one", f"one-{index}", f"first_{index}", "succeeded")
-
+    for turn in ("turn-one", "turn-two"):
+        display.begin_turn()
+        display.note_event(_event(EventType.TURN_STARTED, turn=turn))
+        _tool(display, turn, f"{turn}-0", f"call_in_{turn}", "succeeded")
+        display.end_turn()
     text = buffer.getvalue()
-    for index in range(6):
-        assert f"{index + 1}. first_{index}" in text
-
-    display.end_turn()
-    display.begin_turn()
-    display.note_event(_event(EventType.TURN_STARTED, turn="turn-two"))
-    _tool(display, "turn-two", "two-0", "second_still_full", "succeeded")
-    assert "1. second_still_full" in buffer.getvalue()
-
-    display.tool_view("off")
-    display.end_turn()
-    display.begin_turn()
-    display.note_event(_event(EventType.TURN_STARTED, turn="turn-three"))
-    marker = len(buffer.getvalue())
-    _tool(display, "turn-three", "three-0", "third_limited", "succeeded")
-    assert "1. third_limited" not in buffer.getvalue()[marker:]
-    assert len([line for line in display.render_lines(width=100, rows=24) if "third_limited" in line]) == 1
+    assert "call_in_turn-one" in text
+    assert "call_in_turn-two" in text
+    assert text.index("call_in_turn-one") < text.index("call_in_turn-two")
 
 
 @pytest.mark.parametrize("fail", [False, True])

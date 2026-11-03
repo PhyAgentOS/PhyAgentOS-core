@@ -1,21 +1,25 @@
-"""Single owner of the live terminal region: turn status and the tool area.
+"""Single owner of the live terminal region and this turn's settled tool rows.
 
-The interactive prompt owns the input line. When a prompt is attached, this
-module supplies the prompt message: the live rows render directly above the
-session line and the input line, so they stay next to the permanent request
-without the gap a terminal-anchored bottom toolbar leaves. prompt_toolkit's own
-refresh timer animates the spinner and the elapsed time. There is no second
-cursor-moving writer: Rich prints messages above the prompt through
-``patch_stdout``, which the terminal input owns.
+The transcript keeps the order things happened: a settled tool call prints one
+line immediately, before whatever the model writes next. The live region holds
+only what is still changing: the status line and the streamed text of the
+current model call. It renders directly above the session line and the input
+line, so it stays next to the permanent request without the gap a
+terminal-anchored bottom toolbar leaves. prompt_toolkit's own refresh timer
+animates the spinner and the elapsed time. There is no second cursor-moving
+writer: Rich prints messages above the prompt through ``patch_stdout``, which
+the terminal input owns.
 
 Without a prompt (a one-shot ``-m`` run, startup, or a redirected stream) the
 same state model falls back to plain lines on state changes. That path never
 emits a carriage return, an escape sequence or an animation frame, so a
 redirected log stays readable even though ``NO_COLOR`` is not set.
 
-Only events already persisted by the store are consumed. Tool arguments,
-outcomes and raw provider text are never read; an error summary is redacted,
-control characters are stripped and long text is truncated.
+Only events already persisted by the store are consumed. A tool row carries one
+short value from the call's arguments, taken from a fixed key order and
+redacted; whole argument objects, outcomes and raw provider text are never
+read. Error summaries are redacted the same way, control characters are
+stripped and long text is truncated.
 """
 
 from __future__ import annotations
@@ -61,9 +65,10 @@ STOP_HINT = (
     "Press Esc again within 2s to stop this task "
     "(local stop; remote stop is not confirmed)."
 )
-TOOL_ROWS = 4
 REQUEST_PROMPT = "│ "
 _ERROR_LIMIT = 400
+# The live region only shows what fits; a long reply keeps its newest lines.
+_PREVIEW_CHARS = 2500
 _STATUS_LABELS = {
     PREPARING: "Preparing",
     THINKING: "Thinking",
@@ -78,13 +83,40 @@ _PHASE_STYLES = {
     STOPPING: "fg:ansiyellow",
     IDLE: "fg:ansibrightblack",
 }
+# One short argument value per row, first key that holds a non-empty string.
+# The order is the whole policy: it makes ``activate_skill(name)``,
+# ``forge_tool_query(tool_id)``, ``read_file(path)`` and ``exec(command)`` show
+# what they act on without a per-tool mapping that silently drifts.
+_DETAIL_KEYS = (
+    "path",
+    "tool_id",
+    "name",
+    "command",
+    "query",
+    "url",
+    "job_id",
+    "task_id",
+    "task_description",
+    "label",
+    "task",
+    "child_session_id",
+    "invocation_id",
+    "method",
+    "action",
+    "query_type",
+    "image_path",
+    "content",
+    "program",
+)
+_DETAIL_LIMIT = 60
+# A settled call prints one line: marker, bold name, one argument detail,
+# optional status, elapsed time and a redacted error. Colour follows the
+# outcome, never the tool.
 _TOOL_MARKERS = {
-    "requested": ".",
-    "running": ">",
-    "succeeded": "+",
-    "failed": "x",
-    "rejected": "x",
-    "cancelled": "-",
+    "succeeded": "✓",
+    "failed": "✗",
+    "rejected": "✗",
+    "cancelled": "−",
     "unknown": "?",
 }
 _TOOL_STYLES = {
@@ -93,8 +125,6 @@ _TOOL_STYLES = {
     "rejected": "fg:ansired",
     "cancelled": "fg:ansiyellow",
     "unknown": "fg:ansiyellow",
-    "running": "fg:ansiblue",
-    "requested": "fg:ansiblue",
 }
 
 # The same C0/C1 filter the renderer applies to model and tool text. Keeping it
@@ -203,6 +233,97 @@ def _error_value(payload) -> str:
     return safe_detail(error) if error else ""
 
 
+def _url_brief(match: "re.Match[str]") -> str:
+    """Keep scheme, host and path of a URL; drop its query and fragment."""
+    from urllib.parse import urlsplit
+
+    raw = match.group(0)
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return "<url>"
+    if not parts.netloc:
+        return "<url>"
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def argument_detail(arguments: object, *, limit: int = _DETAIL_LIMIT) -> str:
+    """Return one short, redacted value from a tool call's arguments.
+
+    Only a single string value is considered, chosen by ``_DETAIL_KEYS``; an
+    argument object with no such key shows no detail instead of dumping itself.
+    URLs keep their host and path, credentials are replaced, whitespace is
+    collapsed and the result is cut to ``limit`` display columns.
+    """
+    if not isinstance(arguments, dict):
+        return ""
+    values = (
+        arguments.get(key)
+        for key in _DETAIL_KEYS
+        if isinstance(arguments.get(key), str) and arguments[key].strip()
+    )
+    value = next(values, None)
+    if value is None:
+        return ""
+    text = display_text(" ".join(value.split()))
+    text = _URL_RE.sub(_url_brief, text)
+    text = _BEARER_RE.sub("<redacted>", text)
+    text = _JSON_KEY_VALUE_RE.sub(
+        lambda item: f'"{item.group(1)}": "<redacted>"', text
+    )
+    text = _KEY_VALUE_RE.sub(lambda item: f"{item.group(1)}=<redacted>", text)
+    text = _SECRET_RE.sub("<redacted>", text)
+    text = _JWT_RE.sub("<redacted>", text)
+    text = _LONG_TOKEN_RE.sub("<redacted>", text)
+    return _fit(text, limit)
+
+
+# Rich renders Markdown links as OSC 8 hyperlinks. prompt_toolkit's ANSI parser
+# does not consume OSC, so the address would be printed as body text.
+_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def markdown_lines(text: str, width: int) -> list[list[tuple[str, str]]]:
+    """Render Markdown into prompt_toolkit fragments, one list per line.
+
+    Rich owns the wrapping and styling; the ANSI string is parsed back into
+    fragments because the prompt message only accepts styled text. Hyperlink
+    OSC sequences are dropped first. Every line is padded to the render width
+    on purpose: the caller renders one column narrower than the terminal, so
+    the padding can never wrap.
+    """
+    import io
+
+    from prompt_toolkit.formatted_text import ANSI, to_formatted_text
+    from rich.console import Console
+    from rich.markdown import Markdown
+
+    buffer = io.StringIO()
+    # One column narrower than the terminal: Rich pads every line to its width,
+    # and that padding must not wrap in the prompt. highlight=False keeps Rich
+    # from re-parsing code spans as its own highlight markup.
+    console = Console(
+        file=buffer,
+        force_terminal=True,
+        width=max(1, width - 1),
+        color_system="truecolor",
+        highlight=False,
+    )
+    console.print(Markdown(text), end="")
+    fragments = to_formatted_text(ANSI(_OSC_RE.sub("", buffer.getvalue())))
+    lines: list[list[tuple[str, str]]] = [[]]
+    for style, chunk in fragments:
+        parts = chunk.split("\n")
+        for index, part in enumerate(parts):
+            if index:
+                lines.append([])
+            if part:
+                lines[-1].append((style, part))
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
 @dataclass(slots=True)
 class _ToolRecord:
     session_id: str
@@ -211,6 +332,7 @@ class _ToolRecord:
     name: str
     status: str
     error: str
+    detail: str
     started: float
     ended: float | None = None
 
@@ -249,12 +371,12 @@ class TerminalDisplay:
         self._turn_active = False
         self._records: list[_ToolRecord] = []
         self._index: dict[tuple[str, str, str], _ToolRecord] = {}
-        self._expanded = False
-        # User-selected display preference survives turn boundaries. The
-        # per-turn _expanded flag still closes when the live region closes.
-        self._display_all_steps = False
-        self._collapsed = False
-        self._summary_shown = False
+        self._preview_lines: list[list[tuple[str, str]]] = []
+        self._preview_key: tuple[int, int, int] | None = None
+        # Markdown re-rendering is throttled by its own measured cost, so a
+        # long reply cannot spend most of the frame budget on the preview.
+        self._preview_at = 0.0
+        self._preview_cost = 0.0
         self._last_line = ""
         self._thinking_announced = False
         self._stop_hint = False
@@ -322,16 +444,14 @@ class TerminalDisplay:
         The live area is part of the prompt message so it renders immediately
         above the input line, close to the permanent request. A bottom toolbar
         would pin the same rows to the last terminal line and leave a large
-        blank gap in between.
+        blank gap in between. Settled tool calls are not part of this area:
+        they are printed once into the transcript, in the order they finished.
         """
         fragments: list[tuple[str, str]] = []
         if self._prompt is not None:
             try:
                 width, rows = self._size()
-                for index, line in enumerate(
-                    self.render_lines(width=width, rows=rows)
-                ):
-                    fragments.append((self._style_for(line, index), line + "\n"))
+                fragments.extend(self._live_fragments(width=width, rows=rows))
             except Exception:
                 # A render error must never take down the prompt. The fallback
                 # has no remote or secret text.
@@ -372,10 +492,6 @@ class TerminalDisplay:
     @property
     def phase(self) -> str:
         return self._phase
-
-    @property
-    def expanded(self) -> bool:
-        return self._expanded
 
     @property
     def turn_id(self) -> str | None:
@@ -424,9 +540,6 @@ class TerminalDisplay:
         self._turn_id = None
         self._records = []
         self._index = {}
-        self._expanded = self._display_all_steps
-        self._collapsed = False
-        self._summary_shown = False
         self._last_line = ""
         self._thinking_announced = False
         self._stop_hint = False
@@ -449,11 +562,6 @@ class TerminalDisplay:
         self._detail = ""
         self._active_since = None
         self._turn_active = False
-        if self.live and self._records and not self._summary_shown:
-            self._summary_shown = True
-            self._print_text(self._summary_text())
-        self._collapsed = True
-        self._expanded = False
         self._stop_hint = False
         self._armed_until = None
         self._stream_text = ""
@@ -481,9 +589,6 @@ class TerminalDisplay:
             self._turn_id = event.turn_id
             self._records = []
             self._index = {}
-            self._expanded = self._display_all_steps
-            self._collapsed = False
-            self._summary_shown = False
         self._turn_active = True
         if self._active_since is None:
             self._since = self._clock()
@@ -522,6 +627,7 @@ class TerminalDisplay:
                 name=_clean(payload.get("tool_name") or "tool"),
                 status="requested",
                 error="",
+                detail=argument_detail(payload.get("arguments")),
                 started=self._clock(),
             )
             self._records.append(record)
@@ -549,29 +655,37 @@ class TerminalDisplay:
             running = next((item for item in reversed(self._records) if not item.settled), None)
             self.set_phase(TOOL, running.name) if running else self.set_phase(THINKING)
 
+        # A settled call becomes one permanent transcript line right here, so
+        # every later model chunk lands after it. The live region never holds
+        # a finished row.
+        if record.settled and previous != record.status:
+            self._print_row(record)
         if self.live:
-            if self._expanded and record.settled and previous != record.status:
-                index = self._records.index(record) + 1
-                self._print_text(self._record_line(record, index))
             self._invalidate()
         elif event.type is EventType.TOOL_INTENT:
             self._line(f"Tool {record.name}: requested")
-        elif event.type is EventType.TOOL_SETTLED:
-            marker = "" if record.status == "succeeded" else "! "
-            self._line(f"{marker}Tool {record.name}: {record.status}")
 
     # -- rendering -------------------------------------------------------
 
     def render_lines(self, *, width: int = 80, rows: int = 24) -> list[str]:
-        lines: list[str] = []
-        if (
-            self._armed_until is not None
-            and self._clock() > self._armed_until
-        ):
+        """Plain-text projection of the live region.
+
+        The live region only ever holds the status line and the streamed text
+        of the current model call. Settled tool calls are already printed.
+        """
+        buffer = "".join(text for _, text in self._live_fragments(width=width, rows=rows))
+        lines = buffer.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        return [line.rstrip() for line in lines]
+
+    def _live_fragments(self, *, width: int, rows: int) -> list[tuple[str, str]]:
+        fragments: list[tuple[str, str]] = []
+        if self._armed_until is not None and self._clock() > self._armed_until:
             self._armed_until = None
             self._stop_hint = False
         if self._stop_hint and self._phase != IDLE:
-            lines.append(_fit(STOP_HINT, width))
+            fragments.append(("fg:ansiyellow bold", _fit(STOP_HINT, width) + "\n"))
         if self._phase != IDLE:
             elapsed = max(0.0, self._clock() - (self._active_since or self._since))
             frame = _SPINNER[int(elapsed / _SPINNER_SECONDS) % len(_SPINNER)]
@@ -582,80 +696,20 @@ class TerminalDisplay:
                 label = f"Preparing ({self._detail})"
             if self._phase == STOPPING:
                 label = _STATUS_LABELS[STOPPING]
-            lines.append(_fit(f"{frame} {label} {elapsed:.1f}s", width))
+            style = _PHASE_STYLES.get(self._phase, _PHASE_STYLES[THINKING])
+            fragments.append((style, _fit(f"{frame} {label} {elapsed:.1f}s", width) + "\n"))
 
-        if self._stream_text:
-            # Wrap by terminal display columns, not by code points; CJK and
-            # emoji take two columns. Show the newest wrapped lines so a long
-            # reply without newlines keeps moving. The transcript gets the
-            # final Markdown once, printed by AgentOutput above the prompt.
-            inner_width = max(1, width - 2)
-            wrapped = _wrap_display(self._stream_text, inner_width)
-            reserved = 3  # status + session line + input line
+        preview = self._stream_preview(width)
+        if preview:
+            reserved = 3  # status line + session line + input line
             if self._stop_hint and self._phase != IDLE:
                 reserved += 1
-            if self._turn_active and self._records and not self._collapsed:
-                reserved += self._row_limit(rows) + 1
             available = max(1, rows - reserved)
-            for line in wrapped[-available:]:
-                lines.append(_fit(f"│ {line}", width))
-
-        if not self._turn_active or not self._records or self._collapsed:
-            return lines
-
-        visible = self._records[-self._row_limit(rows):]
-        hidden = len(self._records) - len(visible)
-        ok = sum(1 for item in self._records if item.status == "succeeded")
-        bad = sum(1 for item in self._records if item.failed)
-        cancelled = sum(1 for item in self._records if item.status == "cancelled")
-        counts = [f"{len(self._records)} calls", f"{hidden} hidden"]
-        if hidden and any(item.failed for item in self._records[:-len(visible)]):
-            counts.append("hidden include failures")
-        counts.append(f"{ok} ok")
-        if bad:
-            counts.append(f"{bad} failed/unknown")
-        if cancelled:
-            counts.append(f"{cancelled} cancelled")
-        header = "| " + " · ".join(counts)
-        if self._expanded:
-            header += " · full record on"
-        lines.append(_fit(header, width))
-
-        for record in visible:
-            marker = _TOOL_MARKERS.get(record.status, "?")
-            row = f"| {marker} {record.name} {record.status}"
-            if record.error and record.status in {"failed", "rejected", "unknown"}:
-                row += f" · {_fit(record.error, 60)}"
-            lines.append(_fit(row, width))
-        return lines
-
-    def _style_for(self, line: str, index: int) -> str:
-        if self._stop_hint and index == 0:
-            return "fg:ansiyellow bold"
-        if line.startswith("│ "):
-            return "fg:ansibrightblack"
-        if index > 0 and line.startswith("| "):
-            token = line.split(" ", 2)[1] if line.count(" ") >= 2 else ""
-            if token in _TOOL_MARKERS.values():
-                status = line.split(" · ")[0].rsplit(" ", 1)[-1]
-                return _TOOL_STYLES.get(status, "fg:ansibrightblack")
-            if "failed/unknown" in line:
-                return _TOOL_STYLES["failed"]
-            if "cancelled" in line:
-                return _TOOL_STYLES["cancelled"]
-            return "fg:ansibrightblack"
-        if self._phase != IDLE:
-            return _PHASE_STYLES.get(self._phase, _PHASE_STYLES[THINKING])
-        return "fg:ansibrightblack"
-
-    def _row_limit(self, rows: int) -> int:
-        if rows <= 8:
-            return 1
-        if rows <= 12:
-            return 2
-        if rows <= 16:
-            return 3
-        return TOOL_ROWS
+            for line in preview[-available:]:
+                for style, text in line:
+                    fragments.append((style, text))
+                fragments.append(("", "\n"))
+        return fragments
 
     def _size(self) -> tuple[int, int]:
         if self._size_provider is not None:
@@ -665,62 +719,63 @@ class TerminalDisplay:
         size = get_app().output.get_size()
         return size.columns, size.rows
 
-    def _summary_text(self) -> str:
-        ok = sum(1 for item in self._records if item.status == "succeeded")
-        bad = sum(1 for item in self._records if item.failed)
-        cancelled = sum(1 for item in self._records if item.status == "cancelled")
-        parts = [f"{len(self._records)} calls", f"{ok} ok"]
-        if bad:
-            parts.append(f"{bad} failed/unknown")
-        if cancelled:
-            parts.append(f"{cancelled} cancelled")
-        prefix = "! " if bad else ""
-        return (
-            f"{prefix}Tools this turn: " + " · ".join(parts)
-            + ". /display_all_step shows the full record."
-        )
+    def _stream_preview(self, width: int) -> list[list[tuple[str, str]]]:
+        """Markdown-rendered live preview of the streamed body text.
 
-    def _record_line(self, record: _ToolRecord, index: int) -> str:
-        duration = ""
+        Rendering Markdown costs a few milliseconds per frame, so the result is
+        cached by width and content. A very long reply previews its tail only;
+        the complete text is printed once by AgentOutput when the call ends.
+        """
+        text = self._stream_text
+        if not text:
+            return []
+        if len(text) > _PREVIEW_CHARS:
+            text = text[-_PREVIEW_CHARS:]
+        key = (len(text), hash(text), width)
+        if key == self._preview_key:
+            return self._preview_lines
+        if (
+            self._preview_cost
+            and self._clock() - self._preview_at < self._preview_cost * 4
+        ):
+            # Too soon after an expensive render: keep the last frame and let
+            # the next one catch up. The final block is printed in full anyway.
+            return self._preview_lines
+        started = self._clock()
+        try:
+            self._preview_lines = markdown_lines(text, width)
+        except Exception:
+            # A render failure must not blank the stream: fall back to plain
+            # wrapped text at the same width.
+            self._preview_lines = [
+                [("fg:ansibrightblack", line)]
+                for line in _wrap_display(display_text(text), max(1, width - 1))
+            ]
+        self._preview_key = key
+        self._preview_at = started
+        self._preview_cost = self._clock() - started
+        return self._preview_lines
+
+    def _print_row(self, record: _ToolRecord) -> None:
+        """Print one settled call as a single line, in place of its event."""
+        from rich.text import Text
+
+        style = _TOOL_STYLES.get(record.status, "fg:ansibrightblack")
+        row = Text("  ")
+        row.append(_TOOL_MARKERS.get(record.status, "?"), style=style)
+        row.append(" " + record.name, style="bold")
+        if record.detail:
+            row.append(" · " + record.detail, style="fg:ansibrightblack")
+        if record.status != "succeeded":
+            row.append(" " + record.status, style=style)
         if record.ended is not None:
-            duration = f" · {max(0.0, record.ended - record.started):.1f}s"
-        detail = f" · {record.error}" if record.error else ""
-        return f"  {index}. {record.name} · {record.status}{duration}{detail}"
-
-    def _record_text(self) -> str:
-        if not self._records:
-            return "No tool calls in this turn."
-        turn = display_text(self._turn_id or "unknown")
-        heading = (
-            f"Tool record for turn {turn} "
-            "(redacted; arguments and outcomes are not stored):"
-        )
-        lines = [
-            heading,
-            *(self._record_line(item, index) for index, item in enumerate(self._records, 1)),
-        ]
-        return "\n".join(lines)
-
-    # -- local commands --------------------------------------------------
-
-    def tool_view(self, argument: str = "") -> str:
-        argument = argument.strip().lower()
-        if argument in {"on", "show", "expand"}:
-            self._display_all_steps = True
-        elif argument in {"off", "hide", "collapse"}:
-            self._display_all_steps = False
-        elif argument:
-            return "Usage: /display_all_step [on|off]. The command is local and was not sent to the model."
-        else:
-            self._display_all_steps = not self._display_all_steps
-        self._expanded = self._display_all_steps
-        self._invalidate()
-        if not self._expanded:
-            return "Tool record collapsed."
-        if self._turn_active:
-            self._print_text(self._record_text())
-            return "Tool record expanded; new settlements are printed as they arrive."
-        return self._record_text()
+            row.append(
+                f" · {max(0.0, record.ended - record.started):.1f}s",
+                style="fg:ansibrightblack",
+            )
+        if record.error:
+            row.append(" · " + _fit(record.error, 80), style=style)
+        self._console.print(row)
 
     # -- line fallback ---------------------------------------------------
 

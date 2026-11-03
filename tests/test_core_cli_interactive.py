@@ -109,7 +109,6 @@ class FakeOutput:
         self.turn_requests: list[tuple[str | None, str | None]] = []
         self.turn_finishes = 0
         self.cancel_requests = 0
-        self.tool_views: list[str] = []
 
     def info(self, text: str) -> None:
         self.infos.append(text)
@@ -129,10 +128,6 @@ class FakeOutput:
 
     def cancel_requested(self) -> None:
         self.cancel_requests += 1
-
-    def tool_view(self, argument: str) -> str:
-        self.tool_views.append(argument)
-        return f"tool view:{argument}"
 
 
 async def until(predicate: Callable[[], bool]) -> None:
@@ -507,7 +502,8 @@ async def test_help_is_answered_locally_without_a_model_turn(running_agent):
     reader.send("/help", "exit")
     await asyncio.wait_for(task, 2)
     assert not session.requests
-    assert any("Local commands" in info and "/display_all_step" in info for info in output.infos)
+    assert any("Local commands" in info and "/new" in info for info in output.infos)
+    assert all("/display_all_step" not in info for info in output.infos)
 
 
 async def test_unknown_slash_command_is_rejected_locally(running_agent):
@@ -521,21 +517,17 @@ async def test_unknown_slash_command_is_rejected_locally(running_agent):
     assert "secret-argument" not in output.errors[0]
 
 
-async def test_display_all_step_accepts_on_off_and_toggle_even_while_busy(running_agent):
+async def test_local_help_still_bypasses_the_queue_while_busy(running_agent):
     session, reader, output, task = running_agent
     reader.send("first")
     await until(lambda: session.active is not None)
-    reader.send("/display_all_step on")
-    await until(lambda: output.tool_views == ["on"])
-    assert any("tool view:on" in info for info in output.infos)
-    reader.send("/display_all_step off")
-    await until(lambda: output.tool_views == ["on", "off"])
+    reader.send("/help")
+    await until(lambda: any("Local commands" in info for info in output.infos))
     assert not session.cancelled
     session.releases[0].set()
     await until(lambda: len(output.results) == 1)
-    reader.send("/display_all_step", "exit")
+    reader.send("exit")
     await asyncio.wait_for(task, 2)
-    assert output.tool_views == ["on", "off", ""]
     assert [request.text for request in session.requests] == ["first"]
 
 
@@ -544,7 +536,6 @@ async def test_old_tools_command_is_rejected_and_never_reaches_the_model(running
     reader.send("/tools on", "exit")
     await asyncio.wait_for(task, 2)
     assert not session.requests
-    assert output.tool_views == []
     assert len(output.errors) == 1
     assert "Unknown command /tools" in output.errors[0]
     assert "not sent to the model" in output.errors[0]
@@ -689,8 +680,10 @@ def test_output_tool_events_show_only_name_and_status():
     )
     output.event(RuntimeEvent(type=EventType.TURN_COMPLETED, session_id="session", turn_id="turn"))
     lines = buffer.getvalue().splitlines()
-    assert lines == ["Thinking", "Tool fake_tool: requested", "! Tool fake_tool: unknown"]
-    assert "secret" not in buffer.getvalue() and "token" not in buffer.getvalue()
+    assert lines[:2] == ["Thinking", "Tool fake_tool: requested"]
+    assert lines[2].startswith("  ? fake_tool unknown")
+    # Arguments are never printed; a redacted error summary may be.
+    assert '"secret"' not in buffer.getvalue() and "token" not in buffer.getvalue()
 
 
 def _vt100_output() -> tuple[StringIO, Vt100_Output]:
@@ -1149,3 +1142,12 @@ async def test_eof_during_resume_requests_capability_cancel_before_reaping():
 
     assert session.cancelled == ["cli:test"]
     assert not session.requests
+
+
+def test_startup_hint_points_at_help_without_repeating_the_command_list():
+    from PhyAgentOS.cli.interaction.interactive_session import HELP_TEXT, STARTUP_HINT
+
+    assert "/help" in STARTUP_HINT
+    for command in ("/compact", "/session", "/undo", "/model", "/new"):
+        assert command not in STARTUP_HINT
+        assert command in HELP_TEXT

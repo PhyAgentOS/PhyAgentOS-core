@@ -44,7 +44,10 @@ def _event(kind, *, session="s", turn="t1", **payload):
     )
 
 
-def _usage(output: AgentOutput, *, session="s", turn="t1", call="m1", content=""):
+def _usage(
+    output: AgentOutput, *, session="s", turn="t1", call="m1", content="",
+    tool_calls=False,
+):
     output.event(
         _event(
             EventType.MODEL_ATTEMPT_COMPLETED,
@@ -52,6 +55,7 @@ def _usage(output: AgentOutput, *, session="s", turn="t1", call="m1", content=""
             turn=turn,
             model_call_id=call,
             content=content,
+            tool_calls=tool_calls,
             usage={"prompt_tokens": 100, "completion_tokens": 20},
         )
     )
@@ -437,7 +441,7 @@ def _tool(display, turn, call_id, name, status):
     )
 
 
-def test_default_tool_rows_stay_limited_and_expanded_prints_full_record():
+def test_every_settled_tool_row_is_printed_once_in_call_order():
     buffer = StringIO()
     display = TerminalDisplay(
         Console(file=buffer, width=120, color_system=None), clock=_Clock()
@@ -448,17 +452,47 @@ def test_default_tool_rows_stay_limited_and_expanded_prints_full_record():
     for index in range(6):
         _tool(display, "t1", f"c{index}", f"tool{index}", "succeeded")
 
-    lines = display.render_lines(width=80, rows=24)
-    rows = [line for line in lines if line.startswith("| ")]
-    assert len(rows) == 1 + 4  # header plus the four most recent rows
-    assert "6 calls" in rows[0] and "2 hidden" in rows[0]
-    assert "tool5" in rows[-1] and "tool0" not in "".join(rows)
-
-    display.tool_view("on")
-    text = buffer.getvalue()
-    for index in range(6):
-        assert f"{index + 1}. tool{index} · succeeded" in text
+    rows = [line for line in buffer.getvalue().splitlines() if line.strip()]
+    assert [row.split()[1] for row in rows] == [f"tool{i}" for i in range(6)]
+    # No hidden rows and no live copy: the transcript already has them all.
+    live = display.render_lines(width=80, rows=24)
+    assert all("tool" not in line for line in live)
 
     _tool(display, "t1", "c6", "tool6", "failed")
-    assert "7. tool6 · failed" in buffer.getvalue()
-    assert display.expanded is True
+    assert buffer.getvalue().splitlines()[-1].startswith("  ✗ tool6 failed")
+
+
+def test_streamed_text_and_tool_rows_keep_their_event_order():
+    output, buffer = _output(width=120)
+    output.attach_prompt(_FakePrompt())
+    output.turn_started("s", request_text="move the box")
+    output.event(_event(EventType.TURN_STARTED))
+    _delta(output, "I will list the tools first.\n")
+    _usage(output, tool_calls=True, content="I will list the tools first.\n")
+    output.event(
+        _event(EventType.TOOL_INTENT, tool_call_id="c1", tool_name="forge_tool_list")
+    )
+    output.event(
+        _event(
+            EventType.TOOL_SETTLED,
+            tool_call_id="c1",
+            tool_name="forge_tool_list",
+            status="succeeded",
+        )
+    )
+    _delta(output, "The list is empty; nothing moved.\n")
+    _usage(output, tool_calls=False, content="The list is empty; nothing moved.\n")
+    output.result(
+        TurnResult(
+            "s", "t1", TurnStatus.COMPLETED, reply="The list is empty; nothing moved."
+        )
+    )
+    output.turn_finished()
+
+    text = buffer.getvalue()
+    first = text.index("I will list the tools first.")
+    row = text.index("forge_tool_list")
+    final = text.index("The list is empty; nothing moved.", row)
+    assert first < row < final
+    # The final body is printed once, after the tool rows, not twice.
+    assert text.count("The list is empty; nothing moved.") == 1

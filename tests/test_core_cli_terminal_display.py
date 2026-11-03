@@ -1,7 +1,7 @@
 """Behaviour of the live terminal region and its plain fallback.
 
 These tests use a deterministic clock for the spinner and the real
-prompt_toolkit pipe input plus Vt100 output for the toolbar. No provider,
+prompt_toolkit pipe input plus Vt100 output for the live region. No provider,
 Gateway or robot is contacted.
 """
 
@@ -32,6 +32,7 @@ from PhyAgentOS.cli.interaction.interactive_session import InteractiveAgent
 from PhyAgentOS.cli.interaction.terminal_display import (
     REQUEST_PROMPT,
     TerminalDisplay,
+    argument_detail,
     safe_detail,
 )
 from PhyAgentOS.cli.interaction.terminal_input import TerminalInput
@@ -150,44 +151,37 @@ def test_spinner_appears_switches_and_clears():
     display.end_turn()  # idempotent cleanup must not print another summary
 
 
-def test_tool_area_shows_last_four_updates_one_call_and_counts_hidden():
+def test_settled_calls_print_in_order_and_leave_the_live_region_alone():
     display, buffer = _display(live=True)
     display.begin_turn()
     display.note_event(_event(EventType.TURN_STARTED))
     for index in range(6):
         _tool(display, "turn", f"c{index}", f"tool{index}", "succeeded")
-    lines = display.render_lines(width=80, rows=24)
-    header = lines[1]
-    assert "6 calls" in header and "2 hidden" in header
-    rows = [line for line in lines if line.startswith("| ")]
-    assert len(rows) == 1 + 4  # header plus the four most recent rows
-    assert "tool5" in rows[-1] and "succeeded" in rows[-1]
+    rows = [line for line in buffer.getvalue().splitlines() if line.strip()]
+    assert [row.split()[1] for row in rows] == [f"tool{i}" for i in range(6)]
+    assert all(row.startswith("  ✓ ") for row in rows)
+    assert len(display.records) == 6
 
-    # The same call reported again updates its row instead of adding one.
-    _tool(display, "turn", "c5", "tool5", "succeeded")
+    # The live region only carries the status line; finished rows are already
+    # in the transcript, in the order they finished.
+    live = display.render_lines(width=80, rows=24)
+    assert len(live) == 1 and "Thinking" in live[0]
+    assert all("tool" not in line for line in live)
+
+    # A later settlement of the same call prints its new state instead of
+    # rewriting the earlier line.
     display.note_event(
         _event(
             EventType.TOOL_SETTLED, tool_call_id="c5", tool_name="tool5", status="failed"
         )
     )
     assert len(display.records) == 6
-    header = display.render_lines(width=80, rows=24)[1]
-    assert "6 calls" in header and "1 failed/unknown" in header
-    latest = [line for line in display.render_lines(width=80, rows=24)
-              if line.startswith("| ")][-1]
-    assert "tool5 failed" in latest and "tool5 succeeded" not in latest
-
-    # A hidden failure is never silently dropped.
-    _tool(display, "turn", "c0", "tool0", "unknown")
-    header = display.render_lines(width=80, rows=24)[1]
-    assert "hidden include failures" in header
-
+    rows = [line for line in buffer.getvalue().splitlines() if line.strip()]
+    assert rows[-1].startswith("  ✗ tool5 failed")
     display.end_turn()
-    summary = buffer.getvalue().splitlines()[-1]
-    assert "failed/unknown" in summary and "\n" not in summary
 
 
-def test_expanded_record_shows_redacted_error_without_arguments_or_outcomes():
+def test_settled_row_shows_redacted_error_without_arguments_or_outcomes():
     display, buffer = _display(live=True)
     display.begin_turn()
     display.note_event(_event(EventType.TURN_STARTED))
@@ -210,16 +204,14 @@ def test_expanded_record_shows_redacted_error_without_arguments_or_outcomes():
             outcome={"TOP_SECRET_OUTCOME": "TOP_SECRET_RESULT"},
         )
     )
-    message = display.tool_view("on")
     text = buffer.getvalue()
-    assert "Tool record" in text and "bad_request" in text
+    assert "bad_request" in text
     assert "TOP_SECRET_ARG" not in text and "TOP_SECRET_OUTCOME" not in text
     assert "TOP_SECRET_VALUE" not in text and "TOP_SECRET_RESULT" not in text
     assert "secret.example" not in text and "sk-abcdef123456" not in text
     assert "<url>" in text and "<redacted>" in text
     assert "x" * 500 not in text
     assert len(safe_detail(long_message)) <= 400
-    assert "expanded" in message.lower()
 
     display.note_event(
         _event(
@@ -229,8 +221,8 @@ def test_expanded_record_shows_redacted_error_without_arguments_or_outcomes():
             status="unknown",
         )
     )
-    # Later settlements while expanded print one redacted line each.
-    assert buffer.getvalue().count("1. fake_tool") == 2
+    # A later settlement prints one more redacted line; nothing is rewritten.
+    assert buffer.getvalue().count("? fake_tool unknown") == 1
 
 
 def test_new_turn_does_not_inherit_old_tool_state_or_duplicate_events():
@@ -260,52 +252,45 @@ def test_new_turn_does_not_inherit_old_tool_state_or_duplicate_events():
 
 
 @pytest.mark.parametrize(("columns", "rows"), [(28, 9), (40, 24), (12, 6)])
-def test_toolbar_fits_narrow_and_short_terminals(columns, rows):
+def test_live_region_fits_narrow_and_short_terminals(columns, rows):
     display, _ = _display(live=True, size=lambda: (columns, rows))
     display.begin_turn()
     display.note_event(_event(EventType.TURN_STARTED))
-    for index in range(5):
-        _tool(display, "turn", f"c{index}", f"very_long_tool_name_{index}", "succeeded")
+    display.set_stream_text("streamed body text with **bold** and `code` " * 8)
     lines = display.render_lines(width=columns, rows=rows)
     assert lines
     assert max(len(line) for line in lines) <= columns
-    limit = 1 if rows <= 8 else 2 if rows <= 12 else 4
-    hidden = max(0, 5 - limit)
-    assert "5 calls" in lines[1]
-    if columns >= 24:
-        assert f"{hidden} hidden" in lines[1]
-    tool_rows = [line for line in lines if line.startswith("| ")]
-    assert len(tool_rows) <= limit + 1
+    assert len(lines) <= rows
     message = display.prompt_message()
-    assert any("5 calls" in text for _, text in message)
-    # The live rows are in the prompt message right above the session line,
-    # not in a terminal-anchored bottom toolbar.
     assert message[-1][1].rstrip("\n").startswith("session s")
 
 
 def test_prompt_message_keeps_live_rows_directly_above_the_session_line():
-    display, _ = _display(live=True)
+    display, buffer = _display(live=True)
     display.begin_turn()
     display.note_event(_event(EventType.TURN_STARTED))
     _tool(display, "turn", "c1", "first_tool", "succeeded")
     _tool(display, "turn", "c2", "second_tool", "succeeded")
 
     texts = [text.rstrip("\n") for _, text in display.prompt_message()]
-    # Status, hidden-count header and the limited tool rows all precede the
-    # session line, which stays directly above the input line.
     assert texts[-1].startswith("session s")
     assert not texts[-1].endswith(REQUEST_PROMPT)
     dynamic = texts[:-1]
-    assert any(text.startswith("| ") for text in dynamic)
-    assert len(dynamic) >= 3
+    assert len(dynamic) == 1 and "Thinking" in dynamic[0]
+    assert all("first_tool" not in text for text in texts)
+    # The finished calls are transcript lines already, in call order.
+    assert buffer.getvalue().splitlines() == [
+        "  ✓ first_tool · 0.0s",
+        "  ✓ second_tool · 0.0s",
+    ]
 
     display.end_turn()
     texts = [text.rstrip("\n") for _, text in display.prompt_message()]
     # Ending the turn shrinks the area back to the session line and the next
-    # request marker; no stale status or tool rows remain.
+    # request marker; no stale status rows remain.
     assert texts[-1].rstrip() == REQUEST_PROMPT.rstrip()
     assert texts[0].startswith("session s")
-    assert all("calls" not in text and "Thinking" not in text for text in texts)
+    assert all("Thinking" not in text for text in texts)
 
 
 def test_plain_fallback_uses_lines_without_cursor_or_animation_codes():
@@ -321,7 +306,7 @@ def test_plain_fallback_uses_lines_without_cursor_or_animation_codes():
     assert lines[0] == "Preparing"
     assert lines[1] == "Thinking"
     assert "Tool demo: requested" in lines
-    assert "! Tool demo: failed" in lines
+    assert "  ✗ demo failed · 0.0s · e: boom" in lines
     # No spinner frames and no repeated Thinking after each tool call.
     assert sum(1 for line in lines if line == "Thinking") == 1
 
@@ -361,8 +346,8 @@ async def test_real_pipe_input_and_vt100_render_spinner_toolarea_and_cleanup(tmp
 
             rendered = _ANSI.sub("", stream.getvalue())
             assert re.search(r"\.\.? +Calling fake_tool 0\.\ds", rendered)
-            assert "| 1 calls" in rendered
-            assert "| . fake_tool requested" in rendered
+            # Nothing is pinned into a fixed tool table under the status line.
+            assert "| " not in rendered
 
             # A resize must not raise or corrupt the prompt.
             size[0] = Size(rows=10, columns=40)
@@ -548,13 +533,11 @@ def test_markup_like_tool_text_is_data_not_rich_markup():
         )
     )
     # None of these may raise a Rich markup error or apply formatting.
-    lines = display.render_lines(width=100, rows=24)
-    display.tool_view("on")
     text = buffer.getvalue()
     assert "evil[red]tool" in text
     assert "[bold]boom[/]" in text
     assert "TOP_SECRET_ARG" not in text
-    assert any("evil[red]tool failed" in line for line in lines)
+    assert any("evil[red]tool failed" in line for line in text.splitlines())
 
 
 def test_stop_without_a_running_turn_leaves_no_status_behind():
@@ -616,11 +599,11 @@ def test_stopping_status_is_not_overwritten_by_later_events():
             status="unknown",
         )
     )
-    # The settlement still updates the tool row...
+    # The settlement still prints its row...
     lines = display.render_lines(width=90, rows=24)
     assert display.phase == "stopping"
     assert "Stopping locally (remote unconfirmed)" in lines[0]
-    assert any("late_tool unknown" in line for line in lines)
+    assert all("late_tool" not in line for line in lines)
     # ...but only a terminal turn event clears the stop state.
     display.note_event(_event(EventType.TURN_INTERRUPTED))
     assert display.phase == "idle"
@@ -629,13 +612,13 @@ def test_stopping_status_is_not_overwritten_by_later_events():
 
 @pytest.mark.parametrize("columns", [1, 2, 12, 30])
 @pytest.mark.parametrize("name", ["中文工具", "工具🤖", "🙂emoji工具"])
-def test_toolbar_width_counts_cjk_and_emoji_as_display_columns(columns, name):
+def test_live_preview_width_counts_cjk_and_emoji_as_display_columns(columns, name):
     from prompt_toolkit.utils import get_cwidth
 
     display, _ = _display(live=True, size=lambda: (columns, 24))
     display.begin_turn()
     display.note_event(_event(EventType.TURN_STARTED))
-    _tool(display, "turn", "c1", name, "succeeded")
+    display.set_stream_text((name + " ") * 5)
     lines = display.render_lines(width=columns, rows=24)
     assert lines
     for line in lines:
@@ -709,7 +692,7 @@ async def test_live_area_is_the_prompt_message_not_a_bottom_toolbar(
     )
     stream = StringIO()
     output = _TerminalOutput(stream, lambda: Size(rows=24, columns=80))
-    display, _ = _display(live=True)
+    display, buffer = _display(live=True)
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=output):
             terminal = TerminalInput(display=display, input=pipe, output=output)
@@ -733,12 +716,13 @@ async def test_live_area_is_the_prompt_message_not_a_bottom_toolbar(
             )
             dynamic = texts[:session_index]
             assert any("Thinking" in text for text in dynamic)
-            assert any(text.startswith("| ") for text in dynamic)
+            # Settled calls are transcript lines, not live rows.
+            assert all(not text.startswith("| ") for text in dynamic)
             # Busy: no request marker; the session line is last in the message,
             # so the dynamic rows sit immediately above the input line.
             assert session_index == len(texts) - 1
             assert "│" not in texts
-            assert "| 1 calls" in _ANSI.sub("", stream.getvalue())
+            assert "demo_tool" in buffer.getvalue()
 
             display.end_turn()
             await _wait(0.3)
@@ -1077,7 +1061,7 @@ def test_stream_preview_wraps_long_cjk_and_shows_the_newest_tail():
     first = "机械臂状态检查" * 20
     display.set_stream_text(first)
     lines = display.render_lines(width=20, rows=8)
-    preview = [line for line in lines if line.startswith("│ ")]
+    preview = [line for line in lines if "机械臂" in line or "检查" in line]
     assert len(preview) >= 2
     assert all(len(line) <= 20 for line in preview)
     # With a small viewport the oldest text is gone; the newest text remains.
@@ -1086,7 +1070,8 @@ def test_stream_preview_wraps_long_cjk_and_shows_the_newest_tail():
     latest = "最新增量XYZ"
     display.set_stream_text(first + latest)
     narrowed = display.render_lines(width=20, rows=8)
-    assert any(latest[-3:] in line or "XYZ" in line for line in narrowed)
+    # The newest increment stays in view even when it lands on a fresh line.
+    assert any("YZ" in line or "XYZ" in line for line in narrowed)
     # Resize re-wraps the retained full text instead of keeping stale lines.
     widened = display.render_lines(width=30, rows=20)
     assert widened != narrowed
@@ -1307,3 +1292,98 @@ async def test_busy_correction_callback_exact_and_turn_end_race_never_submits(
                     run.cancel()
                 await asyncio.gather(run, return_exceptions=True)
             terminal.restore()
+
+
+def test_stream_preview_renders_markdown_and_drops_hyperlink_addresses():
+    display, _ = _display(live=True, size=lambda: (60, 24))
+    display.begin_turn()
+    display.set_stream_text("# Heading\n\n**bold** and `code`\n")
+    message = display.prompt_message()
+    text = "".join(chunk for _, chunk in message)
+    assert "Heading" in text and "#" not in text
+    styles = {style for style, chunk in message if chunk.strip()}
+    assert any("bold" in style.split() for style in styles)
+
+    display.set_stream_text("see [link](https://example.com)\n")
+    text = "".join(chunk for _, chunk in display.prompt_message())
+    assert "link" in text
+    assert "example.com" not in text
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ({"name": "pick-and-place", "role": "primary"}, "pick-and-place"),
+        ({"tool_id": "sim.move_eef", "arguments": {"x": 1}}, "sim.move_eef"),
+        ({"path": "PhyAgentOS/cli/x.py", "limit": 20}, "PhyAgentOS/cli/x.py"),
+        ({"command": "git status --short"}, "git status --short"),
+        ({"query": "grasp"}, "grasp"),
+        ({"url": "https://docs.example.com/a/b?token=abc#top"}, "https://docs.example.com/a/b"),
+        ({"job_id": "job_123"}, "job_123"),
+        ({"hidden": "TOP_SECRET"}, ""),
+        ({}, ""),
+        (None, ""),
+    ],
+)
+def test_argument_detail_picks_the_key_that_describes_the_call(arguments, expected):
+    assert argument_detail(arguments) == expected
+
+
+def test_argument_detail_redacts_credentials_and_stays_short():
+    command = "curl -H 'Authorization: Bearer abc123' https://api.example.com/v1/run"
+    detail = argument_detail({"command": command})
+    assert "abc123" not in detail
+    assert "api.example.com" in detail
+
+    long_path = "a/" + "deep/" * 40 + "file.py"
+    detail = argument_detail({"path": long_path})
+    assert len(detail) <= 60 and detail.endswith("…")
+
+
+def test_settled_row_shows_the_argument_it_acts_on():
+    display, buffer = _display(live=True)
+    display.begin_turn()
+    display.note_event(_event(EventType.TURN_STARTED))
+    display.note_event(
+        _event(
+            EventType.TOOL_INTENT,
+            tool_call_id="c1",
+            tool_name="read_file",
+            arguments={"path": "docs/en/02-user-manual.md"},
+        )
+    )
+    display.note_event(
+        _event(
+            EventType.TOOL_SETTLED,
+            tool_call_id="c1",
+            tool_name="read_file",
+            status="succeeded",
+        )
+    )
+    row = next(line for line in buffer.getvalue().splitlines() if "read_file" in line)
+    assert row.startswith("  ✓ read_file")
+    assert "docs/en/02-user-manual.md" in row
+
+
+def test_unknown_tool_arguments_are_not_dumped():
+    display, buffer = _display(live=True)
+    display.begin_turn()
+    display.note_event(_event(EventType.TURN_STARTED))
+    display.note_event(
+        _event(
+            EventType.TOOL_INTENT,
+            tool_call_id="c1",
+            tool_name="mystery_tool",
+            arguments={"secret": "value"},
+        )
+    )
+    display.note_event(
+        _event(
+            EventType.TOOL_SETTLED,
+            tool_call_id="c1",
+            tool_name="mystery_tool",
+            status="succeeded",
+        )
+    )
+    row = next(line for line in buffer.getvalue().splitlines() if "mystery_tool" in line)
+    assert "value" not in row

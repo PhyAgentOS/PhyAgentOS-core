@@ -183,7 +183,8 @@ async def test_undo_reports_a_removed_request_and_prints_it_without_a_prompt(
     assert code == 0
     assert store.calls == ["cli:test"]
     assert not host.requests
-    assert "/undo" in text  # the startup banner names the command
+    # The startup line points at /help instead of listing every command.
+    assert "Type /help for local commands." in text
     assert "Request turn-1 was removed from the context used by later turns." in text
     assert "No input line is available to refill" in text
     assert _REQUEST_TEXT in text
