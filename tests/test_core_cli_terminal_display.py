@@ -1387,3 +1387,31 @@ def test_unknown_tool_arguments_are_not_dumped():
     )
     row = next(line for line in buffer.getvalue().splitlines() if "mystery_tool" in line)
     assert "value" not in row
+
+
+def test_settled_rows_carry_outcome_colours():
+    """Rich colour names must survive: prompt_toolkit names parse as invalid
+    colours here and the row prints plain, with no distinction at all."""
+    buffer = StringIO()
+    console = Console(file=buffer, width=120, color_system="standard")
+    display = TerminalDisplay(console, clock=_Clock())
+    display.begin_turn()
+    display.note_event(_event(EventType.TURN_STARTED))
+    rows = (
+        ("c1", "read_file", "succeeded"),
+        ("c2", "web_fetch", "failed"),
+        ("c3", "mystery_tool", "unknown"),
+    )
+    for call_id, name, status in rows:
+        display.note_event(
+            _event(EventType.TOOL_INTENT, tool_call_id=call_id, tool_name=name)
+        )
+        display.note_event(
+            _event(EventType.TOOL_SETTLED, tool_call_id=call_id, tool_name=name, status=status)
+        )
+    text = buffer.getvalue()
+    assert "\x1b[32m" in text  # succeeded marker, green
+    assert "\x1b[31m" in text  # failed marker, red
+    assert "\x1b[33m" in text  # unknown marker, yellow
+    assert "\x1b[90m" in text  # detail and elapsed time, bright black
+    assert "\x1b[1m" in text  # bold tool name

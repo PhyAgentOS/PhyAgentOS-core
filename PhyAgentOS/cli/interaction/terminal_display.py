@@ -119,13 +119,17 @@ _TOOL_MARKERS = {
     "cancelled": "−",
     "unknown": "?",
 }
+# Rich colour names: settled rows go through Console.print(Text), not through a
+# prompt_toolkit fragment list. The ``fg:ansi*`` names are prompt_toolkit's;
+# Rich cannot parse them, silently drops the colour and prints plain text.
 _TOOL_STYLES = {
-    "succeeded": "fg:ansigreen",
-    "failed": "fg:ansired",
-    "rejected": "fg:ansired",
-    "cancelled": "fg:ansiyellow",
-    "unknown": "fg:ansiyellow",
+    "succeeded": "green",
+    "failed": "red",
+    "rejected": "red",
+    "cancelled": "yellow",
+    "unknown": "yellow",
 }
+_TOOL_DETAIL_STYLE = "bright_black"
 
 # The same C0/C1 filter the renderer applies to model and tool text. Keeping it
 # here lets the live rows and the line fallback share one safety rule.
@@ -760,18 +764,18 @@ class TerminalDisplay:
         """Print one settled call as a single line, in place of its event."""
         from rich.text import Text
 
-        style = _TOOL_STYLES.get(record.status, "fg:ansibrightblack")
+        style = _TOOL_STYLES.get(record.status, _TOOL_DETAIL_STYLE)
         row = Text("  ")
         row.append(_TOOL_MARKERS.get(record.status, "?"), style=style)
         row.append(" " + record.name, style="bold")
         if record.detail:
-            row.append(" · " + record.detail, style="fg:ansibrightblack")
+            row.append(" · " + record.detail, style=_TOOL_DETAIL_STYLE)
         if record.status != "succeeded":
             row.append(" " + record.status, style=style)
         if record.ended is not None:
             row.append(
                 f" · {max(0.0, record.ended - record.started):.1f}s",
-                style="fg:ansibrightblack",
+                style=_TOOL_DETAIL_STYLE,
             )
         if record.error:
             row.append(" · " + _fit(record.error, 80), style=style)
