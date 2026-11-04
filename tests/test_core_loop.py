@@ -1548,7 +1548,6 @@ async def test_runtime_cancel_during_real_context_summary_is_bounded(tmp_path) -
         provider,
         model="fake-model",
         capacity=100_000,
-        reserve_tokens=1_000,
         threshold=10,
         system_instructions="sys",
         estimator=lambda messages, tools: 1_000,

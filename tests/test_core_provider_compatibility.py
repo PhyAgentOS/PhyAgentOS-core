@@ -14,7 +14,7 @@ import pytest
 from PhyAgentOS.agent.core.model import ModelAdapter
 from PhyAgentOS.agent.core.types import ModelRequest, ToolDefinition
 from PhyAgentOS.config.schema import Config
-from PhyAgentOS.providers.base import LLMProvider, LLMResponse
+from PhyAgentOS.providers.base import GenerationSettings, LLMProvider, LLMResponse
 from PhyAgentOS.providers.providers_manager import ProvidersManager
 
 
@@ -124,7 +124,7 @@ async def test_unspecified_tool_choice_keeps_existing_defaults(extra: dict[str, 
     chat = main.chat_calls[0]
     assert chat["tool_choice"] is None
     assert chat["model"] == "fake-main"
-    assert chat["max_tokens"] == 4096
+    assert chat["max_tokens"] is None
     assert chat["temperature"] == 0.7
     assert chat["reasoning_effort"] is None
 
@@ -148,3 +148,23 @@ async def test_core_adapter_against_real_manager_forwards_tool_choice() -> None:
     assert forwarded["model"] == "fake-main"
     # The adapter sent no temperature, so the manager's existing default applies.
     assert main.chat_calls[0]["temperature"] == 0.7
+
+
+class _RequiresMaxTokensProvider(RecordingProvider):
+    requires_max_tokens = True
+
+
+async def test_required_max_tokens_uses_the_fallback_only_when_needed() -> None:
+    provider = _RequiresMaxTokensProvider("fake-main")
+    provider.generation = GenerationSettings(required_max_tokens=32_768)
+
+    await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert provider.chat_calls[0]["max_tokens"] == 32_768
+
+    await provider.chat_with_retry(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=123,
+    )
+    assert provider.chat_calls[1]["max_tokens"] == 123

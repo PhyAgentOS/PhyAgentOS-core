@@ -36,21 +36,23 @@ class CustomProvider(LLMProvider):
         self._max_tokens_param = "max_tokens"
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-                   model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
+                   model: str | None = None, max_tokens: int | None = None, temperature: float = 0.7,
                    reasoning_effort: str | None = None,
                    tool_choice: str | dict[str, Any] | None = None) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": self._sanitize_empty_content(messages),
-            self._max_tokens_param: max(1, max_tokens),
             "temperature": temperature,
         }
+        if max_tokens is not None:
+            kwargs[self._max_tokens_param] = max(1, max_tokens)
         if reasoning_effort and reasoning_effort != "none":
             kwargs["reasoning_effort"] = reasoning_effort
         # Clearing effort restores the model default, not legacy request parameters.
         if "reasoning_effort" in kwargs or is_openai_reasoning_model(kwargs["model"]):
             kwargs.pop("temperature", None)
-            kwargs["max_completion_tokens"] = kwargs.pop(self._max_tokens_param)
+            if self._max_tokens_param in kwargs:
+                kwargs["max_completion_tokens"] = kwargs.pop(self._max_tokens_param)
         if tools:
             kwargs.update(tools=tools, tool_choice=tool_choice or "auto")
         try:
@@ -110,7 +112,7 @@ class CustomProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         model: str | None,
-        max_tokens: int,
+        max_tokens: int | None,
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
@@ -119,16 +121,18 @@ class CustomProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": self._sanitize_empty_content(messages),
-            self._max_tokens_param: max(1, max_tokens),
             "temperature": temperature,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if max_tokens is not None:
+            kwargs[self._max_tokens_param] = max(1, max_tokens)
         if reasoning_effort and reasoning_effort != "none":
             kwargs["reasoning_effort"] = reasoning_effort
         if "reasoning_effort" in kwargs or is_openai_reasoning_model(kwargs["model"]):
             kwargs.pop("temperature", None)
-            kwargs["max_completion_tokens"] = kwargs.pop(self._max_tokens_param)
+            if self._max_tokens_param in kwargs:
+                kwargs["max_completion_tokens"] = kwargs.pop(self._max_tokens_param)
         if tools:
             kwargs.update(tools=tools, tool_choice=tool_choice or "auto")
         return kwargs

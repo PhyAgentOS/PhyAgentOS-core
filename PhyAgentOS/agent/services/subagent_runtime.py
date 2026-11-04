@@ -78,7 +78,7 @@ def _effective_context_capacity(
     source = getattr(selection, "context_window_source", None)
     if capacity:
         capacity = int(capacity)
-        if source in {"model", "configured", "fallback"}:
+        if source in {"model", "configured", "default"}:
             return capacity
         if configured_cap:
             return min(int(configured_cap), capacity)
@@ -340,7 +340,7 @@ class CoreSubagent:
         workspace: str,
         max_steps: int,
         temperature: float,
-        max_tokens: int,
+        max_tokens: int | None,
         role: str | None = None,
         tool_allowlist: frozenset[str] | None = None,
         budget_guard: BudgetGuard | None = None,
@@ -445,13 +445,7 @@ class CoreSubagent:
             capacity = _effective_context_capacity(
                 self._selection, self._context_window_cap
             )
-            semantics = getattr(
-                self._selection, "context_window_semantics", "unknown"
-            )
-            # Match the parent rule: only a provider that explicitly proves an
-            # input-only window may skip the reply reserve.
-            reserve_tokens = 0 if semantics == "input" else self._max_tokens
-            if auto_compact and capacity is not None and capacity > reserve_tokens:
+            if auto_compact and capacity is not None and capacity > 0:
                 from .context_policy import ContextPolicy
 
                 context_policy = ContextPolicy(
@@ -459,7 +453,6 @@ class CoreSubagent:
                     provider,
                     model=self._selection.model,
                     capacity=capacity,
-                    reserve_tokens=reserve_tokens,
                     threshold=float(
                         getattr(performance, "compaction_threshold", 0.8)
                     ),

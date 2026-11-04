@@ -487,14 +487,17 @@ streaming support still produces a normal one-shot reply.
 The session line shows `context ...`: the estimated size of the current request (system prompt,
 tool schemas and history) as a share of the effective window. Model metadata is preferred; an
 explicit `contextWindowTokens` value is only an upper cap and is never rewritten at runtime. The
-documented 65,536 fallback applies only when there is **neither reliable metadata nor an explicit
+documented 262,144 default applies only when there is **neither reliable metadata nor an explicit
 cap**. With an explicit cap, that configured value is used (never silently raised to 1M), and the
-status shows the source (model/configured/fallback). `≈` marks an estimate; a provider-reported
+status shows the source (model/configured/default). `≈` marks an estimate; a provider-reported
 value has no `≈` and no literal `exact` text; an unknown context size shows `context --` or
 `used/--`, not `--%`. A request above capacity stays above 100% instead of being clamped. The
-status line shows only `context used/window percent`; the reply budget, the input limit and the
-token estimator source are recorded in `request.prepared.request_budget` and in the guard error
-instead of the line. `(assumed)` marks a fallback capacity. Tools are stage-gated: task creation/change
+status line shows only `context used/window percent`; there is no local request guard, no reply
+budget is subtracted, and `maxTokens` is omitted unless the provider requires that parameter.
+Its value is the fallback used only for those providers. `(assumed)`
+marks the default capacity and the terminal tells the user to set `contextWindowTokens` when
+needed. Automatic compaction triggers at `compactionThreshold` of the effective window. Tools are
+stage-gated: task creation/change
 tools are not offered before a Skill is activated; registered
 definitions still exist, they are just not visible on that step. One exact Skill content version
 normally keeps one full document per request; if the body is short and dropping it would save fewer

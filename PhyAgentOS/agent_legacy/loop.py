@@ -147,7 +147,7 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int = 40,
-        context_window_tokens: int = 65_536,
+        context_window_tokens: int = 262_144,
         max_concurrent_turns: int = 4,
         per_session_queue_limit: int = 8,
         brave_api_key: str | None = None,
@@ -466,7 +466,9 @@ class AgentLoop:
         generation = getattr(provider, "generation", None) or getattr(
             self.provider, "generation", None
         )
-        configured = int(getattr(generation, "max_tokens", 0) or 0) or 4096
+        configured = int(getattr(generation, "max_tokens", 0) or 0)
+        if not configured:
+            configured = int(getattr(generation, "required_max_tokens", 0) or 0) or 32_768
         available = window - estimated - self._OUTPUT_BUDGET_SAFETY_MARGIN
         minimum = min(self._MIN_OUTPUT_TOKENS, configured)
         if available < minimum:

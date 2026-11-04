@@ -86,10 +86,10 @@ class ProviderSelection:
 @dataclass(frozen=True)
 class RuntimeSelection(ProviderSelection):
     provider: LLMProvider = field(repr=False, compare=False)
-    # Effective input window used by the request guard, compaction and the
-    # status line. Always a positive int after ``ProviderService.resolve``.
+    # Effective window used by the status line and compaction. Always a
+    # positive int after ``ProviderService.resolve``.
     context_window_tokens: int | None = None
-    # How that number was obtained: "model", "configured", "fallback", or
+    # How that number was obtained: "model", "configured", "default", or
     # "unknown" for selections built by callers that do not resolve capacity.
     context_window_source: str = "unknown"
     # What the provider's local metadata reported, when it reported anything.
@@ -117,8 +117,8 @@ def compose_context_capacity(
     """Pick the effective input window and say where it came from.
 
     A reliable model window wins unless the user set a smaller explicit cap.
-    With neither, the documented fallback applies; it is marked so the status
-    line can show that the number is assumed, not the model's real limit.
+    With neither, the documented default applies; it is marked so the status
+    line can show that the number is a default, not the model's real limit.
     """
     model_window = _positive_int(reported)
     if model_window is not None and model_window > _MAX_PLAUSIBLE_MODEL_CONTEXT_WINDOW:
@@ -132,13 +132,13 @@ def compose_context_capacity(
         return model_window, "model"
     if cap is not None:
         return cap, "configured"
-    return DEFAULT_CONTEXT_WINDOW_TOKENS, "fallback"
+    return DEFAULT_CONTEXT_WINDOW_TOKENS, "default"
 
 
 _SOURCE_LABELS = {
     "model": "model metadata",
     "configured": "configured cap",
-    "fallback": "assumed default, model metadata unavailable",
+    "default": "assumed default; set agents.defaults.contextWindowTokens if different",
     "unknown": "unknown",
 }
 
@@ -411,9 +411,11 @@ class ProviderService:
         defaults = self.config.agents.defaults
         provider.generation = GenerationSettings(
             temperature=defaults.temperature,
-            max_tokens=defaults.max_tokens,
+            max_tokens=None,
+            required_max_tokens=defaults.max_tokens,
             reasoning_effort=selection.effort,
         )
+        provider.requires_max_tokens = bool(spec.requires_max_tokens)
         reported = provider.get_context_window(selection.model)
         context_window_tokens, context_window_source = compose_context_capacity(
             reported=reported, configured=defaults.context_window_tokens
@@ -589,7 +591,7 @@ class SessionRuntimes:
             if current.context_window_semantics == "input":
                 detail = f"{detail}; input-only window"
             elif current.context_window_semantics == "unknown":
-                detail = f"{detail}; input+output sharing unverified, reply budget reserved"
+                detail = f"{detail}; input+output sharing unverified"
             if current.model_context_window_tokens is not None:
                 detail = f"{detail}; model reports {current.model_context_window_tokens}"
             return (

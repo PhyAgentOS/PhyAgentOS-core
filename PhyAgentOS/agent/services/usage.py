@@ -37,7 +37,6 @@ __all__ = [
     "TokenUsage",
     "UsageLedger",
     "UsageTotals",
-    "context_input_limit",
     "estimate_context",
     "estimate_context_from_conversation",
     "format_context_label",
@@ -472,41 +471,16 @@ def _format_tokens(value: int | None) -> str:
     return "--" if value is None else str(value)
 
 
-def context_input_limit(
-    capacity: int | None,
-    reply_budget: int | None,
-    capacity_kind: str | None,
-) -> int | None:
-    """Return the largest input estimate this request may send, or ``None``.
-
-    Only a provider that explicitly proves input-only semantics
-    (``capacity_kind == "input"``) keeps the reply budget outside the window.
-    Every other window (an explicit cap, an assumed fallback, or a provider
-    that did not declare its semantics) is treated conservatively as shared
-    input+output: the reply budget is reserved out of it. This keeps the old
-    guard behavior without pretending an input-only number is a total window.
-    """
-    if capacity is None or capacity <= 0:
-        return None
-    if capacity_kind == "input":
-        return capacity
-    return max(0, capacity - max(0, reply_budget or 0))
-
-
 @dataclass(frozen=True, slots=True)
 class ContextSnapshot:
-    """Current prompt size, the model window, and the next request budget.
+    """Current prompt size and the effective window.
 
     ``tokens`` is the estimate or provider-reported prompt size. ``capacity``
-    is the effective window the request guard and compaction use.
+    is the effective window used by compaction and the status line.
     ``capacity_source`` says whether that window is the model's metadata, the
-    user's explicit cap, or the assumed fallback. ``capacity_kind`` says
-    whether the window is input-only or shared input+output; ``None`` means
-    unknown, which keeps the conservative shared-window calculation.
-    ``reply_budget`` is the output budget of the request being measured, and
-    ``input_limit`` is what remains for input after applying that budget.
-    ``tokens_source`` names the estimator; ``provider_usage`` is the previous
-    request's provider count, not an estimate of the current send.
+    user's explicit cap, or the assumed default. ``tokens_source`` names the
+    estimator; ``provider_usage`` is the previous request's provider count, not
+    an estimate of the current send.
     """
 
     tokens: int | None
@@ -514,8 +488,6 @@ class ContextSnapshot:
     exact: bool = False
     capacity_source: str | None = None
     tokens_source: str | None = None
-    reply_budget: int | None = None
-    capacity_kind: str | None = None
 
     @property
     def percent(self) -> float | None:
@@ -523,10 +495,6 @@ class ContextSnapshot:
             return None
         # Never clamp: an over-limit prompt must stay visibly over 100%.
         return self.tokens / self.capacity * 100.0
-
-    @property
-    def input_limit(self) -> int | None:
-        return context_input_limit(self.capacity, self.reply_budget, self.capacity_kind)
 
     def label(self) -> str:
         if self.tokens is None:
@@ -539,7 +507,7 @@ class ContextSnapshot:
             return f"context {used}/--"
         effective = _compact_tokens(self.capacity)
         prefix = "" if self.exact else "≈"
-        assumed = " (assumed)" if self.capacity_source == "fallback" else ""
+        assumed = " (assumed)" if self.capacity_source == "default" else ""
         return f"context {used}/{effective} {prefix}{percent:.0f}%{assumed}"
 
 
@@ -610,8 +578,6 @@ def estimate_context(
     capacity: int | None = None,
     capacity_source: str | None = None,
     instructions: str | None = None,
-    reply_budget: int | None = None,
-    capacity_kind: str | None = None,
     allow_provider_usage: bool = True,
     replace_system: str | None = None,
 ) -> ContextSnapshot:
@@ -639,8 +605,6 @@ def estimate_context(
             model=model,
             capacity=capacity,
             capacity_source=capacity_source,
-            reply_budget=reply_budget,
-            capacity_kind=capacity_kind,
         )
 
     reverted = reverted_turn_ids(events)
@@ -673,8 +637,6 @@ def estimate_context(
                 model=model,
                 capacity=capacity,
                 capacity_source=capacity_source,
-                reply_budget=reply_budget,
-                capacity_kind=capacity_kind,
                 replace_system=replace_system,
             )
 
@@ -686,8 +648,6 @@ def estimate_context(
             model=model,
             capacity=capacity,
             capacity_source=capacity_source,
-            reply_budget=reply_budget,
-            capacity_kind=capacity_kind,
             allow_provider_usage=allow_provider_usage,
             replace_system=replace_system,
         )
@@ -699,8 +659,6 @@ def estimate_context(
         model=model,
         capacity=capacity,
         capacity_source=capacity_source,
-        reply_budget=reply_budget,
-        capacity_kind=capacity_kind,
     )
 
 
@@ -713,8 +671,6 @@ def estimate_context_from_conversation(
     model: str | None = None,
     capacity: int | None = None,
     capacity_source: str | None = None,
-    reply_budget: int | None = None,
-    capacity_kind: str | None = None,
 ) -> ContextSnapshot:
     """Estimate the next request from a checkpoint-aware conversation."""
     messages: list[dict[str, Any]] = []
@@ -728,8 +684,6 @@ def estimate_context_from_conversation(
         model=model,
         capacity=capacity,
         capacity_source=capacity_source,
-        reply_budget=reply_budget,
-        capacity_kind=capacity_kind,
     )
 
 
@@ -749,8 +703,6 @@ def _estimate_completed_turn(
     model: str | None,
     capacity: int | None,
     capacity_source: str | None,
-    reply_budget: int | None,
-    capacity_kind: str | None,
     replace_system: str | None,
 ) -> ContextSnapshot:
     request = events[request_index]
@@ -768,8 +720,6 @@ def _estimate_completed_turn(
         model=model,
         capacity=capacity,
         capacity_source=capacity_source,
-        reply_budget=reply_budget,
-        capacity_kind=capacity_kind,
     )
 
 
@@ -781,8 +731,6 @@ def _estimate_live_request(
     model: str | None,
     capacity: int | None,
     capacity_source: str | None,
-    reply_budget: int | None,
-    capacity_kind: str | None,
     allow_provider_usage: bool = True,
     replace_system: str | None = None,
 ) -> ContextSnapshot:
@@ -817,8 +765,6 @@ def _estimate_live_request(
                 exact=True,
                 capacity_source=capacity_source,
                 tokens_source="provider_usage",
-                reply_budget=reply_budget,
-                capacity_kind=capacity_kind,
             )
 
     estimated_messages = messages + additions
@@ -831,8 +777,6 @@ def _estimate_live_request(
         model=model,
         capacity=capacity,
         capacity_source=capacity_source,
-        reply_budget=reply_budget,
-        capacity_kind=capacity_kind,
     )
 
 
@@ -876,8 +820,6 @@ def _estimate_messages(
     model: str | None,
     capacity: int | None,
     capacity_source: str | None,
-    reply_budget: int | None,
-    capacity_kind: str | None,
 ) -> ContextSnapshot:
     if not messages and not tools:
         return ContextSnapshot(
@@ -885,8 +827,6 @@ def _estimate_messages(
             capacity=capacity,
             exact=False,
             capacity_source=capacity_source,
-            reply_budget=reply_budget,
-            capacity_kind=capacity_kind,
         )
     tokens, source = estimate_prompt_tokens_chain(provider, model, messages, tools)
     return ContextSnapshot(
@@ -895,8 +835,6 @@ def _estimate_messages(
         exact=False,
         capacity_source=capacity_source,
         tokens_source=source if tokens else None,
-        reply_budget=reply_budget,
-        capacity_kind=capacity_kind,
     )
 
 

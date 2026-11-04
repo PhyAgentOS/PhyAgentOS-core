@@ -286,7 +286,11 @@ tokens 内，都不再加进输入、输出或合计。`total_tokens` 优先用 
 provider 报告的 prompt 大小仍对应未变化的请求时才标记为 `exact`。`ProviderService.resolve`
 组合有效窗口：可靠的模型元数据优先，显式 `context_window_tokens` 只在上限更小时覆盖；元数据
 未知时先看显式 cap；有 cap 用 configured 值。只有既无可靠元数据也无显式 cap 时才用文档化的
-65,536 fallback，并记录 source=`fallback`。模型原始值与 effective guard 分开保存。context 标签只显示估算值和占窗口比例；回复预算、输入上限与估算来源写入 `request.prepared.request_budget` 和 guard 错误，不再显示在标签里。`(assumed)` 标记 fallback 容量。模型轮次统计 provider 调用次数，不是内部推理步数，也不伪造推理步数。会话累计行
+262,144 默认值，并记录 source=`default`。模型原始值与有效窗口分开保存。context 标签只显示
+估算值和占窗口比例；没有请求 guard，也不预留回复预算。`maxTokens` 是 provider 要求该参数时
+才使用的兜底值，其他请求不发送。`(assumed)` 标记默认容量，终端会提示按模型设置
+`contextWindowTokens`。自动压缩在该窗口的
+`compactionThreshold` 处触发。模型轮次统计 provider 调用次数，不是内部推理步数，也不伪造推理步数。会话累计行
 从已存事件重建，重新载入后仍可用。脚注只是终端渲染，绝不插入发给 provider 的消息历史。
 
 ### Prompt 投影、工具阶段与启动读取
@@ -381,7 +385,7 @@ undo 能继续往上。`UndoOutcome.request_text` 优先读取 `turn.started` �
 `context.compacted`。摘要失败不会抹掉已经生效的 trim。估算器测量真实的下一次请求，包含 system
 文本与工具 schema。
 
-`compaction_threshold` 默认是有效窗口的比例（`0.8`）；硬上限是 `capacity - reserve_tokens`。
+`compaction_threshold` 默认是有效窗口的比例（`0.8`）；硬上限就是有效窗口本身，不预留输出预算。
 摘要用量记录在 compaction attempt 上，并计入会话累计。provider 返回结构化的 `context_overflow`
 时，循环向 policy 请求一次强制缩减（`force=True`），用新的 step id 重试一次模型调用，且不重放
 任何工具调用。强制缩减没有让请求变小，或重试仍失败，回合失败。只有结构化错误码会触发该恢复；

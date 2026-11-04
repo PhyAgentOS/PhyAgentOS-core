@@ -110,28 +110,6 @@ class ModelAdapter:
         self._provider = provider
         self._stream_enabled = stream
 
-    def request_budget(self, request: ModelRequest) -> Mapping[str, Any] | None:
-        """Ask the injected provider for the local budget of this request.
-
-        This is optional: providers that cannot describe a budget return
-        nothing. The Core loop persists the mapping with the request snapshot,
-        so the adapter stays the only place that knows how to ask. No model
-        call is made; a provider that estimates does so locally.
-        """
-        reader = getattr(self._provider, "request_budget_snapshot", None)
-        if not callable(reader):
-            return None
-        try:
-            value = reader(
-                messages=request.to_messages(),
-                tools=request.to_provider_tools() or None,
-                model=request.model,
-                max_tokens=request.max_tokens,
-            )
-        except Exception as exc:
-            return {"error": _safe_detail(f"{type(exc).__name__}: {exc}")}
-        return dict(value) if isinstance(value, Mapping) else None
-
     def _generation_kwargs(self, request: ModelRequest) -> dict[str, Any]:
         generation: dict[str, Any] = {}
         if request.model is not None:

@@ -63,6 +63,10 @@ class ProviderSpec:
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
     supports_prompt_caching: bool = False
 
+    # Some APIs require a max_tokens value. The runtime uses the configured
+    # fallback only for these providers; every other request omits the field.
+    requires_max_tokens: bool = False
+
     @property
     def label(self) -> str:
         return self.display_name or self.name.title()
@@ -275,6 +279,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
         supports_prompt_caching=True,
+        requires_max_tokens=True,
     ),
     # OpenAI: LiteLLM recognizes "gpt-*" natively, no prefix needed.
     ProviderSpec(

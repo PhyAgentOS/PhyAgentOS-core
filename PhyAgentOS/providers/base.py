@@ -131,7 +131,9 @@ class GenerationSettings:
     """
 
     temperature: float = 0.7
-    max_tokens: int = 4096
+    max_tokens: int | None = None
+    # Used only when a provider requires the max_tokens parameter.
+    required_max_tokens: int = 32_768
     reasoning_effort: str | None = None
 
 
@@ -148,6 +150,9 @@ class LLMProvider(ABC):
     #: fallback, so a provider that only implements ``chat`` keeps the old
     #: single-response path and is reported as a fallback, not as streaming.
     supports_native_stream: bool = False
+
+    #: Set when the provider's API rejects requests that omit max_tokens.
+    requires_max_tokens: bool = False
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _TRANSIENT_ERROR_MARKERS = (
@@ -238,7 +243,7 @@ class LLMProvider(ABC):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
@@ -392,15 +397,17 @@ class LLMProvider(ABC):
         max_tokens: object,
         temperature: object,
         reasoning_effort: object,
-    ) -> tuple[int, float, str | None]:
+    ) -> tuple[int | None, float, str | None]:
         """Apply the provider's generation defaults to sentinel arguments."""
         if max_tokens is self._SENTINEL:
             max_tokens = self.generation.max_tokens
+        if max_tokens is None and self.requires_max_tokens:
+            max_tokens = self.generation.required_max_tokens
         if temperature is self._SENTINEL:
             temperature = self.generation.temperature
         if reasoning_effort is self._SENTINEL:
             reasoning_effort = self.generation.reasoning_effort
-        return int(max_tokens), float(temperature), reasoning_effort
+        return max_tokens, float(temperature), reasoning_effort
 
     @staticmethod
     async def _close_stream(stream: Any) -> None:
@@ -797,9 +804,9 @@ class LLMProvider(ABC):
         """Say whether ``get_context_window`` is input-only or shared.
 
         Return ``"input"`` only when local metadata proves the number counts
-        input tokens alone, so a reply budget must not be subtracted from it.
-        Return ``"total"`` only when it proves a shared input+output window.
-        Return ``None`` when the provider cannot prove either; callers then
-        keep the conservative shared-window calculation and do not guess.
+        input tokens alone. Return ``"total"`` only when it proves a shared
+        input+output window. Return ``None`` when the provider cannot prove
+        either; the current runtime does not reserve output from the window,
+        so this flag is informational for status and future callers.
         """
         return None

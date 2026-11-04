@@ -506,7 +506,6 @@ async def test_summary_prompt_is_checked_against_the_model_window(
                 SESSION,
                 model="fake-model",
                 context_window_tokens=50,
-                reserve_tokens=10,
                 max_summary_input_chars=1000,
             )
 

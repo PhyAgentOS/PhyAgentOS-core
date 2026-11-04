@@ -559,7 +559,7 @@ async def test_selected_provider_exposes_native_stream_and_closes_it():
         provider=Native(),
         context_window_tokens=128000,
     )
-    wrapper = _SelectedProvider(selection, 128000, 4096)
+    wrapper = _SelectedProvider(selection)
     assert wrapper.supports_native_stream is True
     stream = wrapper.chat_stream(messages=[{"role": "user", "content": "hi"}])
     assert (await stream.__anext__()).content == "one"
@@ -584,7 +584,7 @@ async def test_selected_provider_does_not_relabel_a_non_native_stream():
         provider=Wrapped(),
         context_window_tokens=128000,
     )
-    wrapper = _SelectedProvider(selection, 128000, 4096)
+    wrapper = _SelectedProvider(selection)
     assert wrapper.supports_native_stream is False
 
 

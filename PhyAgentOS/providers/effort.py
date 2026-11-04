@@ -157,5 +157,5 @@ def apply_litellm_effort(kwargs: dict, effort: str | None) -> None:
         budget = native.get("thinking", {}).get("budget_tokens", 0)
         # Legacy Claude requires max_tokens > thinking budget. Preserve the
         # configured output allowance in addition to the mapped thinking budget.
-        if budget:
+        if budget and kwargs.get("max_tokens") is not None:
             kwargs["max_tokens"] += budget

@@ -102,9 +102,9 @@ class ContextPolicy:
 
     ``threshold`` is the pressure point. A float in ``(0, 1]`` is a fraction of
     ``capacity`` (``0.8`` means "act above 80% of the window"); an int is an
-    absolute token count. The hard ceiling is ``capacity - reserve_tokens``, so
-    the pressure point is the smaller of the two. ``capacity`` should be the
-    effective window the runtime uses, and ``reserve_tokens`` the reply budget.
+    absolute token count. The hard ceiling is the effective ``capacity``; the
+    pressure point is the smaller of the threshold and that capacity. Output
+    is not reserved out of the window.
 
     ``estimator`` receives the complete next-request messages (system included)
     and the offered tool definitions. Passing ``None`` uses the provider's
@@ -128,7 +128,6 @@ class ContextPolicy:
         *,
         model: str,
         capacity: int,
-        reserve_tokens: int,
         threshold: float | int = 0.8,
         system_instructions: str = "",
         estimator: Estimator | None = None,
@@ -150,10 +149,6 @@ class ContextPolicy:
             raise ValueError("model must be a non-empty string")
         if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
             raise ValueError("capacity must be a positive int")
-        if not isinstance(reserve_tokens, int) or isinstance(reserve_tokens, bool):
-            raise ValueError("reserve_tokens must be a non-negative int")
-        if reserve_tokens < 0 or reserve_tokens >= capacity:
-            raise ValueError("reserve_tokens must be >= 0 and smaller than capacity")
         if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
             raise TypeError("threshold must be an int token count or a float ratio")
         if isinstance(threshold, float) and not 0 < threshold <= 1:
@@ -187,7 +182,6 @@ class ContextPolicy:
         self._provider = provider
         self._model = model
         self._capacity = capacity
-        self._reserve_tokens = reserve_tokens
         self._threshold = threshold
         self._system_instructions = system_instructions
         self._estimator = estimator
@@ -205,9 +199,9 @@ class ContextPolicy:
         trigger = (
             threshold * capacity if isinstance(threshold, float) else threshold
         )
-        # The pressure point can be lower than the hard ceiling; only the hard
-        # ceiling decides whether the request is actually too large to send.
-        self._input_limit = max(1, capacity - reserve_tokens)
+        # The pressure point can be lower than the window; only the window decides
+        # whether a request is actually too large to send.
+        self._input_limit = max(1, capacity)
         self._limit = max(1, min(int(trigger), self._input_limit))
 
     @property
@@ -389,9 +383,8 @@ class ContextPolicy:
         raise CompactionError(
             "context compaction reduced the estimated request to "
             f"{reduction.after_tokens} tokens, but the input limit is "
-            f"{self._input_limit} (capacity {self._capacity}, reserve "
-            f"{self._reserve_tokens}); the request still exceeds the window "
-            "and was not sent"
+            f"{self._input_limit} (capacity {self._capacity}); the request still "
+            "exceeds the window and was not sent"
         )
 
     async def preflight(
@@ -491,7 +484,6 @@ class ContextPolicy:
             max_summary_input_chars=self._max_summary_input_chars,
             max_message_chars=self._max_message_chars,
             context_window_tokens=self._capacity,
-            reserve_tokens=self._reserve_tokens,
             token_estimator=self._prompt_estimate,
             request_token_estimator=lambda items: self._request_estimate(items, tools),
             conversation=conversation,

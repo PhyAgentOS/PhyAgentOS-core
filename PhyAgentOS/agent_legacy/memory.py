@@ -465,7 +465,9 @@ class MemoryConsolidator:
         async with lock:
             provider = runtime.provider if runtime is not None else self.provider
             generation = getattr(provider, "generation", None)
-            reserve = int(getattr(generation, "max_tokens", 0) or 0) or 4096
+            reserve = int(getattr(generation, "max_tokens", 0) or 0)
+            if not reserve:
+                reserve = int(getattr(generation, "required_max_tokens", 0) or 0) or 32_768
             target = max(1, (window - reserve) // 2)
             estimated, source = self.estimate_session_prompt_tokens(session, runtime)
             if estimated <= 0:

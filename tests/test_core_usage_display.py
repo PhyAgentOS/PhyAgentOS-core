@@ -291,14 +291,13 @@ def test_provider_usage_from_another_model_is_not_the_current_send(monkeypatch):
         usage, "estimate_prompt_tokens_chain", lambda *args, **kwargs: (1234, "tiktoken")
     )
     snapshot = estimate_context(
-        [request, completed], model="new-model", capacity=32768, reply_budget=4096
+        [request, completed], model="new-model", capacity=32768
     )
     assert snapshot.exact is False
     assert snapshot.tokens == 1234
     assert snapshot.tokens_source == "tiktoken"
-    # The window and reply budget come from the current selection, not the log.
+    # The window comes from the current selection, not the log.
     assert snapshot.capacity == 32768
-    assert snapshot.reply_budget == 4096
     assert "last request usage" not in snapshot.label()
 
 

@@ -20,8 +20,8 @@ Rules enforced here:
 * the retained tail starts at a user-message boundary, so tool calls and their
   results stay together in one complete turn;
 * the summary input is bounded before the call by characters and, when the
-  caller supplies the model's context window, by estimated tokens plus the
-  output reserve. The first user task and its constraints are always kept;
+  caller supplies the model's context window, by estimated tokens. The first
+  user task and its constraints are always kept;
   only older middle groups may be omitted, and that omission is reported in the
   result warnings and in the summary prompt. Oversized tool output is shortened
   for the summary prompt. The kept tail is never split; if it is too large for
@@ -139,7 +139,6 @@ async def compact_session(
     max_summary_input_chars: int = 60_000,
     max_message_chars: int = 4_000,
     context_window_tokens: int | None = None,
-    reserve_tokens: int | None = None,
     token_estimator: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
     request_token_estimator: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
     conversation: Sequence[Mapping[str, Any]] | None = None,
@@ -151,8 +150,7 @@ async def compact_session(
     ``model``/``effort``/``provider_name`` must be the session's current
     selection; they are forwarded to the provider and recorded on the attempt
     and checkpoint. ``context_window_tokens`` is the selected model's context
-    window; when given, the summary prompt plus ``reserve_tokens`` (defaults to
-    ``max_tokens``) must fit before any network call. ``token_estimator`` may
+    window; when given, the summary prompt must fit before any network call. ``token_estimator`` may
     wrap provider-specific token counting; the default is a character estimate.
     ``request_token_estimator`` must measure a *next request*: the caller adds
     the same system prompt and visible tool definitions the live status line
@@ -200,8 +198,6 @@ async def compact_session(
         raise ValueError("max_tokens must be positive or None")
     if context_window_tokens is not None and context_window_tokens < 1:
         raise ValueError("context_window_tokens must be positive or None")
-    if reserve_tokens is not None and reserve_tokens < 0:
-        raise ValueError("reserve_tokens must be >= 0 or None")
     if not isinstance(commit_checkpoint, bool):
         raise TypeError("commit_checkpoint must be a bool")
     if usage_observer is not None and not callable(usage_observer):
@@ -227,7 +223,6 @@ async def compact_session(
     _check_tool_pairing(plan.retained, "retained messages")
 
     budget = max_summary_input_chars
-    reserve = reserve_tokens if reserve_tokens is not None else (max_tokens or 0)
     while True:
         transcript, omitted, truncated = _bounded_transcript(
             plan.prefix,
@@ -240,13 +235,12 @@ async def compact_session(
         if context_window_tokens is None:
             break
         prompt_tokens = _checked_estimate(estimator, prompt)
-        if prompt_tokens + reserve <= context_window_tokens:
+        if prompt_tokens <= context_window_tokens:
             break
         if budget <= _MIN_SUMMARY_BUDGET:
             raise CompactionError(
                 "summary prompt exceeds the model context before sending "
-                f"(~{prompt_tokens} tokens + {reserve} reserved > "
-                f"{context_window_tokens})"
+                f"(~{prompt_tokens} tokens > {context_window_tokens})"
             )
         budget = max(_MIN_SUMMARY_BUDGET, budget // 2)
 

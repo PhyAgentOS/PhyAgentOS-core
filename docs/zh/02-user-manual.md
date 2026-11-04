@@ -447,13 +447,13 @@ provider 支持流式时，回复正文会在回合结束前先做实时预览�
 
 session 行显示 `context ...`：当前请求（system prompt、工具 schema 与历史）的估算大小占有效窗口
 的比例。有效窗口优先使用模型元数据；显式配置的 `contextWindowTokens` 只作为上限，不会被运行时
-改写。只有**既无可靠元数据、也无显式上限**时才用文档化的 65,536 fallback；有显式上限时使用该
-configured cap，不会自动放大到 1M，状态里会标出容量来源（model/configured/fallback）。`≈`
+改写。只有**既无可靠元数据、也无显式上限**时才用文档化的 262,144 默认值；有显式上限时使用该
+configured cap，不会自动放大到 1M，状态里会标出容量来源（model/configured/default）。`≈`
 表示估算值；provider 报告的真实值不加 `≈`，也不显示字面 `exact`；上下文大小未知时显示
 `context --` 或 `used/--`，不是 `--%`。请求超过容量时仍显示超过 100%，不会被截断。状态行只
-显示 `context 已用/窗口 百分比`；回复预算、输入上限和 token 估算来源记录在
-`request.prepared.request_budget` 和 guard 错误里，不再显示在行上。`(assumed)` 标记 fallback
-容量。工具按阶段显示：未激活 Skill 前不提供任务创建/变更工具；注册的工具定义仍在，只是当前步骤不可见。
+显示 `context 已用/窗口 百分比`；没有本地请求 guard，不扣回复预算；`maxTokens` 默认不发送，
+只有 provider 要求该参数时才使用它作为兜底值。`(assumed)` 标记默认容量，终端会提示按模型设置
+`contextWindowTokens`。自动压缩在有效窗口的 `compactionThreshold` 处触发。工具按阶段显示：未激活 Skill 前不提供任务创建/变更工具；注册的工具定义仍在，只是当前步骤不可见。
 同一 Skill 的同一内容版本通常只保留一份完整文档；若正文很短，去掉后净省不足 128 字符，则保留
 重复副本，不加 marker。完整事件仍保留在 store。compact 摘要不是 Skill 文档副本；再次调用
 `activate_skill` 会按该回合重新授权并返回完整正文，不是压缩后自动从本地文件注入。

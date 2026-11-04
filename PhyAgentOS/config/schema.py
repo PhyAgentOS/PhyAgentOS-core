@@ -8,9 +8,9 @@ from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
 # Used only when neither the model metadata nor an explicit config value gives
-# a context window. It is a conservative assumption, not a model fact, and the
-# status line marks it as assumed.
-DEFAULT_CONTEXT_WINDOW_TOKENS = 65_536
+# a context window. It is an assumption, not a model fact; the status line and
+# the terminal notice tell the user to set contextWindowTokens when needed.
+DEFAULT_CONTEXT_WINDOW_TOKENS = 262_144
 
 
 class Base(BaseModel):
@@ -256,7 +256,9 @@ class AgentDefaults(Base):
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
-    max_tokens: int = 8192
+    # Fallback used only when the selected provider requires a max_tokens
+    # parameter. Requests normally leave it out and use the model's own limit.
+    max_tokens: int = 32_768
     # None means automatic: use the selected model's reported window, capped by
     # this value when it is set explicitly. An explicit value is never rewritten
     # by the runtime; remove it to go back to automatic resolution.

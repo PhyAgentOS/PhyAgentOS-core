@@ -322,7 +322,7 @@ class SpawnCapability:
         self._max_per_parent = self._max_parallel + self._queue_limit
         self._max_steps = max(1, int(defaults.max_tool_iterations))
         self._temperature = float(defaults.temperature)
-        self._max_tokens = int(defaults.max_tokens)
+        self._max_tokens = None
 
         self._semaphore = asyncio.Semaphore(self._max_parallel)
         self._outstanding: dict[str, _Child] = {}

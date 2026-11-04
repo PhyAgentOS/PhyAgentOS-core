@@ -414,11 +414,12 @@ tool messages after it, and marks the number `exact` only while the provider-rep
 still describes the unchanged request. `ProviderService.resolve` composes the effective window:
 reliable model metadata wins unless an explicit `context_window_tokens` cap is smaller; unknown
 metadata uses an explicit cap when present; only when there is neither reliable metadata nor an
-explicit cap does it use the documented 65,536 fallback and record source `fallback`. The raw model
-value and the effective guard stay separate. The context label shows only the estimate and its
-share of the window; the reply budget, input limit and estimator source go to
-`request.prepared.request_budget` and the guard error, not the label. `(assumed)` marks fallback
-capacity. Model rounds count provider calls, not internal reasoning steps,
+explicit cap does it use the documented 262,144 default and record source `default`. The raw model
+value and the effective window stay separate. The context label shows only the estimate and its
+share of the window; there is no request guard and no reply budget is reserved. `maxTokens` is
+the fallback used only when the provider requires the parameter; other requests omit it. `(assumed)` marks the default capacity, and the
+terminal tells the user to set `contextWindowTokens` when needed. Automatic compaction triggers at
+`compactionThreshold` of that window. Model rounds count provider calls, not internal reasoning steps,
 and no reasoning step count is fabricated. The session cumulative
 line is rebuilt from stored events, so it survives a reload. The footer is a terminal rendering
 only; it is never inserted into the message history sent to a provider.
@@ -542,7 +543,8 @@ erase a real trim. The estimator measures the real next request, including syste
 schema.
 
 `compaction_threshold` is a fraction of the effective window by default (`0.8`); the hard ceiling
-is `capacity - reserve_tokens`. Summary usage is recorded on the compaction attempt and counted in
+is the effective window itself, with no output reserve. Summary usage is recorded on the compaction
+attempt and counted in
 the session total. When the provider returns the structured `context_overflow` code, the loop asks
 the policy for one forced reduction (`force=True`), retries the model call once with a fresh step
 id, and never replays a tool call. If the forced reduction does not shrink the request, or the

@@ -10,7 +10,6 @@ import pytest
 
 from PhyAgentOS.agent.services.usage import (
     ContextSnapshot,
-    context_input_limit,
     estimate_context,
     estimate_context_from_conversation,
 )
@@ -67,6 +66,10 @@ def test_default_is_automatic_not_a_silent_65536_cap():
     assert config.agents.defaults.context_window_tokens is None
 
 
+def test_output_cap_is_the_required_parameter_fallback():
+    assert AgentDefaults().max_tokens == 32_768
+
+
 def test_explicit_value_is_kept_and_acts_as_a_cap():
     defaults = AgentDefaults(contextWindowTokens=65_536)
     assert defaults.context_window_tokens == 65_536
@@ -88,17 +91,17 @@ def test_smaller_model_window_wins_over_a_larger_cap():
     )
 
 
-def test_unknown_window_uses_the_documented_fallback():
+def test_unknown_window_uses_the_documented_default():
     assert compose_context_capacity(reported=None, configured=None) == (
         DEFAULT_CONTEXT_WINDOW_TOKENS,
-        "fallback",
+        "default",
     )
 
 
 def test_implausible_model_value_is_treated_as_unknown():
     assert compose_context_capacity(reported=10**12, configured=None) == (
         DEFAULT_CONTEXT_WINDOW_TOKENS,
-        "fallback",
+        "default",
     )
 
 
@@ -111,11 +114,11 @@ def test_resolve_reports_effective_window_and_source(monkeypatch):
     assert selection.model_context_window_tokens == 131_072
 
 
-def test_resolve_without_metadata_uses_fallback_and_explicit_cap(monkeypatch):
+def test_resolve_without_metadata_uses_default_and_explicit_cap(monkeypatch):
     config = _custom_config()
     selection = _resolve(config, monkeypatch, None)
     assert selection.context_window_tokens == DEFAULT_CONTEXT_WINDOW_TOKENS
-    assert selection.context_window_source == "fallback"
+    assert selection.context_window_source == "default"
 
     explicit = _custom_config()
     explicit.agents.defaults.context_window_tokens = 32_768
@@ -267,11 +270,11 @@ def test_status_command_shows_capacity_and_source():
         None,
         _FakeProvider(),
         DEFAULT_CONTEXT_WINDOW_TOKENS,
-        "fallback",
+        "default",
     )
     text = SessionRuntimes(ProviderService(_custom_config()), selection).command("s", "/status")
-    assert "Context window: 65536" in text
-    assert context_window_source_label("fallback") in text
+    assert "Context window: 262144" in text
+    assert context_window_source_label("default") in text
     assert "input+output sharing unverified" in text
     assert "model reports" not in text
 
@@ -280,7 +283,7 @@ def test_snapshot_label_shows_used_effective_percent_and_assumed_source():
     snapshot = ContextSnapshot(
         tokens=12_345,
         capacity=65_536,
-        capacity_source="fallback",
+        capacity_source="default",
     )
     assert snapshot.label() == "context 12.3k/65.5k ≈19% (assumed)"
 
@@ -330,10 +333,10 @@ def test_usage_without_capacity_keeps_double_dash(monkeypatch):
 @pytest.mark.parametrize(
     ("reported", "configured", "expected"),
     [
-        (None, None, (DEFAULT_CONTEXT_WINDOW_TOKENS, "fallback")),
-        (0, None, (DEFAULT_CONTEXT_WINDOW_TOKENS, "fallback")),
-        (-1, None, (DEFAULT_CONTEXT_WINDOW_TOKENS, "fallback")),
-        (True, None, (DEFAULT_CONTEXT_WINDOW_TOKENS, "fallback")),
+        (None, None, (DEFAULT_CONTEXT_WINDOW_TOKENS, "default")),
+        (0, None, (DEFAULT_CONTEXT_WINDOW_TOKENS, "default")),
+        (-1, None, (DEFAULT_CONTEXT_WINDOW_TOKENS, "default")),
+        (True, None, (DEFAULT_CONTEXT_WINDOW_TOKENS, "default")),
     ],
 )
 def test_invalid_reported_values_cannot_become_capacity(reported, configured, expected):
@@ -360,38 +363,6 @@ def test_custom_endpoint_has_no_capacity_semantics():
     provider = LiteLLMProvider(provider_name="custom")
     assert provider.get_context_window_semantics("deepseek-flash") is None
     assert LLMProvider.get_context_window_semantics(provider, None) is None
-
-
-def test_input_only_window_does_not_subtract_the_reply_budget_again():
-    assert context_input_limit(16384, 8192, "input") == 16384
-    assert context_input_limit(16384, 8192, None) == 8192
-    assert context_input_limit(16384, 8192, "total") == 8192
-    assert context_input_limit(None, 8192, "input") is None
-
-
-def test_snapshot_label_shows_reply_budget_and_the_actual_input_limit():
-    snapshot = ContextSnapshot(
-        tokens=8520,
-        capacity=16384,
-        tokens_source="tiktoken",
-        reply_budget=8192,
-        capacity_kind="unknown",
-    )
-    assert snapshot.input_limit == 8192
-    assert snapshot.label() == "context 8.5k/16.4k ≈52%"
-    assert snapshot.percent == pytest.approx(52.0, abs=0.05)
-
-
-def test_input_window_snapshot_labels_the_limit_without_a_fake_reserve():
-    snapshot = ContextSnapshot(
-        tokens=12000,
-        capacity=16384,
-        tokens_source="tiktoken",
-        reply_budget=8192,
-        capacity_kind="input",
-    )
-    assert snapshot.input_limit == 16384
-    assert snapshot.label() == "context 12k/16.4k ≈73%"
 
 
 def test_resolve_uses_input_semantics_only_when_the_provider_explicitly_proves_it(

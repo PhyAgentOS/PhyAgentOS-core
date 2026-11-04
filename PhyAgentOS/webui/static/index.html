@@ -1806,7 +1806,8 @@
       agentField(['agents', 'defaults', 'reasoningEffort'], '推理强度',
         '留空使用模型默认设置，可选值由模型决定。', '留空使用模型默认设置'),
       agentField(['agents', 'defaults', 'temperature'], '温度'),
-      agentField(['agents', 'defaults', 'maxTokens'], '最大输出 Token 数')
+      agentField(['agents', 'defaults', 'maxTokens'], '输出参数兜底值',
+        '平时不发送 max_tokens，由模型决定输出上限；只有模型 API 要求该参数时才使用这个值。', '默认 32768')
     ]));
     fragment.appendChild(basic);
 
@@ -1816,7 +1817,7 @@
       agentField(['agents', 'defaults', 'maxToolIterations'], '每回合模型步数上限',
         '一步包含模型调用和该步工具执行。'),
       agentField(['agents', 'defaults', 'contextWindowTokens'], '上下文窗口上限',
-        '留空自动使用模型信息。', '留空自动确定'),
+        '留空自动使用模型信息；两者都没有时默认 262,144，建议按模型显式设置。', '留空自动确定'),
       agentField(['agents', 'defaults', 'performance', 'autoCompact'], '自动压缩上下文'),
       agentField(['agents', 'defaults', 'performance', 'compactionThreshold'], '自动压缩触发比例')
     ]));

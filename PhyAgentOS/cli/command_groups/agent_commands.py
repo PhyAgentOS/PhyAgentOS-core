@@ -60,7 +60,6 @@ from PhyAgentOS.agent.services.turn_budget import TurnBudget, TurnBudgetRegistry
 from PhyAgentOS.agent.services.turn_control import TurnControl
 from PhyAgentOS.agent.services.usage import (
     ContextSnapshot,
-    context_input_limit,
     estimate_context,
     estimate_context_from_conversation,
 )
@@ -172,20 +171,19 @@ class _DisplayStore:
 
 
 def _effective_window(config, selection) -> tuple[int | None, str]:
-    """One window definition for guard, status and compaction.
+    """One window definition for status and compaction.
 
     The provider service composes model metadata with the configured cap. When
     that answer and its source are present, trust them. Older selections and
     external embeddings may lack the source (``source=None``): then an explicit
-    configured cap and a model capacity are combined with ``min`` (the old
-    guard behaviour) and the source names the winner; a lone capacity is
-    treated as model metadata.
+    configured cap and a model capacity are combined with ``min`` and the source
+    names the winner; a lone capacity is treated as model metadata.
     """
     capacity = getattr(selection, "context_window_tokens", None)
     source = getattr(selection, "context_window_source", None)
     if capacity:
         capacity = int(capacity)
-        if source in {"model", "configured", "fallback"}:
+        if source in {"model", "configured", "default"}:
             return capacity, source
         defaults = getattr(getattr(config, "agents", None), "defaults", None)
         configured = getattr(defaults, "context_window_tokens", None)
@@ -205,12 +203,6 @@ def _effective_window(config, selection) -> tuple[int | None, str]:
     return None, "unknown"
 
 
-class _ContextLimitError(ProviderError):
-    """A local measured overflow, distinct from an arbitrary provider failure."""
-
-    code = "context_overflow"
-
-
 class _SelectedProvider:
     """Forward a turn to its frozen selection; leave SDK retries to the provider.
 
@@ -219,7 +211,6 @@ class _SelectedProvider:
     different model or effort, that is the call that is made, so the persisted
     ``request.prepared`` snapshot cannot disagree with the actual request.
 
-    Both the blocking and streaming paths use the same prompt budget guard.
     A provider without ``chat_stream`` is called once through
     ``chat_with_retry``; the terminal says so once instead of retrying a
     connection that never produced a stream.
@@ -228,18 +219,10 @@ class _SelectedProvider:
     def __init__(
         self,
         selection,
-        context_window,
-        max_tokens,
         *,
         notice=None,
-        window_source="configured",
-        window_semantics="unknown",
     ):
         self.selection = selection
-        self.context_window = context_window
-        self.window_source = window_source
-        self.window_semantics = window_semantics
-        self.max_tokens = max_tokens
         self._notice = notice
         self._fallback_notified = False
         # A wrapper must not turn a non-native provider into a native one.
@@ -252,89 +235,14 @@ class _SelectedProvider:
             and bool(getattr(underlying, "supports_native_stream", True))
         )
 
-    def _reply_budget(self, kwargs) -> int:
-        """Use the max_tokens actually sent, not the selection's old default."""
-        value = kwargs.get("max_tokens")
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-            return value
-        fallback = self.max_tokens
-        if isinstance(fallback, int) and not isinstance(fallback, bool) and fallback >= 1:
-            return fallback
-        return 0
-
-    def _input_limit(self, reply_budget: int) -> int:
-        limit = context_input_limit(
-            self.context_window, reply_budget, self.window_semantics
-        )
-        return self.context_window if limit is None else limit
-
-    def _check_budget(self, *, messages, tools, model, max_tokens=None) -> None:
-        if not self.context_window:
-            return
-        reply_budget = self._reply_budget({"max_tokens": max_tokens})
-        estimated, source = estimate_prompt_tokens_chain(
-            self.selection.provider, model, messages, tools
-        )
-        limit = self._input_limit(reply_budget)
-        if estimated and estimated > limit:
-            raise _ContextLimitError(
-                f"Context limit reached (estimated input {estimated}, input limit "
-                f"{limit}, reply budget {reply_budget}, window {self.context_window}, "
-                f"window source {self.window_source}/{self.window_semantics}, "
-                f"estimate source {source}). Use /compact to summarize older "
-                "history, or /new to start a new session. No further model call "
-                "was sent."
-            )
-
-    def request_budget_snapshot(self, *, messages, tools, model, max_tokens=None):
-        """Describe the exact local budget this wrapper will enforce.
-
-        The Core loop persists this mapping on ``request.prepared`` so a
-        later failure or status line can be compared with the real send. It
-        uses the same estimator and limit as the guard, never a provider call.
-        """
-        reply_budget = self._reply_budget({"max_tokens": max_tokens})
-        estimated, source = estimate_prompt_tokens_chain(
-            self.selection.provider, model, messages, tools
-        )
-        limit = (
-            self._input_limit(reply_budget) if self.context_window else None
-        )
-        return {
-            "estimated_input": estimated or None,
-            "estimate_source": source if estimated else None,
-            "context_window": self.context_window,
-            "window_source": self.window_source,
-            "window_semantics": self.window_semantics,
-            "reply_budget": reply_budget,
-            "reserve_tokens": (
-                0 if self.window_semantics == "input" else reply_budget
-            ),
-            "input_limit": limit,
-        }
-
     async def chat_with_retry(self, *, messages, tools=None, **kwargs):
-        model = kwargs.get("model") or self.selection.model
-        self._check_budget(
-            messages=messages,
-            tools=tools,
-            model=model,
-            max_tokens=kwargs.get("max_tokens"),
-        )
         return await self.selection.provider.chat_with_retry(
             messages=messages, tools=tools, **kwargs
         )
 
     async def chat_stream(self, *, messages, tools=None, **kwargs):
-        """Forward one stream with the same budget guard as the blocking path."""
+        """Forward one stream to the selected provider."""
         selected = self.selection
-        model = kwargs.get("model") or selected.model
-        self._check_budget(
-            messages=messages,
-            tools=tools,
-            model=model,
-            max_tokens=kwargs.get("max_tokens"),
-        )
         stream = getattr(selected.provider, "chat_stream", None)
         if self.supports_native_stream and callable(stream):
             events = stream(messages=messages, tools=tools, **kwargs)
@@ -721,12 +629,10 @@ class CoreAgentSession:
             raise RuntimeError(
                 "Context compaction is unavailable: the raw session store was not attached."
             )
-        defaults = getattr(getattr(self.config, "agents", None), "defaults", None)
-        reply_budget = getattr(defaults, "max_tokens", None)
-        # Same effective window the request guard and status line use.
+        # The provider supplies max_tokens only when its API requires it.
+        max_tokens = None
+        # Same effective window the status line uses.
         window, _window_source = _effective_window(self.config, selection)
-        semantics = getattr(selection, "context_window_semantics", "unknown")
-        reserve_tokens = 0 if semantics == "input" else reply_budget
 
         events = list(await self.raw_store.read_session(session_id))
         reader = self.instructions_reader
@@ -769,9 +675,8 @@ class CoreAgentSession:
             model=selection.model,
             effort=selection.effort,
             provider_name=selection.name,
-            max_tokens=reply_budget,
+            max_tokens=max_tokens,
             context_window_tokens=window,
-            reserve_tokens=reserve_tokens,
             token_estimator=token_estimator,
             request_token_estimator=request_token_estimator,
         )
@@ -873,29 +778,19 @@ def _compose_for_selection(
     with the rest.
     """
     defaults = config.agents.defaults
-    window, window_source = _effective_window(config, selection)
-    window_semantics = getattr(selection, "context_window_semantics", "unknown")
-    provider = _SelectedProvider(
-        selection,
-        window,
-        defaults.max_tokens,
-        notice=notice,
-        window_source=window_source,
-        window_semantics=window_semantics,
-    )
+    window, _window_source = _effective_window(config, selection)
+    provider = _SelectedProvider(selection, notice=notice)
     performance = defaults.performance
     context_policy = None
-    # An input-only catalog window already excludes the reply budget. Reserve
-    # it only for a shared or unknown window, where the old conservative
-    # behavior is still the honest choice.
-    reserve_tokens = 0 if window_semantics == "input" else defaults.max_tokens
-    if performance.auto_compact and window is not None and window > reserve_tokens:
+    # Compaction is the only window management: trigger at the configured
+    # fraction of the real window, with no reply reservation.
+    if performance.auto_compact and window is not None and window > 0:
         context_policy = ContextPolicy(
             getattr(store, "store", store), selection.provider,
-            model=selection.model, capacity=window, reserve_tokens=reserve_tokens,
+            model=selection.model, capacity=window,
             threshold=performance.compaction_threshold,
             system_instructions=instructions, provider_name=selection.name,
-            effort=selection.effort, max_tokens=defaults.max_tokens,
+            effort=selection.effort, max_tokens=None,
         )
     turn_budget = TurnBudget(
         max_tokens=performance.max_turn_tokens,
@@ -911,7 +806,7 @@ def _compose_for_selection(
         system_instructions=instructions,
         model=selection.model,
         temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
+        max_tokens=None,
         reasoning_effort=selection.effort,
         max_steps=defaults.max_tool_iterations,
         additional_capabilities=(
@@ -1340,47 +1235,6 @@ class _ContextStatus:
             return current
         return last_system or current or None
 
-    def _reply_budget(self, events, selection, covers=None) -> int | None:
-        """The output budget of the next send, without mixing in a stale model.
-
-        A ``request.prepared`` snapshot is the durable record of the last real
-        send. It may name another model if this session switched models since;
-        that budget still applies to the *next* turn only when the model is the
-        same. Otherwise the current configured default is the honest answer.
-        A request already represented by a checkpoint is not the current send.
-        """
-        config = getattr(self._session, "config", None)
-        defaults = getattr(getattr(config, "agents", None), "defaults", None)
-        configured = getattr(defaults, "max_tokens", None)
-        reverted = reverted_turn_ids(events)
-        current_model = getattr(selection, "model", None)
-        for event in reversed(events):
-            if event.type is not EventType.REQUEST_PREPARED:
-                continue
-            if event.turn_id is not None and event.turn_id in reverted:
-                continue
-            if (
-                covers is not None
-                and event.sequence is not None
-                and event.sequence <= covers
-            ):
-                continue
-            payload = event.payload
-            prepared_model = payload.get("model")
-            if (
-                isinstance(prepared_model, str)
-                and prepared_model
-                and isinstance(current_model, str)
-                and current_model
-                and prepared_model != current_model
-            ):
-                return configured
-            value = payload.get("max_tokens")
-            if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-                return value
-            return configured
-        return configured
-
     def ingest(self, event) -> None:
         self._events.setdefault(event.session_id, []).append(event)
         if event.type is EventType.REQUEST_PREPARED:
@@ -1415,7 +1269,6 @@ class _ContextStatus:
     def snapshot(self, session_id: str) -> ContextSnapshot:
         selection = self._session.sessions.get(session_id)
         capacity, window_source = _effective_window(getattr(self._session, "config", None), selection)
-        window_semantics = getattr(selection, "context_window_semantics", "unknown")
         events = self._events.get(session_id, [])
         last_system = _last_request_system(events)
         system_text = self._system.get(session_id)
@@ -1441,7 +1294,6 @@ class _ContextStatus:
             if event.type is EventType.REQUEST_PREPARED and event.sequence is not None
         ]
         covers = self._checkpoint_covers.get(session_id)
-        reply_budget = self._reply_budget(events, selection, covers)
         prepared_is_current = bool(prepared_sequences) and not rules_changed and (
             covers is None or max(prepared_sequences) > covers
         )
@@ -1453,8 +1305,6 @@ class _ContextStatus:
                 capacity=capacity,
                 capacity_source=window_source,
                 instructions=system_text,
-                reply_budget=reply_budget,
-                capacity_kind=window_semantics,
             )
         conversation = self._conversation.get(session_id)
         if conversation is not None:
@@ -1466,8 +1316,6 @@ class _ContextStatus:
                 model=selection.model,
                 capacity=capacity,
                 capacity_source=window_source,
-                reply_budget=reply_budget,
-                capacity_kind=window_semantics,
             )
         return estimate_context(
             events,
@@ -1475,8 +1323,6 @@ class _ContextStatus:
             model=selection.model,
             capacity=capacity,
             capacity_source=window_source,
-            reply_budget=reply_budget,
-            capacity_kind=window_semantics,
             instructions=system_text,
             allow_provider_usage=not rules_changed,
             replace_system=system_text if rules_changed else None,
@@ -1625,6 +1471,15 @@ async def run_core_agent(
 
         output.ready()
         label = refresh_label()
+        _window, window_source = _effective_window(
+            config, session.sessions.get(active_session_id)
+        )
+        if window_source == "default":
+            output.info(
+                "Context window: using the default 262,144 tokens because neither "
+                "model metadata nor contextWindowTokens is available. Set "
+                "agents.defaults.contextWindowTokens if your model differs."
+            )
         if message is not None:
             output.info(label)
             output.turn_started(sid, message)

@@ -232,7 +232,11 @@ async def test_limited_result_fits_the_budget_that_original_exceeds(
     estimated, _ = estimate_prompt_tokens_chain(
         provider, loop.model, limited_messages, tool_defs
     )
-    reserve = provider.generation.max_tokens
+    reserve = (
+        provider.generation.max_tokens
+        or provider.generation.required_max_tokens
+        or 32_768
+    )
     loop.context_window_tokens = estimated + reserve + 64
 
     output_budget, budget_error = loop._request_output_budget(

@@ -148,16 +148,12 @@ def _tool_message(outcome: ToolOutcome) -> dict[str, Any]:
     }
 
 
-def _prepared_payload(
-    request: ModelRequest,
-    request_budget: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+def _prepared_payload(request: ModelRequest) -> dict[str, Any]:
     """Snapshot the exact request: messages, tools and safe generation knobs.
 
-    ``request_budget`` is optional local metadata supplied by the adapter. It
-    records the estimated input, window source, reply reserve and input limit
-    used for this send, so a later error can be checked against the same
-    numbers without re-inventing them.
+    The payload is the durable record of what was sent. No local budget fields
+    are written: there is no preflight guard, and the status line derives its
+    estimate from this snapshot.
     """
     payload = {
         "model_call_id": request.model_call_id,
@@ -169,8 +165,6 @@ def _prepared_payload(
         "reasoning_effort": request.reasoning_effort,
         "tool_choice": request.tool_choice,
     }
-    if request_budget:
-        payload["request_budget"] = dict(request_budget)
     return payload
 
 
@@ -499,15 +493,11 @@ class LoopDriverImpl:
 
         # Persist before the side effect: no model call without a durable
         # snapshot, so a crash cannot leave an unexplained request behind.
-        budget_reader = getattr(self._adapter, "request_budget", None)
-        request_budget = (
-            budget_reader(request) if callable(budget_reader) else None
-        )
         if not await self._persist(
             turn,
             context,
             EventType.REQUEST_PREPARED,
-            _prepared_payload(request, request_budget),
+            _prepared_payload(request),
         ):
             return _ModelStep(
                 failure=_failed(

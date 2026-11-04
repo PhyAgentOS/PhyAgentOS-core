@@ -260,7 +260,7 @@ async def test_whitespace_deltas_survive_real_sdk_stream_and_durable_reread(
     selection = RuntimeSelection(
         "custom", "fake-model", None, "http://test/v1", provider, 128000
     )
-    wrapper = _SelectedProvider(selection, 128000, 4096)
+    wrapper = _SelectedProvider(selection)
     path = tmp_path / "sessions.db"
     store = SQLiteSessionStore(path)
     driver = LoopDriverImpl(

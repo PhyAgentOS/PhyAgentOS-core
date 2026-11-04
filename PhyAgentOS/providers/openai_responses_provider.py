@@ -42,14 +42,15 @@ class OpenAIResponsesProvider(LLMProvider):
         self._temperature_supported = True
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-                   model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
+                   model: str | None = None, max_tokens: int | None = None, temperature: float = 0.7,
                    reasoning_effort: str | None = None,
                    tool_choice: str | dict[str, Any] | None = None) -> LLMResponse:
         kwargs: dict[str, Any] = {
             "model": model or self.default_model,
             "input": self._to_input(self._sanitize_empty_content(messages)),
-            "max_output_tokens": max(1, max_tokens),
         }
+        if max_tokens is not None:
+            kwargs["max_output_tokens"] = max(1, max_tokens)
         if self._temperature_supported:
             kwargs["temperature"] = temperature
         if reasoning_effort and reasoning_effort != "none":

@@ -47,7 +47,11 @@ def build_forge_verifier(config: Config, provider, *, write_legacy_lessons=None)
         "extra_headers": provider_config.extra_headers,
         "max_retries": provider_config.max_retries,
         "temperature": 0.0,
-        "max_tokens": min(4096, config.agents.defaults.max_tokens),
+        "max_tokens": (
+            min(4096, config.agents.defaults.max_tokens)
+            if config.agents.defaults.max_tokens
+            else 4096
+        ),
         "reasoning_effort": selection.effort,
     }
     return ForgeTaskVerifier(

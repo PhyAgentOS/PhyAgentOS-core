@@ -114,7 +114,6 @@ def _policy(store: SQLiteSessionStore, provider, **overrides) -> ContextPolicy:
     values = {
         "model": "fake-model",
         "capacity": 100_000,
-        "reserve_tokens": 1_000,
         "threshold": 1_000,
         "system_instructions": "SYS",
         "estimator": _estimator,
@@ -480,7 +479,6 @@ async def test_summary_that_stays_over_the_input_limit_fails_with_numbers(
             store,
             provider,
             capacity=2_000,
-            reserve_tokens=100,
             threshold=1.0,
         )
         history = [
@@ -501,10 +499,9 @@ async def test_summary_that_stays_over_the_input_limit_fails_with_numbers(
 
         text = str(error.value)
         assert "still exceeds" in text
-        assert "input limit is 1900" in text
+        assert "input limit is 2000" in text
         assert "capacity 2000" in text
-        assert "reserve 100" in text
-        assert policy.input_limit_tokens == 1900
+        assert policy.input_limit_tokens == 2000
         # One summary attempt only; no second loop.
         assert len(provider.calls) == 1
     finally:
@@ -549,7 +546,6 @@ async def test_default_estimator_counts_system_and_tool_schema(tmp_path: Path) -
             provider,
             model="fake-model",
             capacity=100_000,
-            reserve_tokens=1_000,
             threshold=0.8,
             system_instructions="SYSTEM " + "S" * 500,
         )

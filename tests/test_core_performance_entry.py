@@ -233,16 +233,17 @@ async def test_real_entry_overflow_trims_once_without_replaying_tools(monkeypatc
 
 async def test_failed_before_first_model_snapshot_still_refills_original_input(monkeypatch, tmp_path):
     async def answer(index, messages, tools):
-        raise AssertionError("The impossible local budget must prevent a provider call")
+        raise AssertionError("provider failure after the request snapshot")
 
     config, provider, session_cm = opened(monkeypatch, tmp_path, answer)
+    # There is no local context guard; the provider is called and fails.
     config.agents.defaults.context_window_tokens = 1
     async with session_cm as session:
         failed = await session.submit(TurnRequest("before:snapshot", "original request"))
         assert failed.status is TurnStatus.FAILED
         outcome = await session.undo("before:snapshot")
         assert outcome.request_text == "original request"
-        assert provider.calls == []
+        assert len(provider.calls) == 1
 
 
 async def test_parallel_tools_overlap_with_real_sqlite_and_respect_config(monkeypatch, tmp_path):

@@ -204,12 +204,12 @@ async def test_custom_openai_effort_payload(monkeypatch, effort):
     monkeypatch.setattr(provider._client.chat.completions, "create", transport)
     monkeypatch.setattr(provider, "_parse", lambda response: LLMResponse("ok"))
     try:
-        await provider.chat([], reasoning_effort=effort)
+        await provider.chat([], reasoning_effort=effort, max_tokens=4096)
         assert transport.call_args.kwargs.get("reasoning_effort") == (effort if effort in {"high", "xhigh"} else None)
         assert transport.call_args.kwargs["max_completion_tokens"] == 4096
         assert "max_tokens" not in transport.call_args.kwargs
         assert "temperature" not in transport.call_args.kwargs
-        await provider.chat([], reasoning_effort="none")
+        await provider.chat([], reasoning_effort="none", max_tokens=4096)
         assert "reasoning_effort" not in transport.call_args.kwargs
     finally:
         await provider._client.close()
@@ -223,8 +223,8 @@ async def test_custom_adaptive_token_parameter_survives_second_call(monkeypatch)
     monkeypatch.setattr(provider._client.chat.completions, "create", transport)
     monkeypatch.setattr(provider, "_parse", lambda response: LLMResponse("ok"))
     try:
-        assert (await provider.chat([])).content == "ok"
-        assert (await provider.chat([])).content == "ok"
+        assert (await provider.chat([], max_tokens=4096)).content == "ok"
+        assert (await provider.chat([], max_tokens=4096)).content == "ok"
         assert transport.await_count == 3
         assert "max_completion_tokens" in transport.call_args.kwargs
         assert "max_tokens" not in transport.call_args.kwargs
@@ -242,7 +242,7 @@ async def test_custom_completion_token_rejection_does_not_retry_converted_payloa
     transport = AsyncMock(side_effect=ValueError("max_completion_tokens is too large"))
     monkeypatch.setattr(provider._client.chat.completions, "create", transport)
     try:
-        response = await provider.chat([], reasoning_effort=effort)
+        response = await provider.chat([], reasoning_effort=effort, max_tokens=4096)
         assert response.finish_reason == "error"
         assert transport.await_count == 1
         assert "max_completion_tokens" in transport.call_args.kwargs
@@ -314,7 +314,7 @@ async def test_memory_consolidation_does_not_combine_thinking_and_forced_tools(t
     from PhyAgentOS.agent_legacy.memory import MemoryStore
 
     provider = LiteLLMProvider(api_key="test", default_model="claude-sonnet-4-5", provider_name="anthropic")
-    provider.generation = GenerationSettings(reasoning_effort="high")
+    provider.generation = GenerationSettings(reasoning_effort="high", max_tokens=4096)
     requests = []
 
     async def complete(**kwargs):

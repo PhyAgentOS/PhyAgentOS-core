@@ -50,6 +50,8 @@ class LiteLLMProvider(LLMProvider):
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self._spec = find_by_name(provider_name) if provider_name else None
+        if self._spec is not None:
+            self.requires_max_tokens = bool(self._spec.requires_max_tokens)
 
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
@@ -193,7 +195,7 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
@@ -215,20 +217,18 @@ class LiteLLMProvider(LLMProvider):
         model = self._resolve_model(original_model)
         extra_msg_keys = self._extra_msg_keys(original_model, model)
 
+        # A missing max_tokens means the model uses its own output limit.
         if self._supports_cache_control(original_model):
             messages, tools = self._apply_cache_control(messages, tools)
-
-        # Clamp max_tokens to at least 1 — negative or zero values cause
-        # LiteLLM to reject the request with "max_tokens must be at least 1".
-        max_tokens = max(1, max_tokens)
 
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
-            "max_tokens": max_tokens,
             "temperature": temperature,
             "drop_params": True,
         }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max(1, max_tokens)
 
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)
@@ -307,7 +307,7 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         model: str | None,
-        max_tokens: int,
+        max_tokens: int | None,
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
@@ -325,12 +325,13 @@ class LiteLLMProvider(LLMProvider):
             "messages": self._sanitize_messages(
                 self._sanitize_empty_content(messages), extra_keys=extra_msg_keys
             ),
-            "max_tokens": max(1, max_tokens),
             "temperature": temperature,
             "stream": True,
             "stream_options": {"include_usage": True},
             "drop_params": True,
         }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max(1, max_tokens)
         self._apply_model_overrides(resolved_model, kwargs)
 
         if self.api_key:
