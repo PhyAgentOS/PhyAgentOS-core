@@ -316,6 +316,37 @@ class NodeInstaller:
             return False
         return True
 
+    def installed_light(self, lock: NodeLock) -> bool:
+        """Cheap presence check that skips hashing the installed binary.
+
+        Mirrors :meth:`load` without the ``binary_sha256`` comparison so
+        read-only UIs can report installation status without touching a
+        possibly large executable.
+        """
+        try:
+            self._verify_lock_host(lock)
+            install_root = self.root / lock.node_id / "versions" / lock.artifact_id
+            path = _entrypoint_path(lock, install_root)
+            receipt_path = install_root / self.receipt_name
+            if not path.is_file() or path.is_symlink():
+                return False
+            if path.stat().st_mode & 0o111 == 0:
+                return False
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (InstallerError, OSError, json.JSONDecodeError):
+            return False
+        expected = {
+            "schema_version": 1,
+            "node_id": lock.node_id,
+            "artifact_id": lock.artifact_id,
+            "artifact_type": lock.artifact_type,
+            "entrypoint": lock.entrypoint,
+            "archive_sha256": lock.sha256,
+        }
+        return isinstance(receipt, dict) and all(
+            receipt.get(name) == value for name, value in expected.items()
+        )
+
     @staticmethod
     def _verify_lock_host(lock: NodeLock) -> None:
         if lock.artifact_type not in NodeInstaller.artifact_types:

@@ -15,6 +15,8 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from PhyAgentOS.skill_runtime.service import InstallOutcome, SkillServicePaths
+
 console = Console()
 
 skill_app = typer.Typer(help="Manage installed Skill runtimes")
@@ -93,99 +95,68 @@ def skill_search(
     console.print(table)
 
 
+def _instance_paths() -> SkillServicePaths:
+    from PhyAgentOS.config.paths import (
+        get_artifact_cache_root,
+        get_forge_runtime_root,
+        get_skill_bundle_root,
+        get_skill_runtime_state_dir,
+    )
+
+    return SkillServicePaths(
+        bundles=get_skill_bundle_root(),
+        state=get_skill_runtime_state_dir(),
+        forge_runtime=get_forge_runtime_root(),
+        cache=get_artifact_cache_root(),
+    )
+
+
+def _print_install_outcome(outcome: InstallOutcome) -> None:
+    if outcome.status == "cancelled":
+        console.print("[yellow]Installation cancelled.[/yellow]")
+        return
+    manifest = outcome.manifest
+    assert manifest is not None
+    if outcome.status == "already_ready":
+        if outcome.missing_nodes:
+            names = ", ".join(outcome.missing_nodes)
+            console.print(
+                f"[yellow]Skill [cyan]{manifest.name}[/cyan] is installed; "
+                f"install locked Node(s) locally before start: {names}[/yellow]"
+            )
+        else:
+            console.print(
+                f"[green]✓[/green] Skill [cyan]{manifest.name}[/cyan] "
+                f"{manifest.version} is already ready"
+            )
+        return
+    console.print(
+        f"[green]✓[/green] Installed Skill [cyan]{manifest.name}[/cyan] {manifest.version}"
+    )
+    if outcome.missing_nodes:
+        names = ", ".join(outcome.missing_nodes)
+        console.print(
+            f"[yellow]Install locked Node(s) locally before start: {names}[/yellow]"
+        )
+
+
 def _install_skill_bundle(
     archive: Path,
     *,
     expected_sha256: str,
     expected_version: str | None = None,
     index: str | None = None,
-) -> None:
-    import tempfile
-
-    from PhyAgentOS.skill_runtime.catalog import SkillCatalog, SkillNotFoundError
-    from PhyAgentOS.skill_runtime.installer import NodeInstaller, SkillInstaller
-    from PhyAgentOS.skill_runtime.registry import (
-        DownloadCache,
-        RegistryClient,
-        StaticPackageIndex,
-    )
-    from PhyAgentOS.skill_runtime.state import RuntimeStateStore
+) -> InstallOutcome:
+    from PhyAgentOS.skill_runtime.service import install_bundle
 
     with _download_progress() as report:
-        cache = DownloadCache(progress=report)
-        try:
-            with tempfile.TemporaryDirectory(prefix="paos-skill-preview-") as directory:
-                preview_root = Path(directory)
-                preview = SkillInstaller(
-                    preview_root / "skills",
-                    state_store=RuntimeStateStore(preview_root / "run"),
-                ).install(
-                    archive,
-                    expected_sha256=expected_sha256,
-                )
-                if expected_version is not None and preview.version != expected_version:
-                    raise RuntimeError(
-                        f"Registry returned Skill {preview.name!r} version "
-                        f"{preview.version!r}; requested version was {expected_version!r}"
-                    )
-                node_installer = NodeInstaller()
-                missing_nodes = [
-                    (node_id, lock)
-                    for node_id, lock in sorted(preview.artifacts.nodes.items())
-                    if not node_installer.satisfies(lock)
-                ]
-                if missing_nodes and (
-                    index is not None or preview.artifacts.resolver == "registry"
-                ):
-                    source = StaticPackageIndex(index) if index else RegistryClient()
-                    with source:
-                        for node_id, lock in missing_nodes:
-                            node_artifact = source.node(
-                                lock.artifact_id,
-                                expected_sha256=lock.sha256,
-                            )
-                            if node_artifact.sha256 != lock.sha256:
-                                raise RuntimeError(
-                                    f"Registry digest for Node {node_id!r} does not match "
-                                    "Skill lock"
-                                )
-                            node_archive = cache.download(node_artifact)
-                            installed = node_installer.install(node_archive, lock)
-                            if not node_installer.satisfies(lock):
-                                raise RuntimeError(
-                                    f"Node executable {installed!s} does not satisfy Skill lock"
-                                )
-                    missing_nodes = []
-                try:
-                    local = SkillCatalog().get(preview.name)
-                except SkillNotFoundError:
-                    local = None
-                if local == preview:
-                    if missing_nodes:
-                        names = ", ".join(node_id for node_id, _ in missing_nodes)
-                        console.print(
-                            f"[yellow]Skill [cyan]{preview.name}[/cyan] is installed; "
-                            f"install locked Node(s) locally before start: {names}[/yellow]"
-                        )
-                    else:
-                        console.print(
-                            f"[green]✓[/green] Skill [cyan]{preview.name}[/cyan] "
-                            f"{preview.version} is already ready"
-                        )
-                    return
-                manifest = SkillInstaller().install(
-                    archive,
-                    expected_sha256=expected_sha256,
-                )
-        finally:
-            cache.close()
-    console.print(
-        f"[green]✓[/green] Installed Skill [cyan]{manifest.name}[/cyan] {manifest.version}"
-    )
-    if missing_nodes:
-        names = ", ".join(node_id for node_id, _ in missing_nodes)
-        console.print(
-            f"[yellow]Install locked Node(s) locally before start: {names}[/yellow]"
+        return install_bundle(
+            archive,
+            expected_sha256=expected_sha256,
+            expected_version=expected_version,
+            index=index,
+            paths=_instance_paths(),
+            progress=report,
         )
 
 
@@ -208,31 +179,16 @@ def _install_skill_from_registry(
     index: str | None,
     ask_confirmation: bool,
 ) -> None:
-    from PhyAgentOS.skill_runtime.registry import (
-        DownloadCache,
-        RegistryClient,
-        StaticPackageIndex,
-    )
+    from PhyAgentOS.skill_runtime.service import install_skill_from_registry
 
-    source = StaticPackageIndex(index) if index else RegistryClient()
-    with source:
-        artifact = source.skill(name, version)
-    assert artifact.sha256 is not None and artifact.size is not None
-    if ask_confirmation and not _confirm_skill_install(name, artifact.url, artifact.size):
-        console.print("[yellow]Installation cancelled.[/yellow]")
-        return
-    with _download_progress() as report:
-        cache = DownloadCache(progress=report)
-        try:
-            archive = cache.download(artifact)
-        finally:
-            cache.close()
-    _install_skill_bundle(
-        archive,
-        expected_sha256=artifact.sha256,
-        expected_version=version,
+    outcome = install_skill_from_registry(
+        name,
+        version=version,
         index=index,
+        paths=_instance_paths(),
+        confirm=_confirm_skill_install if ask_confirmation else None,
     )
+    _print_install_outcome(outcome)
 
 
 def _resolve_local_bundle_path(name: str) -> Path:
@@ -256,10 +212,12 @@ def _install_skill_from_local_bundle(
     if ask_confirmation and not _confirm_skill_install(path.name, str(path.resolve()), size):
         console.print("[yellow]Installation cancelled.[/yellow]")
         return
-    _install_skill_bundle(
-        path,
-        expected_sha256=sha256_file(path),
-        index=index,
+    _print_install_outcome(
+        _install_skill_bundle(
+            path,
+            expected_sha256=sha256_file(path),
+            index=index,
+        )
     )
 
 
@@ -335,10 +293,10 @@ def skill_update(
 @skill_app.command("remove")
 def skill_remove(name: str = typer.Argument(..., help="Installed Skill name")):
     """Remove a Skill unless it is running or owns invocations, Sessions, or tasks."""
-    from PhyAgentOS.skill_runtime.installer import SkillInstaller
+    from PhyAgentOS.skill_runtime.service import remove_skill
 
     try:
-        SkillInstaller().remove(name)
+        remove_skill(name, paths=_instance_paths())
     except Exception as error:
         _skill_runtime_error(error)
         return
