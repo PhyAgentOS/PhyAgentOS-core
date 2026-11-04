@@ -29,6 +29,7 @@ __all__ = [
     "ToolVisibility",
     "is_runtime_context_message",
     "project_forge_tool_results",
+    "project_live_forge_reads",
     "project_skill_documents",
 ]
 
@@ -117,6 +118,13 @@ _STATE_KEYS = (
 )
 _UNSAFE_TRUE_KEYS = frozenset({"accepted", "unknown", "partial", "error"})
 _MIN_DEDUP_SAVING = 128
+
+# Live Forge reads are snapshots of a mutable target. A newer successful read
+# for the same target makes an older *different* read stale; exact duplicates
+# are already handled by project_forge_tool_results. The total budget is a
+# safety valve for many distinct tools, not the normal compaction threshold.
+_LIVE_FORGE_READ_TOOLS = frozenset({"forge_tool_context", "forge_tool_list"})
+_LIVE_FORGE_READ_TOTAL_CHARS = 40_000
 
 
 def _parse_json_object(content: Any) -> dict[str, Any] | None:
@@ -301,6 +309,158 @@ def project_forge_tool_results(
     return replaced
 
 
+def _live_read_identity(
+    name: str, payload: Mapping[str, Any]
+) -> tuple[str, str] | None:
+    """Return the mutable target a live read describes, or ``None``.
+
+    ``forge_tool_context`` identifies one ToolSpec by ``tool_id``;
+    ``forge_tool_list`` identifies one catalog view, separated by the optional
+    task binding so two task-specific views are not treated as one target.
+    """
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    if name == "forge_tool_context":
+        tool = data.get("tool")
+        if not isinstance(tool, Mapping):
+            return None
+        tool_id = tool.get("tool_id")
+        return ("tool", tool_id) if isinstance(tool_id, str) and tool_id else None
+    binding = data.get("binding")
+    task_id = binding.get("task_id") if isinstance(binding, Mapping) else None
+    return ("catalog", task_id if isinstance(task_id, str) else "")
+
+
+def _live_read_time(payload: Mapping[str, Any]) -> str | None:
+    data = payload.get("data")
+    source = data.get("source") if isinstance(data, Mapping) else None
+    read_at = source.get("read_at") if isinstance(source, Mapping) else None
+    return read_at if isinstance(read_at, str) else None
+
+
+def _live_read_reference(
+    name: str,
+    identity: tuple[str, str],
+    digest: str,
+    read_at: str | None,
+    marker: str,
+) -> str:
+    detail: dict[str, Any] = {"tool": name, "sha256": digest}
+    if identity[1]:
+        detail["target"] = identity[1]
+    if read_at:
+        detail["read_at"] = read_at
+    return json.dumps({"ok": True, marker: detail}, ensure_ascii=False)
+
+
+def project_live_forge_reads(
+    messages: list[dict[str, Any]],
+    *,
+    max_total_chars: int = _LIVE_FORGE_READ_TOTAL_CHARS,
+) -> int:
+    """Keep one authoritative full copy of each live Forge read.
+
+    ``forge_tool_context`` and ``forge_tool_list`` describe state that can
+    change between calls. The newest successful read for the same target wins:
+    an older read with different content is replaced by a small reference that
+    keeps the tool, target, content hash and read time, so the model can ask
+    for a fresh read instead of acting on a stale schema. Exact duplicates are
+    left to :func:`project_forge_tool_results`, which already handles them.
+
+    ``max_total_chars`` is a safety valve: when several distinct targets remain
+    full, the oldest ones become ``superseded_by_size_budget`` references until
+    the total fits. The newest full read is always kept, so one oversized result
+    is never silently dropped. Failed reads (``ok`` not true) stay verbatim.
+    """
+    candidates: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        name = message.get("name")
+        if message.get("role") != "tool" or name not in _LIVE_FORGE_READ_TOOLS:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        payload = _parse_json_object(content)
+        if payload is None or payload.get("ok") is not True:
+            continue
+        # A live read is a successful observation even when the runtime it
+        # describes is still starting or not ready. Only the read's own
+        # failure state (``ok`` not true) keeps it out of this projection.
+        identity = _live_read_identity(name, payload)
+        if identity is None:
+            continue
+        candidates.append(
+            {
+                "index": index,
+                "name": name,
+                "content": content,
+                "identity": identity,
+                "digest": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "dedup": hashlib.sha256(
+                    _forge_result_dedup_content(name, payload, content).encode("utf-8")
+                ).hexdigest(),
+                "read_at": _live_read_time(payload),
+            }
+        )
+
+    # Newest candidate per target stays full. Every older candidate becomes a
+    # reference, whether it is an exact duplicate or an older version.
+    newest: dict[tuple[str, tuple[str, str]], dict[str, Any]] = {}
+    for candidate in candidates:
+        key = (candidate["name"], candidate["identity"])
+        newest[key] = candidate
+
+    replaced = 0
+    replaced_indices: set[int] = set()
+    for candidate in candidates:
+        key = (candidate["name"], candidate["identity"])
+        keeper = newest[key]
+        if keeper["index"] == candidate["index"]:
+            continue
+        marker = (
+            "duplicate_of_later_result"
+            if keeper["dedup"] == candidate["dedup"]
+            else "superseded_by_newer_read"
+        )
+        replacement = _live_read_reference(
+            candidate["name"],
+            candidate["identity"],
+            candidate["digest"],
+            candidate["read_at"],
+            marker,
+        )
+        if len(candidate["content"]) - len(replacement) < _MIN_DEDUP_SAVING:
+            continue
+        messages[candidate["index"]]["content"] = replacement
+        replaced_indices.add(candidate["index"])
+        replaced += 1
+
+    # Safety valve: bound the total size of the full live reads that remain.
+    remaining = [
+        candidate for candidate in candidates
+        if candidate["index"] not in replaced_indices
+    ]
+    total = sum(len(candidate["content"]) for candidate in remaining)
+    for candidate in sorted(remaining, key=lambda item: item["index"]):
+        if total <= max_total_chars or len(remaining) <= 1:
+            break
+        replacement = _live_read_reference(
+            candidate["name"],
+            candidate["identity"],
+            candidate["digest"],
+            candidate["read_at"],
+            "superseded_by_size_budget",
+        )
+        if len(candidate["content"]) - len(replacement) < _MIN_DEDUP_SAVING:
+            continue
+        messages[candidate["index"]]["content"] = replacement
+        total -= len(candidate["content"]) - len(replacement)
+        remaining.remove(candidate)
+        replaced += 1
+    return replaced
+
+
 class PromptAssemblerImpl:
     """Builds one step's :class:`PromptBundle` from injected inputs.
 
@@ -371,6 +531,7 @@ class PromptAssemblerImpl:
         else:
             project_forge_tool_results(messages)
             project_skill_documents(messages)
+            project_live_forge_reads(messages)
 
             system_text = self._system_text(context)
             if system_text and not _already_carries_system_text(messages, system_text):
@@ -413,6 +574,10 @@ class PromptAssemblerImpl:
         """
         project_forge_tool_results(messages, keep_earliest=True)
         project_skill_documents(messages, keep_earliest=True)
+        # A changed ToolSpec is a real fact change, so superseding it is worth
+        # the prefix-cache invalidation. Exact duplicates stay in their existing
+        # earliest-copy form.
+        project_live_forge_reads(messages)
         _drop_runtime_context(messages)
 
         system_text = self._system_text(context, include_fragments=False)

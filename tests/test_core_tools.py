@@ -844,9 +844,26 @@ async def test_rejection_that_cannot_be_settled_is_reported_as_unknown() -> None
     assert outcome.content["local_error"]["code"] == "unknown_tool"
 
 
+async def test_settled_payload_keeps_structured_text_below_the_limit() -> None:
+    store = _Store()
+    large_text = "x" * 12_000
+
+    async def handler(call: ToolCall, context: ExecutionContext) -> ToolOutcome:
+        return ToolOutcome("call-1", "forge_tool_context", ToolStatus.SUCCEEDED, large_text)
+
+    executor = ToolExecutorImpl([_registration(handler, name="forge_tool_context")], store)
+
+    outcome = await executor.execute(
+        ToolCall("call-1", "forge_tool_context", {"text": "demo"}), _context()
+    )
+
+    assert outcome.text == large_text
+    assert store.events[-1].payload["text"] == large_text
+
+
 async def test_settled_payload_truncates_text_but_keeps_identity_and_error() -> None:
     store = _Store()
-    long_text = "x" * 5000
+    long_text = "x" * 20_000
 
     async def handler(call: ToolCall, context: ExecutionContext) -> ToolOutcome:
         return ToolOutcome(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 
@@ -94,3 +95,33 @@ def test_new_loader_preserves_workspace_installed_builtin_precedence(tmp_path: P
     (installed / "example" / "SKILL.md").unlink()
     assert loader.load_skill("example") == "builtin"
     assert loader.resolve_skill("example")["source"] == "builtin"
+
+
+def test_skill_without_frontmatter_describes_its_first_paragraph(
+    tmp_path: Path,
+) -> None:
+    skill = tmp_path / "skills" / "arm-control"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "# Arm control\n\n"
+        "Control a simulated arm through the Gateway.\n"
+        "Works for joint and Cartesian moves.\n\n"
+        "## Setup\n\n"
+        "This heading is not the description.\n",
+        encoding="utf-8",
+    )
+    loader = SkillDocumentLoader(
+        tmp_path, builtin_skills_dir=tmp_path / "builtin",
+        installed_skills_dir=tmp_path / "installed",
+    )
+
+    summary = ElementTree.fromstring(loader.build_skills_summary())
+    node = next(
+        item for item in summary.findall("skill")
+        if item.findtext("name") == "arm-control"
+    )
+
+    assert node.findtext("description") == (
+        "Control a simulated arm through the Gateway. "
+        "Works for joint and Cartesian moves."
+    )

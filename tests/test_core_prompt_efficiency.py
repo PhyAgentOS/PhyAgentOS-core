@@ -10,6 +10,7 @@ import pytest
 from PhyAgentOS.agent.core.prompt import (
     PromptAssemblerImpl,
     project_forge_tool_results,
+    project_live_forge_reads,
 )
 from PhyAgentOS.agent.core.types import (
     Budget,
@@ -116,6 +117,81 @@ def test_small_or_other_tools_are_not_projected() -> None:
          "content": json.dumps({"ok": True, "data": {"blob": "z" * 9000}})},
     ]
     assert project_forge_tool_results(messages) == 0
+
+
+def _live_context(tool_id: str, description: str, read_at: str) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "tool": {
+                "tool_id": tool_id,
+                "description": description,
+                "input_schema": {"type": "object"},
+            },
+            "context": {
+                "ready": True,
+                "gateway_readiness": {"runtime_phase": "running"},
+            },
+            "source": {"kind": "live_gateway", "read_at": read_at},
+        },
+    }
+
+
+def _live_message(call_id: str, payload: dict) -> dict:
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "name": "forge_tool_context",
+        "content": json.dumps(payload),
+    }
+
+
+def test_newer_live_read_supersedes_an_older_changed_spec() -> None:
+    old = _live_context("sim.move_eef", "old schema " * 80, "2026-11-01T10:00:00+00:00")
+    new = _live_context("sim.move_eef", "new schema " * 80, "2026-11-01T11:00:00+00:00")
+    messages = [_live_message("1", old), _live_message("2", new)]
+
+    assert project_live_forge_reads(messages) == 1
+
+    reference = json.loads(messages[0]["content"])
+    assert reference["superseded_by_newer_read"]["target"] == "sim.move_eef"
+    assert reference["superseded_by_newer_read"]["read_at"] == old["data"]["source"]["read_at"]
+    assert len(reference["superseded_by_newer_read"]["sha256"]) == 64
+    assert messages[1]["content"] == json.dumps(new)
+
+
+def test_live_read_total_budget_replaces_the_oldest_full_copies() -> None:
+    payloads = [
+        _live_context(f"sim.tool_{index}", "x" * 12_000, f"2026-11-01T1{index}:00:00+00:00")
+        for index in range(5)
+    ]
+    messages = [_live_message(str(index), payload) for index, payload in enumerate(payloads)]
+
+    assert project_live_forge_reads(messages, max_total_chars=30_000) == 3
+
+    stripped = [json.loads(message["content"]) for message in messages]
+    assert [item.get("superseded_by_size_budget") is not None for item in stripped] == [
+        True, True, True, False, False,
+    ]
+    assert messages[-1]["content"] == json.dumps(payloads[-1])
+
+
+def test_live_read_projection_leaves_failed_reads_verbatim() -> None:
+    first = {
+        "ok": False,
+        "error": {"message": "gateway timeout"},
+        "data": {"tool": {"tool_id": "sim.move_eef"}},
+    }
+    second = {
+        "ok": False,
+        "error": {"message": "gateway refused the read"},
+        "data": {"tool": {"tool_id": "sim.move_eef"}},
+    }
+    messages = [_live_message("1", first), _live_message("2", second)]
+
+    assert project_live_forge_reads(messages) == 0
+    assert messages[0]["content"] == json.dumps(first)
+    assert messages[1]["content"] == json.dumps(second)
 
 
 def test_hidden_tools_filter_request_tools_but_keep_allowed_ones() -> None:

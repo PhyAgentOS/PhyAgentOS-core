@@ -297,6 +297,26 @@ class SkillDocumentLoader:
         meta = self.get_skill_metadata(name)
         if meta and meta.get("description"):
             return meta["description"]
+        # A Skill without YAML frontmatter still needs a summary that says what
+        # it is for. Repeating the name tells the model nothing about when to
+        # activate it, so use the first prose paragraph of the document instead.
+        body = content
+        if body.startswith("---"):
+            match = re.match(r"^---\n.*?\n---\n?", body, re.DOTALL)
+            if match:
+                body = body[match.end() :]
+        paragraph: list[str] = []
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line:
+                if paragraph:
+                    break
+                continue
+            if line.startswith("#") or line.startswith("<!--"):
+                continue
+            paragraph.append(line)
+        if paragraph:
+            return " ".join(paragraph)[:300].rstrip()
         return name  # Fallback to skill name
 
     def build_evolution_catalog(

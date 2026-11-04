@@ -43,6 +43,7 @@ from PhyAgentOS.agent.core.events import EventType, reverted_turn_ids
 from PhyAgentOS.agent.core.host import AgentHostCloseError
 from PhyAgentOS.agent.core.prompt import (
     project_forge_tool_results,
+    project_live_forge_reads,
     project_skill_documents,
 )
 from PhyAgentOS.agent.core.session import CHECKPOINT_SUMMARY_NOTICE
@@ -112,6 +113,14 @@ def _instructions(config) -> str:
         "when known. Omit timeout_ms when the Gateway limit is unknown. Respect the "
         "user's verification requirement and explain missing evidence; execution "
         "facts alone do not prove the user's goal.",
+        "A physical request is a task, not a chat topic. When the user asks to move, "
+        "pose, reset, inspect, or simulate a robot, arm, gripper, or MuJoCo scene, "
+        "read the installed Skills summary and activate the matching primary Skill "
+        "with activate_skill before answering. Only after activation can "
+        "forge_task_create and forge_tool_start_action run; call forge_tool_context "
+        "for the live ToolSpec and readiness before the first Action. Never say the "
+        "robot cannot be operated without checking the installed Skills and Forge "
+        "tools; if no Skill matches, say what is missing instead of inventing one.",
     ]
     # Workspace instructions are data for the model; they cannot affect runtime
     # authorization or move the Forge execution path out of registered tools.
@@ -119,6 +128,13 @@ def _instructions(config) -> str:
         path = config.workspace_path / name
         if path.is_file():
             parts.append(f"## Workspace {name}\n{path.read_text(encoding='utf-8')}")
+    # 1.1.1 loaded MEMORY.md with the bootstrap files. Core kept the file but
+    # stopped reading it, which dropped exactly the long-lived project and robot
+    # context the model needs to recognize a physical request. Read it live for
+    # the same reason as the workspace files: the next turn sees the edit.
+    memory = config.workspace_path / "memory" / "MEMORY.md"
+    if memory.is_file():
+        parts.append(f"## Workspace memory/MEMORY.md\n{memory.read_text(encoding='utf-8')}")
     return "\n\n".join(parts)
 
 
@@ -1159,6 +1175,7 @@ def _project_request_messages(messages):
     projected = [dict(message) for message in messages]
     project_forge_tool_results(projected)
     project_skill_documents(projected)
+    project_live_forge_reads(projected)
     return projected
 
 

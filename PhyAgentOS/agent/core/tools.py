@@ -61,7 +61,11 @@ from .types import (
 
 __all__ = ["ToolExecutorImpl"]
 
-_SETTLED_TEXT_LIMIT = 2000
+# The settled event is the durable audit record, not the model budget. Keep
+# enough of a structured ToolSpec/context result to be useful later (the largest
+# observed live reads are well under this); model-facing trimming remains the
+# ContextPolicy's job.
+_SETTLED_TEXT_LIMIT = 16_000
 _ERROR_TEXT_LIMIT = 1000
 _TRUNCATION_MARKER = "...[truncated]"
 

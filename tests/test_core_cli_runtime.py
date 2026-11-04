@@ -1471,3 +1471,17 @@ async def test_run_core_agent_single_message_passes_request_text_and_finishes_af
         kind == "info" and "session cli:test" in text and "hello" not in text
         for kind, text in (item[:2] for item in calls if item[0] == "info")
     )
+
+
+def test_instructions_include_memory_and_physical_routing(tmp_path) -> None:
+    config = _config(tmp_path)
+    memory = config.workspace_path / "memory" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("# Long-term Memory\n\nrobot arm baseline\n", encoding="utf-8")
+
+    text = agent_commands._instructions(config)
+
+    assert "robot arm baseline" in text
+    assert "activate_skill" in text
+    assert "forge_tool_context" in text
+    assert "physical request is a task" in text
