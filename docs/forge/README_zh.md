@@ -80,6 +80,11 @@ Result HTTP 202 表示 pending。Cancel HTTP 200/202 表示取消请求已处理
 Timeout 表示远端状态未知。显式 `unknown` 终态会以失败关闭 PAOS 记账，但物理效果仍不确定，
 不能触发盲目重试。
 
+`forge_tool_start_action` 可以在同一个工具调用里最多等待 `forge.actionWaitMs`（默认 8 秒）
+直到 Action 进入终态。这是对 `GET /invocations/{invocation_id}/result` 的有界读取，不是第二次
+dispatch。pending 响应或等待到期仍然是 `UNKNOWN`；只有 `succeeded`/`failed`/`cancelled` 终态
+才映射为已结算的 tool outcome。`wait_ms` 可以按调用覆盖默认值，`0` 恢复只返回 admission 的行为。
+
 PAOS 在 admission 前持久化 Action intent 与生成的 caller ID，并保留 Gateway 返回的每个
 invocation/attempt identity。Timeout 或传输错误形成 `unknown` record；恢复只能读取已持久化
 invocation ID，绝不盲目重复 POST。

@@ -325,6 +325,10 @@ class ForgeConfig(Base):
     request_timeout_s: float = Field(default=10.0, gt=0)
     poll_interval_s: float = Field(default=0.5, ge=0.1, le=5.0)
     execution_timeout_s: float = Field(default=300.0, gt=0)
+    # How long forge_tool_start_action waits inside the same tool call for a
+    # terminal Action outcome. 0 disables the wait and preserves admission-only
+    # behaviour; the model may override it per call with wait_ms.
+    action_wait_ms: int = Field(default=8_000, ge=0, le=60_000)
     # How long an Action/Session may stay ``unknown`` before PAOS settles this
     # execution as a local failure. The deadline is set when the record first
     # becomes unknown and is never extended; the remote state stays unconfirmed.

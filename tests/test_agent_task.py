@@ -147,7 +147,7 @@ def _coordinator(
 ):
     return AgentTaskCoordinator(
         workspace=tmp_path,
-        config=ForgeConfig(),
+        config=ForgeConfig(action_wait_ms=0),
         client=client or FakeToolClient(),
         verifier=verifier,
         experience=experience,

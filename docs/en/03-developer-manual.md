@@ -60,6 +60,8 @@ Routes, response codes and pending/cancel/stop semantics are defined in the [For
 Path components are percent-encoded. PAOS supplies `caller_id` and persists it with the intent
 before Action/Session admission. Admission must contain a non-empty `invocation_id`; Action also
 requires `attempt_id`. A timeout leaves an unknown record and recovery never repeats the POST.
+`forge_tool_start_action` may then read `/invocations/{id}/result` for a bounded `actionWaitMs`
+inside the same call; a pending timeout remains unknown and never becomes success.
 
 ## 4. Agent-facing tools
 
@@ -485,8 +487,9 @@ selects a provider or model, and the entry never substitutes a cheaper model.
 worker pool, treats every other call as a sequential barrier, and still calls `execute()` for every
 call, so validation, policy and the `tool.intent` / `tool.dispatched` / `tool.settled` sequence are
 unchanged. Results keep the model's call order; a never-started call is settled as `cancelled`, not
-as success. A write, edit, shell, `spawn`, `job_wait`, `job_cancel` or Forge tool therefore never
-overlaps another call.
+as success. `forge_tool_context`, `forge_tool_list` and `forge_task_get` are pure reads and may
+overlap; a Forge Action/Session control, write, edit, shell, `spawn`, `job_wait` or `job_cancel`
+never overlaps another call.
 
 With `cache_stable_prompts=True`, `PromptAssemblerImpl` keeps only the fixed system instructions in
 the system message and appends the step's live fragments as one runtime-context message after the

@@ -23,6 +23,7 @@ manifest and an explicitly started profile.
 | `requestTimeoutS` | number | `10.0` | HTTP request timeout, greater than zero. |
 | `pollIntervalS` | number | `0.5` | Recommended Action/Session reconciliation interval in `[0.1, 5.0]` seconds. |
 | `executionTimeoutS` | number | `300.0` | Default Agent-side task deadline guidance. It does not prove that a timed-out execution stopped. |
+| `actionWaitMs` | integer | `8000` | How long `forge_tool_start_action` waits inside one tool call for a terminal Action result, in `[0, 60000]`. `0` returns immediately after admission; a pending timeout is not success. |
 | `unknownRecoveryTimeoutS` | number | `3600.0` | How long an Action/Session may stay `unknown` before it is failed locally and its session slot is released. Set once per record and never extended; the remote outcome stays unconfirmed. |
 | `evidence` | object | below | AgentTask best-effort before/after capture settings. |
 | `interaction` | object | `{"enabled": false}` | Opt-in restricted interaction extension; see below. |

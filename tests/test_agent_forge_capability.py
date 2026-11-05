@@ -112,6 +112,7 @@ class _FakeCoordinator:
         self.cancelled: list[str] = []
         self.started: list[tuple[str, str]] = []
         self.start_action_error: Exception | None = None
+        self.start_action_response: dict[str, Any] | None = None
         self.records: dict[str, AgentTaskRecord] = {}
         self.blockers: list[dict[str, Any]] = []
         self.store = SimpleNamespace(latest_for_session=self._latest_for_session)
@@ -152,6 +153,8 @@ class _FakeCoordinator:
         self.started.append((_task_id, tool_id))
         if self.start_action_error is not None:
             raise self.start_action_error
+        if self.start_action_response is not None:
+            return self.start_action_response
         return {
             "ok": True,
             "data": {"tool_id": tool_id, "invocation_id": "inv_1", "attempt_id": "attempt_1"},
@@ -676,6 +679,11 @@ def test_legacy_wrappers_share_the_native_definitions() -> None:
         build_forge_tool_api_tools(client, coordinator=coordinator)  # type: ignore[arg-type]
     )
     registrations = capability.tool_registrations()
+    parallel_safe = {
+        "forge_tool_context",
+        "forge_tool_list",
+        "forge_task_get",
+    }
 
     assert [item.definition.name for item in registrations] == [
         tool.name for tool in legacy_tools
@@ -683,8 +691,10 @@ def test_legacy_wrappers_share_the_native_definitions() -> None:
     for registration, tool in zip(registrations, legacy_tools, strict=True):
         assert registration.definition.description == tool.description
         assert registration.definition.parameters == tool.parameters
-        assert registration.parallel_safe is False
-        assert tool.parallel_safe is False
+        assert registration.parallel_safe is (
+            registration.definition.name in parallel_safe
+        )
+        assert tool.parallel_safe is registration.parallel_safe
 
 
 async def test_native_handler_does_not_use_legacy_wrappers_or_json_decode(
@@ -723,6 +733,34 @@ async def test_native_handler_does_not_use_legacy_wrappers_or_json_decode(
 
     assert created.status is ToolStatus.SUCCEEDED
     assert started.status is ToolStatus.UNKNOWN
+
+
+async def test_terminal_action_result_maps_to_success_or_failure() -> None:
+    coordinator = _FakeCoordinator()
+    capability = ForgeCapability(coordinator, client=_FakeClient())  # type: ignore[arg-type]
+    arguments = {"task_id": "task_1", "tool_id": "motion.move", "arguments": {}}
+
+    coordinator.start_action_response = {
+        "ok": True,
+        "data": {"status": "succeeded"},
+    }
+    succeeded = await _invoke(capability, "forge_tool_start_action", arguments)
+    assert succeeded.status is ToolStatus.SUCCEEDED
+
+    coordinator.start_action_response = {
+        "ok": True,
+        "data": {"status": "failed", "error": {"message": "boom"}},
+    }
+    failed = await _invoke(capability, "forge_tool_start_action", arguments)
+    assert failed.status is ToolStatus.FAILED
+    assert failed.error is not None and "boom" in failed.error.message
+
+    coordinator.start_action_response = {
+        "ok": True,
+        "data": {"status": "pending"},
+    }
+    pending = await _invoke(capability, "forge_tool_start_action", arguments)
+    assert pending.status is ToolStatus.UNKNOWN
 
 
 async def test_explicit_session_cannot_be_overridden_by_model_arguments() -> None:

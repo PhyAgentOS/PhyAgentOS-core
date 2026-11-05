@@ -315,6 +315,7 @@ is serialized in camelCase and also accepts snake_case.
     "requestTimeoutS": 10,
     "pollIntervalS": 0.5,
     "executionTimeoutS": 300,
+    "actionWaitMs": 8000,
     "evidence": {
       "requiredImageSources": ["front"],
       "associationQuality": "best_effort"
@@ -339,7 +340,7 @@ a cheaper model on its own.
 | `maxParallelTools` | `4` | Upper bound for concurrent tool calls declared `parallel_safe` in one model step. |
 | `cacheStablePrompts` | `true` | Keeps the fixed system text first and appends live state as a separate runtime-context message, so the static prefix stays byte-identical. |
 | `autoCompact` | `true` | Runs the automatic context reduction described in “Compacting a session” before a model request. |
-| `compactionThreshold` | `0.8` | Automatic reduction pressure point; the actual trigger is the smaller of this share of the window and the window minus the reply reserve. |
+| `compactionThreshold` | `0.8` | Automatic reduction pressure point as a share of the effective window. No reply budget is reserved. |
 | `lazyMcpTools` | `true` | Hides MCP tool schemas behind `tool_search`; MCP servers still connect at startup. |
 | `codeMode` | `true` | Offers the restricted `execute_program` tool. |
 | `maxTurnTokens` | `null` | No turn token ceiling. A positive integer stops new model calls after the reported usage for the turn reaches it. |
@@ -568,9 +569,10 @@ work only and does not prove that remote work stopped.
 Tool calls returned by one model step are returned to the model in the order they were requested.
 Only tools whose author declared them `parallel_safe` may overlap, up to `maxParallelTools`; every
 other call is a sequential barrier that waits for the earlier safe batch. Reads, directory listing, web
-search/fetch, scene-graph queries, `job_status` and `subagent_status` are safe; writes, edits,
-shell, `spawn`, `job_wait`, `job_cancel` and all Forge tools are barriers. Each call still runs
-through the normal policy and writes `tool.intent`, `tool.dispatched` and `tool.settled`.
+search/fetch, scene-graph queries, `job_status`, `subagent_status`, `forge_tool_context`,
+`forge_tool_list` and `forge_task_get` are safe; writes, edits, shell, `spawn`, `job_wait`,
+`job_cancel`, Forge Action/Session control and every remaining Forge tool are barriers. Each call
+still runs through the normal policy and writes `tool.intent`, `tool.dispatched` and `tool.settled`.
 
 With `lazyMcpTools`, only MCP tool schemas (names starting with `mcp_`) are hidden. MCP servers are
 still discovered and connected at startup; laziness reduces schema size, not connection delay.
@@ -601,8 +603,8 @@ summary stays with the parent session and does not change the parent's actual ta
 
 Automatic compaction is on by default when the effective window is known. Before each model
 request, Core compares the estimated next request (system prompt, visible tool schemas and history)
-with the effective window. The pressure point is the smaller of `compactionThreshold × window` (80%
-by default) and the window minus the reply reserve. Above it, it first shortens old oversized tool
+with the effective window. The pressure point is `compactionThreshold × window` (80% by default);
+no reply budget is reserved. Above it, it first shortens old oversized tool
 result text deterministically, without a model call, then makes at most one summary request over the
 safe completed prefix. The current user
 task and the most recent complete tool call/result pair stay verbatim. It never loops, and it
@@ -735,7 +737,10 @@ outcome stays unconfirmed. Do not resend that unknown Action/Session, invent an 
 another session's task to get around a local refusal. Use only tools declared by the activated Skill or a fetched
 ToolSpec. If the current end-effector pose or robot state is unavailable, a relative displacement
 cannot be claimed and no guessed absolute target is sent; leaving optional `timeout_ms` unset lets
-the Gateway apply its own timeout.
+the Gateway apply its own timeout. `forge_tool_start_action` also waits up to
+`forge.actionWaitMs` (8 seconds by default) inside the same call for a terminal result. A response
+that is still pending is not success; only a terminal `succeeded`/`failed`/`cancelled` result ends
+the wait. Pass `wait_ms: 0` to return immediately after admission, or a larger value up to 60000.
 
 ## 5. Inspect Tool context
 

@@ -254,7 +254,8 @@ _CREATE_DEFINITION = ToolDefinition(
 _GET_DEFINITION = ToolDefinition(
     name="forge_task_get",
     description=(
-        "Read persisted AgentTask, PlanRevision, Tool execution, evidence and verdict state."
+        "Read persisted AgentTask, PlanRevision, Tool execution, evidence and verdict state. "
+        "Read-only and parallel-safe: independent reads may share one model step."
     ),
     parameters=_task_id_schema(),
 )

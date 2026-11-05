@@ -22,6 +22,7 @@ Runtime 选择与 Gateway URL 来自已安装 Skill manifest 和显式启动的 
 | `requestTimeoutS` | number | `10.0` | HTTP 请求 timeout，必须大于 0。 |
 | `pollIntervalS` | number | `0.5` | Action/Session status/result 建议对账间隔，范围 `[0.1, 5.0]` 秒。 |
 | `executionTimeoutS` | number | `300.0` | Agent 侧任务 deadline 指引；timeout 不能证明远端执行已停止。 |
+| `actionWaitMs` | integer | `8000` | `forge_tool_start_action` 在同一个工具调用里等待 Action 终态的时间，范围 `[0, 60000]` 毫秒。`0` 表示 admission 后立即返回；等待超时仍不是成功。 |
 | `unknownRecoveryTimeoutS` | number | `3600.0` | Action/Session 保持 unknown 的最长时间；到期后按本地失败结算并释放 session 槽位。每条记录只设置一次，不因轮询或重启延长；远端结果仍为未确认。 |
 | `evidence` | object | 见下表 | AgentTask 的 best-effort 前后证据采集设置。 |
 | `interaction` | object | `{"enabled": false}` | 可选的受限交互扩展，见下文。 |

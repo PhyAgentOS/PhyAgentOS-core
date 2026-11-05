@@ -289,12 +289,17 @@ async def _start_action(
     arguments: Mapping[str, Any],
 ) -> dict[str, Any]:
     del client
+    wait_ms = arguments.get("wait_ms")
+    if wait_ms is None:
+        config = getattr(coordinator, "config", None)
+        wait_ms = int(getattr(config, "action_wait_ms", 0) or 0)
     return await _call(
         lambda: coordinator.start_action(
             arguments["task_id"],
             arguments["tool_id"],
             arguments["arguments"],
             timeout_ms=arguments.get("timeout_ms"),
+            wait_ms=wait_ms,
         )
     )
 
@@ -449,7 +454,9 @@ def _owned_invocation_schema() -> dict[str, Any]:
     }
 
 
-def _invoke_schema(*, task_required: bool, include_timeout: bool) -> dict[str, Any]:
+def _invoke_schema(
+    *, task_required: bool, include_timeout: bool, include_wait: bool = False
+) -> dict[str, Any]:
     properties: dict[str, Any] = {
         "task_id": {"type": "string", "minLength": 1},
         "tool_id": {"type": "string", "minLength": 1},
@@ -468,6 +475,17 @@ def _invoke_schema(*, task_required: bool, include_timeout: bool) -> dict[str, A
                 "HTTP client timeout."
             ),
         }
+    if include_wait:
+        properties["wait_ms"] = {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 60_000,
+            "description": (
+                "Optional milliseconds to wait inside this call for a terminal "
+                "Action result. Omit to use forge.actionWaitMs; 0 returns after "
+                "admission. A timeout is still not success."
+            ),
+        }
     return {
         "type": "object",
         "properties": properties,
@@ -478,7 +496,10 @@ def _invoke_schema(*, task_required: bool, include_timeout: bool) -> dict[str, A
 
 _CONTEXT_DEFINITION = ToolDefinition(
     name="forge_tool_context",
-    description="Read a Forge ToolSpec and its live readiness/context before invocation.",
+    description=(
+        "Read a Forge ToolSpec and its live readiness/context before invocation. "
+        "Read-only and parallel-safe: independent reads may share one model step."
+    ),
     parameters=_single_schema("tool_id"),
 )
 
@@ -489,7 +510,8 @@ _LIST_DEFINITION = ToolDefinition(
         "read-only: a newly discovered tool is callable only when the frozen Skill "
         "binding already allows it. Pass task_id to report that AgentTask's frozen "
         "allowlist; omit it for plain catalog discovery. The catalog keeps the "
-        "Gateway's own object shape and is not reinterpreted."
+        "Gateway's own object shape and is not reinterpreted. Read-only and "
+        "parallel-safe: independent reads may share one model step."
     ),
     parameters={
         "type": "object",
@@ -512,9 +534,14 @@ _START_ACTION_DEFINITION = ToolDefinition(
     name="forge_tool_start_action",
     description=(
         "Start a task-bound Forge Action; admission is not completion or task success. "
-        "Omit timeout_ms unless the Gateway's limit is known; the Gateway default applies."
+        "The call waits up to wait_ms (default forge.actionWaitMs, 8s) for a terminal "
+        "result, so do not spend another model step polling while it is still running. "
+        "A timeout remains unknown, not success. Omit timeout_ms unless the Gateway's "
+        "limit is known; the Gateway default applies."
     ),
-    parameters=_invoke_schema(task_required=True, include_timeout=True),
+    parameters=_invoke_schema(
+        task_required=True, include_timeout=True, include_wait=True
+    ),
 )
 
 _ACTION_STATUS_DEFINITION = ToolDefinition(

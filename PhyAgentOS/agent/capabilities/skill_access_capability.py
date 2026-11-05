@@ -80,6 +80,8 @@ class SkillAccessCapability:
             "Only activation_ids returned in this turn are valid; historical ids are not authorization. "
             "For physical work activate a primary Skill, then create an AgentTask. "
             "Do not ask the user to supply activation ids. "
+            "Independent read-only Forge calls may be issued together in one model step; "
+            "Forge Actions and Sessions remain sequential. "
             "A running Skill runtime is separate from a document activation.",
             documents.build_skills_summary(),
             "Current turn activations: " + json.dumps(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 import httpx
 
@@ -22,12 +24,18 @@ def _ok(data: dict, status: int = 200) -> httpx.Response:
     return httpx.Response(status, json={"ok": True, "data": data})
 
 
-def _coordinator(tmp_path, client: ForgeToolClient, *, tracked=None):
+def _coordinator(
+    tmp_path,
+    client: ForgeToolClient,
+    *,
+    tracked=None,
+    config: ForgeConfig | None = None,
+):
     # Keep evidence collection disabled in transport-only tests; AsyncClient retains its base URL.
     client.base_url = ""
     coordinator = AgentTaskCoordinator(
         workspace=tmp_path,
-        config=ForgeConfig(),
+        config=config or ForgeConfig(action_wait_ms=0),
         client=client,
         runtime_invocation_ids=tracked,
     )
@@ -115,10 +123,10 @@ async def test_core_start_action_passes_no_timeout_when_omitted() -> None:
 
     class Coordinator:
         async def start_action(
-            self, task_id, tool_id, arguments, *, timeout_ms=None
+            self, task_id, tool_id, arguments, *, timeout_ms=None, wait_ms=None
         ):
             del task_id, tool_id, arguments
-            calls.append(timeout_ms)
+            calls.append((timeout_ms, wait_ms))
             return {"ok": True, "data": {"status": "accepted"}}
 
     payload = await execute_tool_api_tool(
@@ -128,7 +136,7 @@ async def test_core_start_action_passes_no_timeout_when_omitted() -> None:
         {"task_id": "task_1", "tool_id": "motion.move", "arguments": {}},
     )
     assert payload["data"]["status"] == "accepted"
-    assert calls == [None]
+    assert calls == [(None, 0)]
 
     await execute_tool_api_tool(
         "forge_tool_start_action",
@@ -141,7 +149,7 @@ async def test_core_start_action_passes_no_timeout_when_omitted() -> None:
             "timeout_ms": 500,
         },
     )
-    assert calls == [None, 500]
+    assert calls == [(None, 0), (500, 0)]
 
 
 def test_tool_schema_keeps_optional_timeout_with_omit_policy() -> None:
@@ -367,3 +375,128 @@ async def test_pre_dispatch_validation_code_is_passed_through_and_failed(tmp_pat
     assert record.rejected_before_dispatch is True
     assert record.invocation_id is None
     assert requests == [("POST", "/tools/motion.move_pose:invoke")]
+
+
+async def test_start_action_wait_returns_terminal_result(tmp_path) -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.method == "POST" and request.url.path.endswith(":invoke"):
+            return _ok(
+                {"invocation_id": "inv_wait", "attempt_id": "attempt_wait"},
+                status=202,
+            )
+        if request.url.path == "/invocations/inv_wait/result":
+            return _ok(
+                {
+                    "status": "available",
+                    "result": {"status": "succeeded", "outputs": {"moved": True}},
+                }
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = ForgeToolClient(
+        "http://gateway.test",
+        transport=httpx.MockTransport(handler),
+    )
+    coordinator, task = _coordinator(
+        tmp_path,
+        client,
+        tracked=(tracked := set()),
+        config=ForgeConfig(action_wait_ms=1_000, poll_interval_s=0.1),
+    )
+    try:
+        payload = await execute_tool_api_tool(
+            "forge_tool_start_action",
+            client,
+            coordinator,
+            {"task_id": task.task_id, "tool_id": "motion.move_pose", "arguments": {}},
+        )
+    finally:
+        await client.close()
+
+    assert payload["ok"] is True
+    assert payload["data"]["result"]["status"] == "succeeded"
+    assert payload["data"]["invocation_id"] == "inv_wait"
+    assert payload["data"]["attempt_id"] == "attempt_wait"
+    record = coordinator.get_task(task.task_id).execution_records[0]
+    assert record.status == "succeeded"
+    assert record.invocation_id == "inv_wait"
+    assert tracked == set()
+    assert ("GET", "/invocations/inv_wait/result") in requests
+
+
+async def test_start_action_wait_timeout_stays_pending(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith(":invoke"):
+            return _ok(
+                {"invocation_id": "inv_slow", "attempt_id": "attempt_slow"},
+                status=202,
+            )
+        if request.url.path == "/invocations/inv_slow/result":
+            return _ok({"status": "pending"}, status=202)
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = ForgeToolClient(
+        "http://gateway.test",
+        transport=httpx.MockTransport(handler),
+    )
+    coordinator, task = _coordinator(
+        tmp_path,
+        client,
+        config=ForgeConfig(action_wait_ms=150, poll_interval_s=0.1),
+    )
+    try:
+        payload = await execute_tool_api_tool(
+            "forge_tool_start_action",
+            client,
+            coordinator,
+            {"task_id": task.task_id, "tool_id": "motion.move_pose", "arguments": {}},
+        )
+    finally:
+        await client.close()
+
+    assert payload["ok"] is True
+    assert payload["data"]["status"] == "pending"
+    assert payload["data"]["invocation_id"] == "inv_slow"
+    assert payload["data"]["attempt_id"] == "attempt_slow"
+    record = coordinator.get_task(task.task_id).execution_records[0]
+    assert record.status == "accepted"
+    assert record.invocation_id == "inv_slow"
+
+
+async def test_start_action_wait_bounds_a_slow_result_read(tmp_path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return _ok(
+                {"invocation_id": "inv_read", "attempt_id": "attempt_read"},
+                status=202,
+            )
+        await asyncio.sleep(5)
+        return _ok({"status": "pending"}, status=202)
+
+    client = ForgeToolClient(
+        "http://gateway.test", transport=httpx.MockTransport(handler)
+    )
+    coordinator, task = _coordinator(
+        tmp_path, client, config=ForgeConfig(action_wait_ms=50)
+    )
+    try:
+        started = time.monotonic()
+        payload = await asyncio.wait_for(
+            execute_tool_api_tool(
+                "forge_tool_start_action",
+                client,
+                coordinator,
+                {"task_id": task.task_id, "tool_id": "motion.move_pose", "arguments": {}},
+            ),
+            timeout=1,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        await client.close()
+
+    assert elapsed < 1
+    assert payload["data"]["invocation_id"] == "inv_read"
+    assert coordinator.get_task(task.task_id).execution_records[0].status == "accepted"

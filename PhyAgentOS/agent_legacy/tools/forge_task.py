@@ -89,6 +89,8 @@ class ForgeTaskCreateTool(Tool):
 
 
 class ForgeTaskGetTool(Tool):
+    parallel_safe = True
+
     def __init__(self, coordinator: AgentTaskCoordinator) -> None:
         self.coordinator = coordinator
 

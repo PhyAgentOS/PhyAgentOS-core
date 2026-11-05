@@ -55,6 +55,8 @@ class ForgeToolContextTool(Tool):
     never caches its response; every call must reflect the current runtime.
     """
 
+    parallel_safe = True
+
     def __init__(self, client: ForgeToolClient) -> None:
         self.client = client
         self.coordinator: AgentTaskCoordinator | None = None
@@ -80,6 +82,8 @@ class ForgeToolContextTool(Tool):
 
 class ForgeToolListTool(Tool):
     """List the live Gateway catalog; discovery never expands the allowlist."""
+
+    parallel_safe = True
 
     def __init__(
         self,
@@ -175,6 +179,7 @@ class ForgeToolStartActionTool(Tool):
         tool_id: str,
         arguments: dict[str, Any],
         timeout_ms: int | None = None,
+        wait_ms: int | None = None,
     ) -> str:
         call_arguments: dict[str, Any] = {
             "task_id": task_id,
@@ -183,6 +188,8 @@ class ForgeToolStartActionTool(Tool):
         }
         if timeout_ms is not None:
             call_arguments["timeout_ms"] = timeout_ms
+        if wait_ms is not None:
+            call_arguments["wait_ms"] = wait_ms
         payload = await execute_tool_api_tool(
             self.name, self.client, self.coordinator, call_arguments
         )

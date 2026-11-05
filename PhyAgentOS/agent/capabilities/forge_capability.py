@@ -59,6 +59,12 @@ _ACCEPTED_START_TOOLS = frozenset(
     {"forge_tool_start_action", "forge_tool_start_session"}
 )
 
+# Pure reads that do not write AgentTask state. They may overlap in one model
+# step; every Action/Session control remains a sequential barrier.
+_PARALLEL_SAFE_TOOLS = frozenset(
+    {"forge_tool_context", "forge_tool_list", "forge_task_get"}
+)
+
 # These tools ask Forge to stop remote work. A request is not proof of stop.
 _STOP_REQUEST_TOOLS = frozenset(
     {"forge_tool_cancel_action", "forge_tool_stop_session"}
@@ -325,6 +331,27 @@ def _outcome_for_success(
     status = _domain_status(data)
 
     if call.name in _ACCEPTED_START_TOOLS:
+        if status in _SUCCESS_DOMAIN_STATUSES:
+            return _success_outcome(call, data, arguments)
+        if status in _FAILED_DOMAIN_STATUSES:
+            error = _domain_error(data, status)
+            return _failed_outcome(
+                call,
+                error.code,
+                error.message,
+                data=data,
+                arguments=arguments,
+            )
+        if status in _CANCELLED_DOMAIN_STATUSES:
+            return ToolOutcome(
+                tool_call_id=call.tool_call_id,
+                tool_name=call.name,
+                status=ToolStatus.CANCELLED,
+                text=f"Forge reports the invocation as {status}. "
+                + _json({"ok": True, "data": dict(data)}),
+                content={"data": dict(data), "domain_status": status},
+                domain_refs=_domain_refs(data, arguments),
+            )
         return _unknown_outcome(
             call,
             "Forge accepted the request, but remote completion is not confirmed. "
@@ -493,6 +520,7 @@ class ForgeCapability:
             ToolRegistration(
                 definition=definition,
                 handler=self._task_handler(definition.name),
+                parallel_safe=definition.name in _PARALLEL_SAFE_TOOLS,
             )
             for definition in TASK_TOOL_DEFINITIONS
         ]
@@ -501,6 +529,7 @@ class ForgeCapability:
                 ToolRegistration(
                     definition=definition,
                     handler=self._tool_api_handler(definition.name),
+                    parallel_safe=definition.name in _PARALLEL_SAFE_TOOLS,
                 )
                 for definition in TOOL_API_DEFINITIONS
             )

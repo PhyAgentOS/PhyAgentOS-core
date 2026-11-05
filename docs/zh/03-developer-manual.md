@@ -59,7 +59,8 @@ HTTP 路由、响应码及 pending/cancel/stop 语义统一维护在 [Forge Tool
 
 路径组件经过 percent encoding。PAOS 生成 `caller_id`，并在 Action/Session admission 前与
 intent 一同持久化。Admission 必须包含非空 `invocation_id`，Action 还要求 `attempt_id`。
-Timeout 形成 unknown record，恢复不会重复 POST。
+Timeout 形成 unknown record，恢复不会重复 POST。`forge_tool_start_action` 之后可以在同一个
+调用里按 `actionWaitMs` 有界读取 `/invocations/{id}/result`；等待超时仍是 unknown，不会变成成功。
 
 ## 4. Agent tools
 
@@ -341,7 +342,8 @@ provider 确实发来的 usage 键。
 `ToolExecutorImpl.execute_batch` 把连续的 `parallel_safe=True` 注册放进有界 worker pool，其他调用
 一律作为串行屏障，并且每个调用仍走 `execute()`，所以校验、策略和 `tool.intent` /
 `tool.dispatched` / `tool.settled` 顺序不变。结果保持模型给出的调用顺序；从未启动的调用结算为
-`cancelled`，不写成成功。写入、编辑、Shell、`spawn`、`job_wait`、`job_cancel` 或 Forge 工具都
+`cancelled`，不写成成功。`forge_tool_context`、`forge_tool_list` 与 `forge_task_get` 是纯读取，
+可以并发；Forge Action/Session 控制、写入、编辑、Shell、`spawn`、`job_wait` 或 `job_cancel`
 不会与另一个调用重叠。
 
 `cache_stable_prompts=True` 时，`PromptAssemblerImpl` 只把固定 system 指令放进 system 消息，并把

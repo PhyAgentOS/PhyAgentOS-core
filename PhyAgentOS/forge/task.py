@@ -1100,7 +1100,12 @@ class AgentTaskCoordinator:
         arguments: dict[str, Any],
         *,
         timeout_ms: int | None = None,
+        wait_ms: int | None = None,
     ) -> dict[str, Any]:
+        if wait_ms is not None:
+            if isinstance(wait_ms, bool) or not isinstance(wait_ms, int) or wait_ms < 0:
+                raise ValueError("wait_ms must be a non-negative int or None")
+            wait_ms = min(wait_ms, 60_000)
         task = self._require_executable(task_id)
         if any(
             item.semantics == "action"
@@ -1119,7 +1124,7 @@ class AgentTaskCoordinator:
             task_id, tool_id, "action", arguments, tool=tool
         )
         self._assert_dispatch_window(task_id, record_id)
-        client = self._execution_client(task_id)
+        client = self._pinned_execution_client(task_id)
         invocation_id: str | None = None
         attempt_id: str | None = None
         inner = asyncio.ensure_future(
@@ -1268,6 +1273,19 @@ class AgentTaskCoordinator:
         ) and not accepted_record.cancel_requested:
             await self._request_remote_stop(task_id, accepted_record, client=client)
             self._settle_cancellation(task_id)
+        if (
+            wait_ms
+            and not current.cancellation_requested
+            and current.status == AgentTaskStatus.EXECUTING
+        ):
+            response = await self._wait_action_result(
+                task_id,
+                record_id,
+                invocation_id,
+                client,
+                response,
+                wait_ms,
+            )
         return self._track_remote_identity(
             task_id,
             record_id,
@@ -1836,6 +1854,93 @@ class AgentTaskCoordinator:
                 task_id, record.record_id, status=status, response=response
             )
 
+    def _pinned_execution_client(self, task_id: str):
+        """Return one concrete client for an entire Action admission and wait.
+
+        ``DynamicForgeToolClient`` follows the active runtime on every attribute
+        access. A dispatch and its result reads must not land on two different
+        Gateways, so the active client is resolved once here.
+        """
+        from PhyAgentOS.forge.interaction.client import trusted_runtime
+
+        runtime = trusted_runtime(self, task_id)
+        if runtime is not None:
+            return runtime.client
+        client = self.client
+        registry = getattr(client, "registry", None)
+        current = getattr(registry, "current", None)
+        if not callable(current):
+            return client
+        active = current()
+        if active is None:
+            raise AgentTaskError("no ready Forge Skill runtime is active")
+        pinned = getattr(active, "client", None)
+        if pinned is None:
+            raise AgentTaskError("the active Forge Skill runtime has no Gateway client")
+        return pinned
+
+    async def _wait_action_result(
+        self,
+        task_id: str,
+        record_id: str,
+        invocation_id: str,
+        client,
+        accepted_response: dict[str, Any],
+        wait_ms: int,
+    ) -> dict[str, Any]:
+        """Poll one accepted Action until it is terminal or the wait expires.
+
+        A terminal response is returned to the tool adapter, which maps it to
+        success or failure. A timeout returns the last pending response and
+        leaves the record non-terminal; the caller can still reconcile it later.
+        """
+        if wait_ms <= 0:
+            return accepted_response
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (wait_ms / 1000.0)
+        last = accepted_response
+        last_status = "accepted"
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return last
+            current = self.store.get(task_id)
+            if current.terminal or current.cancellation_requested:
+                return last
+            if _task_execution(current, record_id).terminal:
+                return last
+
+            try:
+                response = await asyncio.wait_for(
+                    client.invocation_result(invocation_id), timeout=remaining
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A read failure does not turn the admitted Action into a
+                # success or failure. Keep the last known response.
+                return last
+            # Result envelopes may omit the admission identities. Keep them
+            # visible so the model can reconcile a pending Action later.
+            data = dict(_response_data(response))
+            admitted = _response_data(accepted_response)
+            for identity in ("invocation_id", "attempt_id"):
+                if identity in admitted:
+                    data.setdefault(identity, admitted[identity])
+            response = {**response, "data": data}
+            last = response
+            status = _tool_status(response, default="accepted")
+            if status != last_status or status in TERMINAL_TOOL_STATUSES:
+                self.observe_action(task_id, invocation_id, response)
+                last_status = status
+            if status in TERMINAL_TOOL_STATUSES:
+                return response
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return last
+            await asyncio.sleep(min(self.cancel_poll_interval_s, remaining))
+
     def _execution_client(self, task_id):
         from PhyAgentOS.forge.interaction.client import trusted_runtime
         runtime = trusted_runtime(self, task_id)
@@ -2225,6 +2330,12 @@ class AgentTaskCoordinator:
         if tracker is None:
             return response
         try:
+            record = _task_execution(self.store.get(task_id), record_id)
+            if record.terminal and record.status != "unknown":
+                # A terminal observation already removed this identity from
+                # the Runtime tracker; admission must not add it back. An
+                # unknown result stays tracked for later reconciliation.
+                return response
             tracker.add(invocation_id)
             return response
         except Exception as exc:

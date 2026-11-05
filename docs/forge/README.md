@@ -82,6 +82,13 @@ accepted; it does not prove stop. A timeout means the remote state is unknown. A
 `unknown` terminal outcome closes PAOS accounting as a failure but remains physically uncertain and
 must not trigger a blind retry.
 
+`forge_tool_start_action` may wait inside the same tool call for up to `forge.actionWaitMs`
+(8 seconds by default) for a terminal Action result. This is a bounded read of
+`GET /invocations/{invocation_id}/result`, not a second dispatch. A pending response or an expired
+wait remains `UNKNOWN`; only a terminal `succeeded`/`failed`/`cancelled` response is mapped to a
+settled tool outcome. `wait_ms` may override the default per call, and `0` restores admission-only
+behaviour.
+
 Before admission PAOS persists an Action intent and its generated caller ID. Every returned
 invocation/attempt identity is retained. A timeout or transport error leaves an `unknown` record;
 recovery may only read a persisted invocation ID and never repeats the POST blindly.

@@ -291,6 +291,7 @@ docker compose run --rm phyagentos-cli agent --provider openai --model gpt-5 --r
     "requestTimeoutS": 10,
     "pollIntervalS": 0.5,
     "executionTimeoutS": 300,
+    "actionWaitMs": 8000,
     "evidence": {
       "requiredImageSources": ["front"],
       "associationQuality": "best_effort"
@@ -314,7 +315,7 @@ snake_case。这些设置不会选择 provider 或模型，Core 也不会自行�
 | `maxParallelTools` | `4` | 单个模型步骤里，声明为 `parallel_safe` 的工具最多并发多少个。 |
 | `cacheStablePrompts` | `true` | 固定 system 文本放在最前，实时状态作为独立的 runtime-context 消息附在最后，静态前缀保持逐字节不变。 |
 | `autoCompact` | `true` | 每次模型请求前执行“压缩会话”里描述的自动上下文缩减。 |
-| `compactionThreshold` | `0.8` | 自动缩减的压力点；实际触发点取“窗口的这个比例”与“窗口减去回复预留”中较小者。取值必须在 0 和 1 之间。 |
+| `compactionThreshold` | `0.8` | 自动缩减的压力点，按有效窗口的比例计算；不预留回复预算。取值必须在 0 和 1 之间。 |
 | `lazyMcpTools` | `true` | 把 MCP 工具 schema 藏在 `tool_search` 后面；MCP 服务仍在启动时连接。 |
 | `codeMode` | `true` | 提供受限的 `execute_program` 工具。 |
 | `maxTurnTokens` | `null` | 不设回合 token 上限。设为正整数后，回合已报告的用量达到该值就不再发起新的模型调用。 |
@@ -504,9 +505,10 @@ session、provider/model 与 `context` 行在请求输入上方。状态行不�
 
 同一个模型步骤返回的工具调用按模型请求的顺序交回。只有作者声明 `parallel_safe` 的工具可以并发，
 最多 `maxParallelTools` 个；其他调用都是串行屏障，会等前面的安全批次结束。读取、列目录、
-网页搜索/抓取、场景图查询、`job_status` 与 `subagent_status` 是安全的；写入、编辑、shell、
-`spawn`、`job_wait`、`job_cancel` 和所有 Forge 工具都是屏障。每次调用仍然走正常策略，并写入
-`tool.intent`、`tool.dispatched`、`tool.settled`。
+网页搜索/抓取、场景图查询、`job_status`、`subagent_status`、`forge_tool_context`、
+`forge_tool_list` 与 `forge_task_get` 是安全的；写入、编辑、shell、`spawn`、`job_wait`、
+`job_cancel`、Forge Action/Session 控制和其余 Forge 工具都是屏障。每次调用仍然走正常策略，
+并写入 `tool.intent`、`tool.dispatched`、`tool.settled`。
 
 打开 `lazyMcpTools` 时，只隐藏 MCP 工具 schema（名字以 `mcp_` 开头）。MCP 服务仍在启动时
 发现并连接；它减少的是 schema 体积，不是连接延迟。`tool_search(query)` 返回匹配的 schema，
@@ -532,8 +534,8 @@ Forge 工具被排除；每个子调用仍受当前工具策略约束，并按�
 ### 压缩会话
 
 自动压缩在有效窗口已知时默认开启。每次模型请求前，Core 会把下一次请求（system prompt、可见工具
-schema 与历史）的估算和有效窗口比较。触发点是 `compactionThreshold × 窗口`（默认 80%）与“窗口减去回复预留”中
-较小的那个。超过它时，Core 先确定性地缩短旧的超长工具结果文本，不发模型请求，再对安全的已完成
+schema 与历史）的估算和有效窗口比较。触发点是 `compactionThreshold × 窗口`（默认 80%），不预留
+回复预算。超过它时，Core 先确定性地缩短旧的超长工具结果文本，不发模型请求，再对安全的已完成
 前缀最多发一次摘要请求。当前用户任务和最近一组完整工具调用/结果保持原文。它不循环，只有测量到
 的下一次请求确实变小时才返回缩减；摘要失败不会丢掉已经生效的 trim。回合未结束时，缩减记录在该
 回合里，不写 checkpoint。摘要是真实的 provider 调用：它报告的用量（包括失败尝试）计入会话
@@ -631,7 +633,10 @@ AgentTask，其他 session 的未完成或 unknown 工作既不阻止创建，�
 这次执行按本地失败结算并释放槽位。截止时间只写一次，轮询和重启都不会延长；远端结果仍为未确认。不要重发该 unknown Action/Session，不要猜 invocation id，也不要靠取消别人的
 任务绕过本地的拒绝。只能用激活 Skill 或已取得 ToolSpec 声明的工具；如果当前末端位姿
 或机器人状态拿不到，就不能声称相对位移已完成，也不要发送猜测的绝对目标。可选 `timeout_ms`
-不填时由 Gateway 用自己的默认超时。
+不填时由 Gateway 用自己的默认超时。`forge_tool_start_action` 还会在同一个调用里最多等待
+`forge.actionWaitMs`（默认 8 秒）直到 Action 进入终态。仍然 pending 的响应不是成功；只有
+`succeeded`/`failed`/`cancelled` 终态才会结束等待。传 `wait_ms: 0` 可在 admission 后立即返回，
+也可以传更大值，上限 60000。
 
 ## 5. 检查 Tool context
 
