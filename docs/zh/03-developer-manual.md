@@ -250,7 +250,7 @@ session、provider/model 与 `context` 行渲染在请求输入上方。状态�
 5. 创建 `SkillDocumentLoader` 与 `TurnSkillActivationManager`，把激活管理器注册给 coordinator，使 `forge_task_create` 能校验 `activation_id`。
 6. 打开会话存储 `<workspace>/sessions/core.db`。
 7. 建立共用工具能力，在装配前完成 MCP 发现，再用 `compose_agent` 建种子装配；Skill 访问在前，通用工具、图片、条件模式管理、MCP、spawn、有 MCP 工具时的 `tool_search` 与 code mode 打开时的 `execute_program` 居中，Forge 在后。
-8. 跑单条消息或交互循环。每回合在真正开始时读取该 session 的选择并新建面向模型的装配；这份装配只服务一个回合，回合结束立即 `runtime.stop()`（不关 host），不再等下次 submit。工作区规则文件（`AGENTS.md`、`SOUL.md`、`USER.md`、`IDENTITY.md`、`TOOLS.md`、`SKILLS.md`）也在同一回合开始读取，并在本回合内冻结；修改从下一回合生效，包括排队中的回合或新 session，手动压缩读取当前文件。store、Forge coordinator/client 与激活管理器保持共享。同一 session 的提交按登记顺序串行，不同 session 可并发；`cancel` 只取消当前装配，排队中的回合不会继承这次取消。
+8. 跑单条消息或交互循环。每回合在真正开始时读取该 session 的选择并新建面向模型的装配；这份装配只服务一个回合，回合结束立即 `runtime.stop()`（不关 host），不再等下次 submit。工作区规则文件（`AGENTS.md`、`SOUL.md`、`USER.md`、`IDENTITY.md`、`TOOLS.md`、`SKILLS.md`）也在同一回合开始读取，并在本回合内冻结；修改从下一回合生效，包括排队中的回合或新 session，手动压缩读取当前文件。store、Forge coordinator/client 与激活管理器保持共享。同一 session 的提交由一个 FIFO worker 按登记顺序串行，不同 session 可并发；取消一个排队中的提交只移除该项，不能让后面的项越过正在运行的回合。`cancel` 只作用于调用时当前的那一轮，包括装配尚未登记的启动交接阶段。能力清理由会话持有；调用方停止等待不会打断清理，清理完成前也不会启动后继回合。清理失败按异常类型和 session 报告一次，不改变本回合的本地取消结果或远端 unknown/success 语义；仍在等待的调用方同时收到原异常。取消仍在排队的压缩会立即返回，不等待当前回合；没有活动或正在启动的回合时，取消不会留给之后的提交。
 9. 只关闭一次：先拒绝新提交并让排队中的提交在开回合前退出，再停仍可能持有回合的 runtime，等已进入本 session 的提交返回，对每个已接受的 session 通知各能力，关闭规范能力一次，最后关 store。Forge client 与验证器由资源栈在会话之后关闭。
 
 只有本 session 最新的 task 仍有未完成的实时工作时，`forge_task_create` 才拒绝；别的 session 的 task 不会阻止它。若旧 task 唯一未完成的工作是仍标为 unknown 的 Action/Session 调用，则不会拒绝：创建会把旧的本地 task 以 failed 关闭，并保留远端 unknown record。拒绝结果会给出阻塞的 `task_id`、状态与 origin session；不会重发旧请求，也不会建议删 store 或靠重启清除。真实 operation 是否 busy 由 Gateway 判断，不由 PAOS 代替判断。

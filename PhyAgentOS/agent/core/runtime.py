@@ -48,11 +48,11 @@ Invariants this module enforces:
   ``payload["unapplied_corrections"]`` and exposed by
   :meth:`unapplied_corrections`; it is never applied or put into history.
 * ``cancel`` only requests local cancellation and waits for the turn to settle.
-  If the session is registered but no turn is published yet, it records
-  ``cancel_pending`` for that accepted submit instead of losing the request.
-  It never calls a capability or Forge, never claims remote work stopped, and
-  never cancels an asyncio task (so a ``submit`` that is waiting in the same
-  session is not cancelled).
+  Its target is fixed when it is called: the active turn, or the one accepted
+  submit currently preparing to start. It never turns into a cancellation of a
+  later submit. It never calls a capability or Forge, never claims remote work
+  stopped, and never cancels an asyncio task (so a ``submit`` that is waiting in
+  the same session is not cancelled).
 """
 
 from __future__ import annotations
@@ -125,6 +125,17 @@ class _ActiveTurn:
 
 
 @dataclass(slots=True)
+class _Admission:
+    """The one accepted submit that is preparing its turn.
+
+    Its token exists before the turn is published, so a cancel during recovery
+    or history loading targets this submit and does not leak to a later one.
+    """
+
+    token: CancellationToken
+
+
+@dataclass(slots=True)
 class _SessionState:
     """Per-session serialization plus the current turn, if any.
 
@@ -134,17 +145,18 @@ class _SessionState:
     sessions and a freshly created lock can never coexist with a live waiter
     of the old one.
 
-    ``cancel_pending`` records a cancellation that arrived after ``submit``
-    registered the session but before it published ``active``. The next turn
-    of this state consumes the flag exactly once; it is never inherited by a
-    turn that has not been accepted yet.
+    ``starting`` is the one accepted submit that currently holds the session
+    lock and is preparing its turn. It is set only after that submit acquired
+    the lock, so a cancel cannot reach a submit that is merely queued. There is
+    no session-wide pending cancellation: a cancel with no active or starting
+    turn has no target and returns ``None``.
     """
 
     session_id: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     active: _ActiveTurn | None = None
+    starting: _Admission | None = None
     users: int = 0
-    cancel_pending: bool = False
 
 
 class AgentRuntime:
@@ -317,96 +329,108 @@ class AgentRuntime:
 
         state = await self._acquire_state(request.session_id, create=True, submit=True)
         active: _ActiveTurn | None = None
+        admission: _Admission | None = None
         try:
             async with state.lock:
                 if self._stopped:
                     raise RuntimeError("agent runtime is stopped")
 
-                resumed_from: str | None = None
-                resume_warnings: tuple[str, ...] = ()
-                if resume:
-                    await self._startup(
-                        request.session_id, with_conversation=False
-                    )
-                    history, resumed_from, resume_warnings = (
-                        await self._read_resume_history(
-                            request.session_id, source_turn_id
-                        )
-                    )
-                else:
-                    history = await self._startup(request.session_id)
-                if self._stopped:
-                    raise RuntimeError("agent runtime is stopped")
-
                 turn_id = f"turn-{uuid.uuid4().hex}"
                 token = CancellationToken()
-                budget = Budget(
-                    max_steps=self._max_steps,
-                    deadline=(
-                        None
-                        if self._deadline_seconds is None
-                        else time.monotonic() + self._deadline_seconds
-                    ),
-                )
-                # Consuming a pending cancel and publishing ``active`` happen
-                # under the registry lock, which ``cancel`` and ``stop`` also
-                # take. A cancel either records intent before this block (and
-                # this turn consumes it) or observes ``active`` after it; it
-                # can never fall between the two and be lost.
+                admission = _Admission(token=token)
+                # Publishing ``starting`` and observing it in ``cancel`` use
+                # the same registry lock. A cancel can only target a submit
+                # that already owns the session lock; one that is still
+                # queued is not a target. This is what keeps a cancellation
+                # from being inherited by a later submit.
                 async with self._registry_lock:
                     if self._stopped:
                         raise RuntimeError("agent runtime is stopped")
-                    if state.cancel_pending:
-                        state.cancel_pending = False
-                        token.request("cancellation requested by runtime")
-                    start = TurnStart(
-                        request=request,
-                        turn_id=turn_id,
-                        cancellation=token,
-                        budget=budget,
-                        history=history,
-                    )
-                    active = _ActiveTurn(turn_id=turn_id, start=start)
-                    # Open steering before publishing the active turn. A closed
-                    # or broken control then raises with no active turn to
-                    # leak, no start event written, and no terminal event
-                    # invented; the outer finally still releases the state.
-                    self._steering_begin(request.session_id, turn_id)
-                    state.active = active
+                    state.starting = admission
 
                 try:
-                    await self._append_start_events(
-                        start,
-                        resumed_from_turn_id=resumed_from,
-                        resume_warnings=resume_warnings,
+                    resumed_from: str | None = None
+                    resume_warnings: tuple[str, ...] = ()
+                    if resume:
+                        await self._startup(
+                            request.session_id, with_conversation=False
+                        )
+                        history, resumed_from, resume_warnings = (
+                            await self._read_resume_history(
+                                request.session_id, source_turn_id
+                            )
+                        )
+                    else:
+                        history = await self._startup(request.session_id)
+                    if self._stopped:
+                        raise RuntimeError("agent runtime is stopped")
+
+                    budget = Budget(
+                        max_steps=self._max_steps,
+                        deadline=(
+                            None
+                            if self._deadline_seconds is None
+                            else time.monotonic() + self._deadline_seconds
+                        ),
                     )
-                    result, event_type, payload = await self._execute(start)
-                    # Corrections can arrive while the final answer streams.
-                    # There is no next safe step to consume them, so close the
-                    # queue before the terminal payload is fixed and record
-                    # them as unapplied. A concurrent steer then sees no open
-                    # turn instead of silently queueing into a closed one.
                     async with self._registry_lock:
-                        unapplied = self._steering_take_unapplied(
-                            request.session_id, turn_id
+                        if self._stopped:
+                            raise RuntimeError("agent runtime is stopped")
+                        start = TurnStart(
+                            request=request,
+                            turn_id=turn_id,
+                            cancellation=token,
+                            budget=budget,
+                            history=history,
                         )
-                    if unapplied:
-                        payload["unapplied_corrections"] = list(unapplied)
-                    active.status = result.status
-                    await self._append_terminal(start, event_type, payload)
-                    if unapplied:
-                        self._unapplied_corrections[(request.session_id, turn_id)] = (
-                            unapplied
-                        )
-                    return result
-                finally:
+                        active = _ActiveTurn(turn_id=turn_id, start=start)
+                        # Open steering before publishing the active turn. A
+                        # closed or broken control then raises with no active
+                        # turn to leak, no start event written, and no terminal
+                        # event invented; the outer finally still releases the
+                        # state.
+                        self._steering_begin(request.session_id, turn_id)
+                        state.active = active
+                        state.starting = None
+
                     try:
+                        await self._append_start_events(
+                            start,
+                            resumed_from_turn_id=resumed_from,
+                            resume_warnings=resume_warnings,
+                        )
+                        result, event_type, payload = await self._execute(start)
+                        # Corrections can arrive while the final answer streams.
+                        # There is no next safe step to consume them, so close
+                        # the queue before the terminal payload is fixed and
+                        # record them as unapplied. A concurrent steer then sees
+                        # no open turn instead of silently queueing into a
+                        # closed one.
                         async with self._registry_lock:
-                            if state.active is active:
-                                state.active = None
-                            self._steering_end(request.session_id, turn_id)
+                            unapplied = self._steering_take_unapplied(
+                                request.session_id, turn_id
+                            )
+                        if unapplied:
+                            payload["unapplied_corrections"] = list(unapplied)
+                        active.status = result.status
+                        await self._append_terminal(start, event_type, payload)
+                        if unapplied:
+                            self._unapplied_corrections[(request.session_id, turn_id)] = (
+                                unapplied
+                            )
+                        return result
                     finally:
-                        active.done.set()
+                        try:
+                            async with self._registry_lock:
+                                if state.active is active:
+                                    state.active = None
+                                self._steering_end(request.session_id, turn_id)
+                        finally:
+                            active.done.set()
+                finally:
+                    async with self._registry_lock:
+                        if state.starting is admission:
+                            state.starting = None
         finally:
             await self._release_state(state, submit=True)
 
@@ -419,12 +443,13 @@ class AgentRuntime:
         ``capability.cancel``. It returns ``None`` when no turn was active or
         when the turn ended without local cancellation.
 
-        If the session is registered but its accepted ``submit`` has not
-        published a turn yet (it is still recovering or reading history),
-        ``cancel`` records ``cancel_pending`` instead of dropping the request.
-        That submit consumes the flag once, before publishing its turn, so the
-        turn is recorded as interrupted without calling the driver. The flag
-        never survives into a later, unrelated submit.
+        The target is fixed at call time. If a submit already owns the session
+        lock and is recovering or reading history, its token is requested and
+        this call returns ``None``; that submit records the interruption when
+        it publishes its turn. A submit that is merely queued behind another
+        turn is not a target, and a cancel with neither an active nor a
+        starting turn returns ``None`` without recording anything for a future
+        submit.
 
         The returned context uses :data:`CANCEL_STEP_ID` as ``step_id``; it is
         not a model step and must not be recorded as one. This method never
@@ -439,7 +464,13 @@ class AgentRuntime:
             async with self._registry_lock:
                 active = state.active
                 if active is None:
-                    state.cancel_pending = True
+                    starting = state.starting
+                    if starting is None:
+                        return None
+                    # It has not published a turn yet, so there is no
+                    # ExecutionContext to return. The token stays bound to
+                    # this admission; a later submit cannot inherit it.
+                    starting.token.request("cancellation requested by runtime")
                     return None
             active.cancellation.request("cancellation requested by runtime")
             await active.done.wait()

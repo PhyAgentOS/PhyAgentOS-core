@@ -310,6 +310,9 @@ async def test_interactive_undo_refills_the_prompt_and_the_next_read_uses_it(
                 pipe.send_text("\r")
                 await _until(lambda: host.requests)
                 assert host.requests[0].text == _REQUEST_TEXT
+                # Busy input is deliberately blocked. Wait until the turn
+                # closed its block before typing the exit command.
+                await _until(lambda: "End Turn" in log.getvalue())
                 pipe.send_text("exit\r")
                 await asyncio.wait_for(run, 3)
             finally:

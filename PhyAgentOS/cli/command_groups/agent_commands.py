@@ -19,8 +19,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import typer
@@ -305,24 +307,74 @@ class _AssemblyState:
 
 
 @dataclass(slots=True)
-class _SessionSlot:
-    """Same-session ordering plus the assembly registered for its last turn.
+class _TurnJob:
+    """One submitted turn waiting for its place in the session queue."""
 
-    ``tail`` is the completion marker of the submit that entered registration
-    last. A submit waits for it before it may build and run its own turn, so
-    same-session turns run in the order they entered registration. ``abort`` is
-    set once by :meth:`CoreAgentSession.aclose`: a submit still waiting for its
-    turn then leaves the queue instead of starting a turn during shutdown.
-    ``current`` is the assembly registered for the session's running (or most
-    recent) turn; it is the only target of :meth:`CoreAgentSession.cancel`.
+    request: TurnRequest
+    future: asyncio.Future
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    resume: bool = False
+    source_turn_id: str | None = None
+    cancelled: bool = False
+    started: bool = False
+    # True when the turn body itself raised CancelledError. The waiting submit
+    # must not mistake that for its own cancellation and cancel the runtime stop
+    # that is already settling the turn.
+    execution_cancelled: bool = False
+    # Set once the one-assembly cleanup has begun; a late cancellation must not
+    # interrupt it after the worker has committed to finishing the turn.
+    cleanup_started: bool = False
+    state: _AssemblyState | None = None
+    run_task: asyncio.Task | None = None
+
+
+@dataclass(slots=True)
+class _CompactJob:
+    """One manual compaction queued at a session turn boundary."""
+
+    session_id: str
+    future: asyncio.Future
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task | None = None
+    cancelled: bool = False
+    started: bool = False
+
+
+@dataclass(slots=True)
+class _CancelJob:
+    """One cleanup step placed between a cancelled turn and its successors."""
+
+    state: _AssemblyState
+    future: asyncio.Future
+
+
+@dataclass(slots=True)
+class _SessionSlot:
+    """One FIFO lane and its single worker.
+
+    The worker takes one item at a time, so a running turn must settle before
+    anything behind it starts. Cancelling a queued turn only marks that item;
+    it never resolves the dependency of the item behind it. A shutdown abort
+    fails every queued turn before it builds an assembly.
+
+    ``current`` is the assembly of the running or most recently finished turn.
+    ``active`` is the one turn job the worker is executing now. ``compact`` is
+    the summary task a cancel may stop while no model turn is running.
     """
 
-    tail: "asyncio.Future[None] | None" = None
+    queue: deque[object] = field(default_factory=deque)
+    worker: asyncio.Task | None = None
     abort: asyncio.Event = field(default_factory=asyncio.Event)
+    cleanup_done: asyncio.Event = field(default_factory=asyncio.Event)
+    cleanup_tasks: set[asyncio.Task] = field(default_factory=set)
     current: _AssemblyState | None = None
-    # The summary task registered for a manual compaction. It is the only
-    # target of ``cancel``/``aclose`` while no model turn is running.
-    compact: "asyncio.Task | None" = None
+    active: _TurnJob | None = None
+    compact: asyncio.Task | None = None
+    compact_job: _CompactJob | None = None
+
+    def __post_init__(self) -> None:
+        self.cleanup_done.set()
 
 
 class CoreAgentSession:
@@ -338,21 +390,22 @@ class CoreAgentSession:
     turn-scoped activations, and building a turn reuses those shared owners
     instead of creating a second Forge or Skill capability.
 
-    Same-session submits are serialized by registration order: a submit that
-    enters while another turn is running waits for that turn to settle and only
-    then builds and submits its own turn. Sessions are independent, so turns of
-    different sessions still run concurrently.
+    Same-session submits are serialized by one FIFO worker: a submit that enters
+    while another turn is running waits for that turn to settle and only then
+    builds and submits its own turn. Cancelling a queued submit removes that
+    item only; it does not shorten the running turn or let the next item start.
+    Sessions are independent, so turns of different sessions still run
+    concurrently.
 
-    ``cancel`` never takes the ordering gate. It reads the assembly registered
-    for the session under a short lock and asks that assembly's host to cancel,
-    so it waits for that turn's local settlement (bounded by the token
-    cancelling the model call) and never for a queued submit or for the next
-    turn. Only the running turn is affected: the queued submit starts a fresh
-    runtime that never saw this cancel, so a cancellation can never be
-    inherited by the next turn. When the cancel arrives between turns there is
-    no running turn to interrupt; the request goes to the last registered
-    assembly (or the seed before the first turn) so capabilities still receive
-    it.
+    ``cancel`` targets the turn current when it is called, including a turn
+    selected by the worker whose assembly is still being registered. A
+    session-owned task cancels that turn and the worker waits for capability
+    cleanup before taking any later item. Cancelling the caller's wait does
+    not cancel this cleanup. If no turn is running, cleanup is queued before
+    every waiting turn. A queued submit is never a
+    cancel target; it starts only after the cleanup that belongs to the current
+    turn has finished. This keeps a capability cancel from reaching a successor
+    and prevents a cancel from being inherited by the next turn.
 
     Shutdown rejects new submits, tells every queued submit to leave before it
     starts a turn, stops the runtimes that may still own a turn, waits for the
@@ -416,7 +469,12 @@ class CoreAgentSession:
             if self._closed:
                 raise RuntimeError("agent session is closed")
             slot = self._slots.get(session_id)
-            if slot is None or slot.tail is None or slot.tail.done() or slot.current is None:
+            if (
+                slot is None
+                or slot.active is None
+                or slot.active.state is None
+                or slot.current is None
+            ):
                 raise RuntimeError("No active turn to correct in this session.")
             runtime = slot.current.assembly.runtime
             steer = getattr(runtime, "steer", None)
@@ -436,103 +494,395 @@ class CoreAgentSession:
             if self._closed:
                 raise RuntimeError("agent session is closed")
             slot = self._slots.setdefault(session_id, _SessionSlot())
-            previous = slot.tail
-            marker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-            slot.tail = marker
+            job = _TurnJob(
+                request=request,
+                future=asyncio.get_running_loop().create_future(),
+                resume=resume,
+                source_turn_id=source_turn_id,
+            )
+            slot.queue.append(job)
             self._pending += 1
             self._idle.clear()
+            self._ensure_worker_locked(session_id, slot)
         try:
-            # Registration order is execution order: a submit only starts after
-            # every submit that entered before it finished its whole turn.
-            await self._wait_turn(slot, previous)
-            if self._closed:
-                raise RuntimeError("agent session is closed")
-            # Read the selection when the turn really starts. A model or effort
-            # change made while this submit was queued therefore applies to it.
-            selection = self.sessions.get(session_id)
-            assembly = self._build(selection)
-            try:
-                state = _AssemblyState(selection, assembly)
-                async with self._registry_lock:
-                    if self._closed:
-                        raise RuntimeError("agent session is closed")
-                    # Register as current before ``host.submit`` can suspend, so
-                    # a concurrent cancel targets this turn and never the seed
-                    # or a retired assembly.
-                    slot.current = state
-                    self._accepted_sessions.setdefault(session_id, None)
-                if resume:
-                    reader = getattr(assembly.runtime, "resume", None)
-                    if not callable(reader):
-                        raise RuntimeError("This runtime does not support resuming progress.")
-                    result = await reader(request, source_turn_id=source_turn_id)
-                else:
-                    result = await assembly.host.submit(request)
-                unapplied_reader = getattr(assembly.runtime, "unapplied_corrections", None)
-                if callable(unapplied_reader) and unapplied_reader(session_id, result.turn_id):
-                    try:
-                        self.output.error(
-                            "Correction was not applied: the turn ended before another safe "
-                            "step boundary. It was not replayed; submit it as a new request."
-                        )
-                    except Exception:
-                        pass
-                return result
-            finally:
-                # One assembly serves exactly one turn. Retiring its runtime
-                # keeps the next turn independent and leaves the shared store
-                # and capabilities open.
-                with suppress(Exception):
-                    await assembly.runtime.stop()
+            return await job.future
+        except asyncio.CancelledError:
+            # A cancelled submit owns only its own job. An execution-side
+            # CancelledError also cancels ``job.future``, but that turn is
+            # already settling its runtime: cancelling it again here would
+            # abort the runtime stop and let the worker take the next item
+            # early. Only a caller cancellation stops the job.
+            if not job.execution_cancelled:
+                await self._stop_turn_job(job)
+            raise
         finally:
-            # Leaving the queue must not itself need an await: a cancelled
-            # submit still has to free its slot and wake a waiting shutdown.
-            if not marker.done():
-                marker.set_result(None)
-            self._pending -= 1
-            if self._pending == 0:
-                self._idle.set()
+            # A caller may touch session state (for example /undo) as soon as
+            # submit returns. Let the worker clear the active slot first.
+            await job.done.wait()
+
+    async def _stop_turn_job(self, job: _TurnJob) -> None:
+        async with self._registry_lock:
+            job.cancelled = True
+            run_task = job.run_task
+            started = job.started
+            cleanup_started = job.cleanup_started
+        if not started:
+            # A queued job has no runtime and no side effect to settle. The
+            # worker still keeps its place in line; this caller can return.
+            job.done.set()
+            return
+        if run_task is not None and not run_task.done():
+            if not cleanup_started:
+                run_task.cancel()
+            # A cleanup that already began finishes on its own; cancelling it
+            # again would leave the runtime half-stopped and free the queue.
+            #
+            # The wait is shielded: a second cancellation of this caller stops
+            # only this caller from waiting, never the execution task that is
+            # settling the turn. The worker awaits the same task, so the next
+            # item still cannot start before the runtime stop really finishes.
+            try:
+                await asyncio.shield(run_task)
+            except asyncio.CancelledError:
+                if not run_task.done():
+                    raise
+            except Exception:  # noqa: BLE001 - the worker owns delivery
+                pass
+
+    def _ensure_worker_locked(self, session_id: str, slot: _SessionSlot) -> None:
+        """Start the one worker for this session while the registry is locked."""
+        if slot.worker is None or slot.worker.done():
+            slot.worker = asyncio.create_task(self._run_slot(session_id, slot))
+
+    async def _run_slot(self, session_id: str, slot: _SessionSlot) -> None:
+        """Execute one queued item at a time for this session.
+
+        A cancelled queued turn is skipped, but skipping it does not shorten
+        the running turn. The next item is only taken after the current one
+        has fully settled, including the turn's runtime stop or a cancel
+        job's capability cleanup.
+        """
+        try:
+            while True:
+                cleanup = None
+                jobs = None
+                job = None
+                async with self._registry_lock:
+                    if not slot.cleanup_done.is_set():
+                        # A cancel already cancelled the running turn and is
+                        # still cleaning up capabilities. No successor may
+                        # start before that cleanup completes.
+                        cleanup = slot.cleanup_done
+                    elif self._closed or slot.abort.is_set():
+                        jobs = list(slot.queue)
+                        slot.queue.clear()
+                        slot.worker = None
+                    elif not slot.queue:
+                        slot.worker = None
+                        return
+                    else:
+                        job = slot.queue.popleft()
+                        if isinstance(job, _TurnJob) and not (
+                            job.cancelled or job.future.cancelled()
+                        ):
+                            job.started = True
+                            slot.active = job
+                        elif isinstance(job, _CompactJob) and not (
+                            job.cancelled or job.future.cancelled()
+                        ):
+                            job.started = True
+                if cleanup is not None:
+                    await cleanup.wait()
+                    continue
+                if jobs is not None:
+                    error = RuntimeError("agent session is closed")
+                    for queued in jobs:
+                        self._reject_job(queued, error)
+                        self._finish_job()
+                        self._mark_done(queued)
+                    return
+                assert job is not None
+                try:
+                    if isinstance(job, _TurnJob):
+                        job.run_task = asyncio.create_task(
+                            self._run_turn_job(session_id, slot, job)
+                        )
+                        if job.cancelled or job.future.cancelled():
+                            job.run_task.cancel()
+                        await job.run_task
+                    elif isinstance(job, _CompactJob):
+                        await self._run_compact_job(job)
+                    elif isinstance(job, _CancelJob):
+                        await self._run_cancel_job(session_id, job)
+                except asyncio.CancelledError:
+                    self._reject_job(job, asyncio.CancelledError())
+                except Exception as exc:  # noqa: BLE001 - delivered to the caller
+                    self._reject_job(job, exc)
+                finally:
+                    if isinstance(job, _TurnJob):
+                        async with self._registry_lock:
+                            if slot.active is job:
+                                slot.active = None
+                    self._finish_job()
+                    self._mark_done(job)
+        finally:
+            async with self._registry_lock:
+                if slot.worker is asyncio.current_task():
+                    slot.worker = None
+
+    def _finish_job(self) -> None:
+        self._pending -= 1
+        if self._pending == 0:
+            self._idle.set()
 
     @staticmethod
-    async def _wait_turn(slot: _SessionSlot, previous) -> None:
-        """Wait for the previous same-session submit, or for shutdown to begin."""
-        if previous is None or previous.done():
+    def _mark_done(job: object) -> None:
+        if isinstance(job, _TurnJob):
+            # A build failure or a cancelled execution task may never publish
+            # an assembly. Wake cleanup waiting on this job without falling
+            # back to the previous turn's assembly.
+            job.ready.set()
+        done = getattr(job, "done", None)
+        if done is not None:
+            done.set()
+
+    @staticmethod
+    def _reject_job(job: object, error: BaseException) -> None:
+        future = getattr(job, "future", None)
+        if future is None or future.done():
             return
-        aborted = asyncio.ensure_future(slot.abort.wait())
+        if isinstance(error, asyncio.CancelledError):
+            future.cancel()
+        else:
+            future.set_exception(error)
+
+    async def _run_turn_job(
+        self, session_id: str, slot: _SessionSlot, job: _TurnJob
+    ) -> None:
+        """Run one turn, then retire its runtime before the worker moves on."""
+        if job.cancelled or job.future.cancelled():
+            if not job.future.done():
+                job.future.cancel()
+            return
+        selection = self.sessions.get(session_id)
+        assembly = self._build(selection)
         try:
-            await asyncio.wait({previous, aborted}, return_when=asyncio.FIRST_COMPLETED)
+            state = _AssemblyState(selection, assembly)
+            async with self._registry_lock:
+                if self._closed:
+                    raise RuntimeError("agent session is closed")
+                slot.current = state
+                job.state = state
+                self._accepted_sessions.setdefault(session_id, None)
+                job.ready.set()
+            if job.cancelled:
+                if not job.future.done():
+                    job.future.cancel()
+                return
+            if job.resume:
+                reader = getattr(assembly.runtime, "resume", None)
+                if not callable(reader):
+                    raise RuntimeError(
+                        "This runtime does not support resuming progress."
+                    )
+                result = await reader(
+                    job.request, source_turn_id=job.source_turn_id
+                )
+            else:
+                result = await assembly.host.submit(job.request)
+            unapplied_reader = getattr(
+                assembly.runtime, "unapplied_corrections", None
+            )
+            if callable(unapplied_reader) and unapplied_reader(
+                session_id, result.turn_id
+            ):
+                try:
+                    self.output.error(
+                        "Correction was not applied: the turn ended before another "
+                        "safe step boundary. It was not replayed; submit it as a "
+                        "new request."
+                    )
+                except Exception:
+                    pass
+            if not job.future.done():
+                job.future.set_result(result)
+        except asyncio.CancelledError:
+            if not job.cancelled and not job.future.cancelled():
+                # The turn body raised this on its own; a caller cancellation
+                # marks the job or its future before cancelling this task.
+                job.execution_cancelled = True
+            if not job.future.done():
+                job.future.cancel()
+        except Exception as exc:  # noqa: BLE001 - delivered to the caller
+            self._reject_job(job, exc)
         finally:
-            aborted.cancel()
-            await asyncio.gather(aborted, return_exceptions=True)
+            # One assembly serves exactly one turn. Retiring its runtime keeps
+            # the next turn independent and leaves the shared store and
+            # capabilities open. Mark the start before the first await so a
+            # late cancel cannot mistake this settling phase for the turn body.
+            job.cleanup_started = True
+            with suppress(Exception):
+                await assembly.runtime.stop()
+
+    async def _run_compact_job(self, job: _CompactJob) -> None:
+        if job.cancelled or job.future.cancelled():
+            if not job.future.done():
+                job.future.cancel()
+            return
+        selection = self.sessions.get(job.session_id)
+        task = asyncio.create_task(self._run_compact(job.session_id, selection))
+        job.task = task
+        async with self._registry_lock:
+            if self._closed or job.cancelled or job.future.cancelled():
+                task.cancel()
+            else:
+                job_slot = self._slots.get(job.session_id)
+                if job_slot is not None:
+                    job_slot.compact = task
+                    job_slot.compact_job = job
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            if not job.future.done():
+                job.future.cancel()
+        except Exception as exc:  # noqa: BLE001 - delivered to the caller
+            self._reject_job(job, exc)
+        else:
+            if not job.future.done():
+                job.future.set_result(result)
+        finally:
+            async with self._registry_lock:
+                job_slot = self._slots.get(job.session_id)
+                if job_slot is not None:
+                    if job_slot.compact is task:
+                        job_slot.compact = None
+                    if job_slot.compact_job is job:
+                        job_slot.compact_job = None
+
+    async def _run_cancel_job(
+        self, session_id: str, job: _CancelJob
+    ) -> None:
+        try:
+            await job.state.assembly.host.cancel(session_id)
+        except Exception as exc:  # noqa: BLE001 - delivered to the caller
+            self._reject_job(job, exc)
+        else:
+            if not job.future.done():
+                job.future.set_result(None)
+
+    def _observe_cleanup_result(
+        self, session_id: str, future: asyncio.Future
+    ) -> None:
+        # The caller may have stopped waiting, but cleanup still belongs to the
+        # session. Retrieve the failure so it leaves no unobserved exception,
+        # then report it. The exception stays on the future, so a caller that
+        # is still waiting receives the original one. Only the type and session
+        # are reported; the message may carry credentials.
+        if future.cancelled():
+            return
+        try:
+            error = future.exception()
+        except Exception:  # pragma: no cover - done callbacks see done futures
+            return
+        if error is None:
+            return
+        try:
+            self.output.error(
+                f"Capability cleanup for session {session_id} failed "
+                f"({type(error).__name__}). The local cancellation result is "
+                "unchanged."
+            )
+        except Exception:
+            # A reporting failure must not escape a done callback or damage
+            # the worker's bookkeeping.
+            pass
+
+    async def _cancel_active_turn(
+        self, session_id: str, slot: _SessionSlot, active: _TurnJob
+    ) -> None:
+        try:
+            await active.ready.wait()
+            if active.state is not None:
+                await active.state.assembly.host.cancel(session_id)
+        finally:
+            async with self._registry_lock:
+                slot.cleanup_tasks.discard(asyncio.current_task())
+                if not slot.cleanup_tasks:
+                    slot.cleanup_done.set()
+                self._finish_job()
 
     async def cancel(self, session_id: str) -> None:
-        """Cancel the assembly currently registered for this session.
+        """Cancel the turn that is current when this call is made.
 
-        The registry lock is held only while reading the target, and the
-        ordering gate is never taken, so the cancel neither waits for a queued
-        submit nor for the turn to produce an answer. Registration cannot
-        change between that read and ``host.cancel`` without a new turn
-        starting, and a new turn always builds a new runtime, so this call can
-        only interrupt the turn that was registered when it was made.
+        If a turn is running or being registered, a session-owned task cancels
+        that exact job and the worker waits on ``cleanup_done`` before taking
+        any later item. The caller only waits for cleanup; cancelling that
+        wait cannot stop cleanup or open the gate early. If no turn is
+        running, cleanup is queued before every waiting turn. Either
+        way a capability cancellation issued for this turn cannot hit a
+        successor that started during the cleanup. A queued submit that has
+        not started is not a cancel target; it starts only after cleanup.
         """
+        cleanup_task: asyncio.Task | None = None
+        job: _CancelJob | None = None
         async with self._registry_lock:
             if self._closed:
                 return
             slot = self._slots.get(session_id)
             summary = None if slot is None else slot.compact
-            state = None if slot is None else slot.current
-            if state is None:
-                # No turn has run yet: ask the seed host so capability
-                # cancellation still receives the request.
-                state = _AssemblyState(self._seed_selection, self._seed)
+            compact_job = None if slot is None else slot.compact_job
+            active = None if slot is None else slot.active
+            if summary is None or summary.done():
+                if active is not None:
+                    # Capture the selected job even before its assembly exists.
+                    # This task remains owned by the session if the caller
+                    # times out or stops waiting for the cancellation.
+                    slot.cleanup_done.clear()
+                    cleanup_task = asyncio.create_task(
+                        self._cancel_active_turn(session_id, slot, active)
+                    )
+                    slot.cleanup_tasks.add(cleanup_task)
+                    cleanup_task.add_done_callback(
+                        partial(self._observe_cleanup_result, session_id)
+                    )
+                else:
+                    state = None if slot is None else slot.current
+                    if state is None:
+                        # Before the first turn, the seed host still owns
+                        # capability cancellation for this session.
+                        state = _AssemblyState(self._seed_selection, self._seed)
+                    job = _CancelJob(
+                        state=state,
+                        future=asyncio.get_running_loop().create_future(),
+                    )
+                    job.future.add_done_callback(
+                        partial(self._observe_cleanup_result, session_id)
+                    )
+                    slot = self._slots.setdefault(session_id, _SessionSlot())
+                    # Place cleanup after the running turn and before every
+                    # queued turn. The worker cannot reach a successor before
+                    # this barrier has finished.
+                    slot.queue.appendleft(job)
+                self._pending += 1
+                self._idle.clear()
+                self._ensure_worker_locked(session_id, slot)
         if summary is not None and not summary.done():
             # Cancelling the summary task makes the compaction service record
             # an interrupted attempt and re-raise; no other session or queued
             # turn is touched.
             summary.cancel()
-            await asyncio.gather(summary, return_exceptions=True)
+            if compact_job is not None:
+                with suppress(asyncio.CancelledError):
+                    await compact_job.future
+                await compact_job.done.wait()
+            else:
+                await asyncio.gather(summary, return_exceptions=True)
             return
-        await state.assembly.host.cancel(session_id)
+        if cleanup_task is not None:
+            await asyncio.shield(cleanup_task)
+            return
+        assert job is not None
+        await asyncio.shield(job.future)
 
     async def undo(self, session_id: str):
         """Revert this session's last turn at a turn boundary.
@@ -548,15 +898,20 @@ class CoreAgentSession:
                 raise RuntimeError("agent session is closed")
             slot = self._slots.get(session_id)
             compacting = None if slot is None else slot.compact
-            tail = None if slot is None else slot.tail
+            busy = bool(
+                slot is not None
+                and (
+                    slot.active is not None
+                    or slot.queue
+                    or not slot.cleanup_done.is_set()
+                )
+            )
         if compacting is not None and not compacting.done():
             raise RuntimeError(
                 "context compaction is running for this session; wait for it to "
                 "finish before /undo"
             )
-        if tail is not None and not tail.done():
-            # ``tail`` is done only once that submit settled, so this also
-            # covers a queued turn that has not started yet.
+        if busy:
             raise RuntimeError(
                 "a turn is running or queued for this session; wait for it to "
                 "settle before /undo"
@@ -582,8 +937,8 @@ class CoreAgentSession:
     async def compact(self, session_id: str):
         """Manually compact one session at a turn boundary.
 
-        The same ordering gate as ``submit`` is used, so no turn is active and
-        no queued turn can start while the summary runs. This never schedules
+        The same FIFO lane as ``submit`` is used, so no turn is active and no
+        queued turn can start while the summary runs. This never schedules
         itself and never executes a user task. A failure leaves the original
         event log and projection unchanged; only a success writes a checkpoint.
         """
@@ -591,36 +946,31 @@ class CoreAgentSession:
             if self._closed:
                 raise RuntimeError("agent session is closed")
             slot = self._slots.setdefault(session_id, _SessionSlot())
-            previous = slot.tail
-            marker: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-            slot.tail = marker
+            job = _CompactJob(
+                session_id=session_id,
+                future=asyncio.get_running_loop().create_future(),
+            )
+            slot.queue.append(job)
             self._pending += 1
             self._idle.clear()
-        task: asyncio.Task | None = None
+            self._ensure_worker_locked(session_id, slot)
         try:
-            await self._wait_turn(slot, previous)
-            if self._closed:
-                raise RuntimeError("agent session is closed")
-            selection = self.sessions.get(session_id)
-            # Register the summary as the session's current local work before
-            # it can run. It is cancellable by ``cancel(session_id)`` and by
-            # ``aclose`` without touching another session or a queued turn.
+            return await job.future
+        except asyncio.CancelledError:
             async with self._registry_lock:
-                if self._closed:
-                    raise RuntimeError("agent session is closed")
-                task = asyncio.create_task(self._run_compact(session_id, selection))
-                slot.compact = task
-            try:
-                return await task
-            finally:
-                if slot.compact is task:
-                    slot.compact = None
+                job.cancelled = True
+                task = job.task
+                if not job.started:
+                    # Nothing has started and there is no summary to settle.
+                    # Keep the cancelled item in order for the worker to skip,
+                    # but do not make its caller wait for the running turn.
+                    job.done.set()
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
         finally:
-            if not marker.done():
-                marker.set_result(None)
-            self._pending -= 1
-            if self._pending == 0:
-                self._idle.set()
+            await job.done.wait()
 
     async def _run_compact(self, session_id: str, selection):
         if self._compact is not None:
@@ -687,11 +1037,19 @@ class CoreAgentSession:
                 return
             async with self._registry_lock:
                 self._closed = True
-                # Queued submits leave the ordering gate here, before they
-                # build an assembly or open a turn, so no turn starts after
-                # shutdown began.
+                # Queued submits leave here, before they build an assembly or
+                # open a turn, so no turn starts after shutdown began. Failing
+                # them now also means a blocked provider holding the running
+                # turn does not delay their callers.
+                error = RuntimeError("agent session is closed")
                 for slot in self._slots.values():
                     slot.abort.set()
+                    queued = list(slot.queue)
+                    slot.queue.clear()
+                    for job in queued:
+                        self._reject_job(job, error)
+                        self._finish_job()
+                        self._mark_done(job)
                 summaries = [
                     slot.compact
                     for slot in self._slots.values()

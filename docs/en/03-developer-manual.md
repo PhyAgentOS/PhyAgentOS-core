@@ -347,9 +347,16 @@ makes no promise that such text will run.
    `SKILLS.md`) are read at that same turn start and frozen for the turn, so an edit applies from
    the next turn, including a queued turn or a new session; manual compaction reads the current
    files. The store, Forge coordinator/client, and activation manager stay shared. Submits in
-   the same session run serially in registration order; different sessions still run
-   concurrently. `cancel` targets only the current assembly, so a queued turn never inherits an
-   earlier cancellation.
+   the same session run through one FIFO worker in registration order; different sessions still
+   run concurrently. Cancelling a queued submit removes only that item, so the next item cannot
+   overtake the running turn. `cancel` targets the turn current at call time, including the
+   handoff before its assembly is registered. Capability cleanup belongs to the session;
+   stopping the caller's wait does not interrupt cleanup or let a successor start early.
+   A cleanup failure is reported once with its exception type and session id; it does not
+   change the turn's local cancellation result or remote unknown/success semantics, and a
+   caller that is still waiting also receives the original exception.
+   Cancelling a compaction that is still queued returns without waiting for the running turn.
+   A cancel with no active or starting turn does not carry into a later submit.
 9. Shut down once: reject new submits and let queued submits leave before they start a turn,
    stop the runtimes that may still own a turn, wait for submits already inside the session,
    notify each accepted session's capabilities, close the canonical capabilities once, then

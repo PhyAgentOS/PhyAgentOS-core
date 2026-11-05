@@ -494,14 +494,18 @@ class AgentRuntime(Protocol):
     stays open so capabilities can still cancel and report, and callers can
     audit events. It is idempotent; ``aclose`` closes the store afterwards.
 
-    ``cancel`` requests local cancellation, lets calls already dispatched
-    settle as ``cancelled`` or ``unknown``, and returns the last
-    :class:`ExecutionContext` of the interrupted turn. It returns ``None``
-    when no turn was active or the turn did not end as interrupted. When it
-    returns, the turn has reached a terminal state and its terminal event has
-    been persisted, so callers may safely shut down next. It does not assert
-    that remote work stopped; the host notifies capabilities regardless of
-    whether a context was returned.
+    ``cancel`` targets the one turn that is active or already owns the session
+    lock and is preparing to start when the call is made. It lets dispatched
+    calls settle as ``cancelled`` or ``unknown`` and returns the last
+    :class:`ExecutionContext` of the interrupted turn. A submit that is still
+    queued behind that turn is not a target, and a cancel with no active or
+    starting turn returns ``None`` without recording anything for a later
+    submit. When cancel returns a context, that turn's terminal event has been
+    persisted and callers may safely shut down next. A submit cancelled during
+    startup receives the token before publishing; its call returns ``None``
+    because no context exists yet. Cancellation does not assert that remote
+    work stopped; the host notifies capabilities regardless of whether a
+    context was returned.
     """
 
     async def submit(self, request: TurnRequest) -> TurnResult: ...

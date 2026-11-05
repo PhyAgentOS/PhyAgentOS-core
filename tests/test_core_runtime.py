@@ -595,6 +595,27 @@ async def test_cancel_returns_none_without_an_active_turn() -> None:
     assert len(driver.turns) == 2
 
 
+async def test_cancel_with_an_idle_registered_session_does_not_leak_forward() -> None:
+    store = FakeStore()
+    driver = StaticDriver()
+    runtime = _runtime(driver, store)
+
+    # Keep the state registered without an active or starting turn. A cancel
+    # must not leave a flag that the next submit consumes.
+    state = await runtime._acquire_state(
+        "session-1", create=True, submit=False
+    )
+    try:
+        assert state is not None
+        assert await runtime.cancel("session-1") is None
+        result = await runtime.submit(_request(text="next"))
+    finally:
+        await runtime._release_state(state, submit=False)
+
+    assert result.status is TurnStatus.COMPLETED
+    assert [turn.request.text for turn in driver.turns] == ["next"]
+
+
 @pytest.mark.parametrize("stage", ["recover", "read_conversation"])
 async def test_cancel_during_startup_is_recorded_and_skips_driver(
     stage: str,

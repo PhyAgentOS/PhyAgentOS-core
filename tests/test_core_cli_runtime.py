@@ -699,7 +699,9 @@ class _GatedProvider:
         return LLMResponse(content=self.reply, finish_reason="stop")
 
 
-def _open_real_session(tmp_path, selections, *, builds=None):
+def _open_real_session(
+    tmp_path, selections, *, builds=None, additional_capabilities=(), compact=None
+):
     """Build a CoreAgentSession over a real store and per-turn assemblies."""
     store = SQLiteSessionStore(":memory:")
     output = RecordingOutput()
@@ -722,6 +724,7 @@ def _open_real_session(tmp_path, selections, *, builds=None):
             instructions="test",
             skill_capability=skill_capability,
             forge_capability=forge_capability,
+            additional_capabilities=additional_capabilities,
         )
 
     selected = selections.get("cli:test")
@@ -732,6 +735,7 @@ def _open_real_session(tmp_path, selections, *, builds=None):
         store=display,
         sessions=selections,
         output=output,
+        compact=compact,
     )
     return store, output, session, manager
 
@@ -834,6 +838,572 @@ async def test_cancel_of_the_running_turn_leaves_the_queued_turn_alone(tmp_path)
         assert not store._closed
     finally:
         await session.aclose()
+
+
+async def test_cancelling_a_queued_submit_does_not_skip_the_running_turn():
+    """B leaving the queue must not let C overtake the still-running A."""
+
+    class RecordingHost:
+        def __init__(self) -> None:
+            self.submitted = asyncio.Event()
+            self.calls = 0
+            self.cancel_calls = 0
+
+        async def submit(self, request):
+            self.calls += 1
+            self.submitted.set()
+            return TurnResult(
+                request.session_id, "turn-recorded", TurnStatus.COMPLETED, reply="ok"
+            )
+
+        async def cancel(self, session_id: str) -> None:
+            self.cancel_calls += 1
+
+    capability = _FakeCapability()
+    store = _FakeStore()
+    seed_runtime, seed_host = _FakeRuntime("seed"), _DoneHost()
+    seed = _fake_assembly(seed_host, seed_runtime, capability)
+    first_runtime, first_host = _FakeRuntime("first"), _GateHost()
+    second_host = RecordingHost()
+    third_host = RecordingHost()
+
+    class Selections:
+        selection = RuntimeSelection("fake", "first", None, None, object(), 128000)
+
+        def get(self, session_id):
+            return self.selection
+
+    selections = Selections()
+
+    def build(selection):
+        if selection.model == "first":
+            return _fake_assembly(first_host, first_runtime, capability)
+        if selection.model == "second":
+            return _fake_assembly(
+                second_host, _FakeRuntime("second"), capability
+            )
+        return _fake_assembly(third_host, _FakeRuntime("third"), capability)
+
+    session = CoreAgentSession(
+        seed,
+        selections.selection,
+        build=build,
+        store=store,
+        sessions=selections,
+        output=RecordingOutput(),
+    )
+    try:
+        first_task = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "first"))
+        )
+        await asyncio.wait_for(first_host.submitted.wait(), 2)
+
+        selections.selection = RuntimeSelection(
+            "fake", "second", None, None, object(), 128000
+        )
+        second_task = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "second"))
+        )
+        selections.selection = RuntimeSelection(
+            "fake", "third", None, None, object(), 128000
+        )
+        third_task = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "third"))
+        )
+        await asyncio.sleep(0)
+        assert not second_host.submitted.is_set()
+        assert not third_host.submitted.is_set()
+
+        second_task.cancel()
+        await asyncio.gather(second_task, return_exceptions=True)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert second_host.calls == 0
+        assert not third_host.submitted.is_set()
+        assert not first_task.done()
+
+        first_host.cancelled.set()
+        one = await asyncio.wait_for(first_task, 2)
+        three = await asyncio.wait_for(third_task, 2)
+
+        assert one.status is TurnStatus.INTERRUPTED
+        assert three.status is TurnStatus.COMPLETED
+        assert third_host.submitted.is_set()
+        assert second_host.calls == 0
+    finally:
+        await session.aclose()
+
+
+async def test_completed_turn_cleanup_blocks_the_next_turn():
+    """A cancel issued for the finished turn must finish before B can start."""
+
+    class BlockingCancelHost:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancel_calls = 0
+
+        async def submit(self, request):
+            return TurnResult(
+                request.session_id, "turn-a", TurnStatus.COMPLETED, reply="ok"
+            )
+
+        async def cancel(self, session_id: str) -> None:
+            self.cancel_calls += 1
+            self.started.set()
+            await self.release.wait()
+
+    class RecordingHost:
+        def __init__(self) -> None:
+            self.submitted = asyncio.Event()
+            self.cancel_calls = 0
+
+        async def submit(self, request):
+            self.submitted.set()
+            return TurnResult(
+                request.session_id, "turn-b", TurnStatus.COMPLETED, reply="ok"
+            )
+
+        async def cancel(self, session_id: str) -> None:
+            self.cancel_calls += 1
+
+    capability = _FakeCapability()
+    store = _FakeStore()
+    seed_runtime, seed_host = _FakeRuntime("seed"), _DoneHost()
+    seed = _fake_assembly(seed_host, seed_runtime, capability)
+    first_host = BlockingCancelHost()
+    second_host = RecordingHost()
+
+    class Selections:
+        selection = RuntimeSelection("fake", "first", None, None, object(), 128000)
+
+        def get(self, session_id):
+            return self.selection
+
+    selections = Selections()
+
+    def build(selection):
+        if selection.model == "first":
+            return _fake_assembly(first_host, _FakeRuntime("first"), capability)
+        return _fake_assembly(second_host, _FakeRuntime("second"), capability)
+
+    session = CoreAgentSession(
+        seed,
+        selections.selection,
+        build=build,
+        store=store,
+        sessions=selections,
+        output=RecordingOutput(),
+    )
+    try:
+        first = await asyncio.wait_for(
+            session.submit(TurnRequest("cli:test", "first")), 2
+        )
+        assert first.status is TurnStatus.COMPLETED
+        selections.selection = RuntimeSelection(
+            "fake", "second", None, None, object(), 128000
+        )
+
+        cancel_task = asyncio.create_task(session.cancel("cli:test"))
+        await asyncio.wait_for(first_host.started.wait(), 2)
+        second_task = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "second"))
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not second_host.submitted.is_set()
+
+        first_host.release.set()
+        await asyncio.wait_for(cancel_task, 2)
+        assert (await asyncio.wait_for(second_task, 2)).status is TurnStatus.COMPLETED
+        assert second_host.submitted.is_set()
+        assert second_host.cancel_calls == 0
+    finally:
+        await session.aclose()
+
+
+async def test_running_turn_cleanup_blocks_the_next_turn():
+    """A running turn's capability cleanup still precedes the next turn."""
+
+    class BlockingGateHost(_GateHost):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleanup_started = asyncio.Event()
+            self.cleanup_release = asyncio.Event()
+
+        async def cancel(self, session_id: str) -> None:
+            self.cancel_calls += 1
+            self.cancelled.set()
+            self.cleanup_started.set()
+            await self.cleanup_release.wait()
+
+    class RecordingHost:
+        def __init__(self) -> None:
+            self.submitted = asyncio.Event()
+            self.cancel_calls = 0
+
+        async def submit(self, request):
+            self.submitted.set()
+            return TurnResult(
+                request.session_id, "turn-b", TurnStatus.COMPLETED, reply="ok"
+            )
+
+        async def cancel(self, session_id: str) -> None:
+            self.cancel_calls += 1
+
+    capability = _FakeCapability()
+    store = _FakeStore()
+    seed_runtime, seed_host = _FakeRuntime("seed"), _DoneHost()
+    seed = _fake_assembly(seed_host, seed_runtime, capability)
+    first_host = BlockingGateHost()
+    second_host = RecordingHost()
+
+    class Selections:
+        selection = RuntimeSelection("fake", "first", None, None, object(), 128000)
+
+        def get(self, session_id):
+            return self.selection
+
+    selections = Selections()
+
+    def build(selection):
+        if selection.model == "first":
+            return _fake_assembly(first_host, _FakeRuntime("first"), capability)
+        return _fake_assembly(second_host, _FakeRuntime("second"), capability)
+
+    session = CoreAgentSession(
+        seed,
+        selections.selection,
+        build=build,
+        store=store,
+        sessions=selections,
+        output=RecordingOutput(),
+    )
+    try:
+        first_task = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "first"))
+        )
+        await asyncio.wait_for(first_host.submitted.wait(), 2)
+        selections.selection = RuntimeSelection(
+            "fake", "second", None, None, object(), 128000
+        )
+        second_task = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "second"))
+        )
+
+        cancel_task = asyncio.create_task(session.cancel("cli:test"))
+        await asyncio.wait_for(first_host.cleanup_started.wait(), 2)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not second_host.submitted.is_set()
+
+        one = await asyncio.wait_for(first_task, 2)
+        assert one.status is TurnStatus.INTERRUPTED
+        first_host.cleanup_release.set()
+        await asyncio.wait_for(cancel_task, 2)
+        assert (await asyncio.wait_for(second_task, 2)).status is TurnStatus.COMPLETED
+        assert second_host.submitted.is_set()
+        assert second_host.cancel_calls == 0
+    finally:
+        first_host.cleanup_release.set()
+        await session.aclose()
+
+
+async def test_cancelling_a_running_submit_stops_it_and_releases_the_queue():
+    """Cancelling the caller task stops that turn; the next submit still runs."""
+
+    class RecordingHost:
+        def __init__(self) -> None:
+            self.submitted = asyncio.Event()
+            self.cancel_calls = 0
+
+        async def submit(self, request):
+            self.submitted.set()
+            return TurnResult(
+                request.session_id, "turn-b", TurnStatus.COMPLETED, reply="ok"
+            )
+
+        async def cancel(self, session_id: str) -> None:
+            self.cancel_calls += 1
+
+    capability = _FakeCapability()
+    store = _FakeStore()
+    seed_runtime, seed_host = _FakeRuntime("seed"), _DoneHost()
+    seed = _fake_assembly(seed_host, seed_runtime, capability)
+    first_host = _GateHost()
+    second_host = RecordingHost()
+
+    class Selections:
+        selection = RuntimeSelection("fake", "first", None, None, object(), 128000)
+
+        def get(self, session_id):
+            return self.selection
+
+    selections = Selections()
+
+    def build(selection):
+        if selection.model == "first":
+            return _fake_assembly(first_host, _FakeRuntime("first"), capability)
+        return _fake_assembly(second_host, _FakeRuntime("second"), capability)
+
+    session = CoreAgentSession(
+        seed,
+        selections.selection,
+        build=build,
+        store=store,
+        sessions=selections,
+        output=RecordingOutput(),
+    )
+    try:
+        first_task = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "first"))
+        )
+        await asyncio.wait_for(first_host.submitted.wait(), 2)
+
+        first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
+        assert session._pending == 0
+
+        selections.selection = RuntimeSelection(
+            "fake", "second", None, None, object(), 128000
+        )
+        second = await asyncio.wait_for(
+            session.submit(TurnRequest("cli:test", "second")), 2
+        )
+        assert second.status is TurnStatus.COMPLETED
+        assert second_host.submitted.is_set()
+    finally:
+        first_host.cancelled.set()
+        await session.aclose()
+
+
+@pytest.mark.parametrize("previous_turn", [False, True])
+async def test_cancel_during_worker_handoff_targets_the_starting_turn(
+    tmp_path, previous_turn
+):
+    provider = RecordingProvider()
+    selections = FakeSelections(
+        RuntimeSelection("fake", "model-one", None, None, provider, 128000)
+    )
+    store, _, session, _ = _open_real_session(tmp_path, selections)
+    tasks = []
+    try:
+        if previous_turn:
+            await session.submit(TurnRequest("cli:test", "previous"))
+            provider.calls.clear()
+
+        turn = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "cancel this turn"))
+        )
+        tasks.append(turn)
+        # submit registers the worker; cancel then runs after the worker has
+        # selected this job but before its execution task registers the host.
+        await asyncio.sleep(0)
+        cancel = asyncio.create_task(session.cancel("cli:test"))
+        tasks.append(cancel)
+        result, _ = await asyncio.wait_for(asyncio.gather(turn, cancel), 2)
+
+        assert result.status is TurnStatus.INTERRUPTED
+        assert provider.calls == []
+        events = await store.read_session("cli:test")
+        assert any(
+            event.type is EventType.TURN_INTERRUPTED
+            and event.turn_id == result.turn_id
+            for event in events
+        )
+    finally:
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await session.aclose()
+
+
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("shutdown", [False, True])
+async def test_cancel_waiter_does_not_own_capability_cleanup(
+    tmp_path, running, shutdown
+):
+    class CleanupCapability(_FakeCapability):
+        def __init__(self, *, blocked=False):
+            super().__init__()
+            self.blocked = blocked
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.interrupted = False
+
+        def tool_registrations(self):
+            return ()
+
+        def prompt_context(self, context):
+            return None
+
+        async def cancel(self, session_id, context):
+            self.entered.set()
+            try:
+                if self.blocked:
+                    await self.release.wait()
+            except asyncio.CancelledError:
+                self.interrupted = True
+                raise
+            await super().cancel(session_id, context)
+
+    first_cleanup = CleanupCapability(blocked=True)
+    later_cleanup = CleanupCapability()
+    first_provider = _GatedProvider("first") if running else RecordingProvider()
+    second_provider = _GatedProvider("second")
+    selections = FakeSelections(
+        RuntimeSelection("fake", "model-one", None, None, first_provider, 128000)
+    )
+    _, _, session, _ = _open_real_session(
+        tmp_path, selections,
+        additional_capabilities=(first_cleanup, later_cleanup),
+    )
+    tasks = []
+    try:
+        turn = asyncio.create_task(session.submit(TurnRequest("cli:test", "first")))
+        tasks.append(turn)
+        if running:
+            await asyncio.wait_for(first_provider.started.wait(), 2)
+        else:
+            assert (await turn).status is TurnStatus.COMPLETED
+
+        cancel = asyncio.create_task(session.cancel("cli:test"))
+        tasks.append(cancel)
+        await asyncio.wait_for(first_cleanup.entered.wait(), 2)
+        result = await asyncio.wait_for(turn, 2)
+        expected = TurnStatus.INTERRUPTED if running else TurnStatus.COMPLETED
+        assert result.status is expected
+
+        selections.selection = RuntimeSelection(
+            "fake", "model-two", None, None, second_provider, 128000
+        )
+        successor = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "second"))
+        )
+        tasks.append(successor)
+        await asyncio.sleep(0)
+        cancel.cancel()
+        await asyncio.gather(cancel, return_exceptions=True)
+        assert cancel.cancelled()
+        for _ in range(8):
+            await asyncio.sleep(0)
+
+        assert not first_cleanup.interrupted
+        assert not later_cleanup.entered.is_set()
+        assert second_provider.calls == []
+
+        if shutdown:
+            close = asyncio.create_task(session.aclose())
+            tasks.append(close)
+            for _ in range(8):
+                await asyncio.sleep(0)
+            assert not close.done()
+            with pytest.raises(RuntimeError, match="closed"):
+                await successor
+            first_cleanup.release.set()
+            await asyncio.wait_for(close, 2)
+            assert second_provider.calls == []
+        else:
+            first_cleanup.release.set()
+            await asyncio.wait_for(second_provider.started.wait(), 2)
+            assert later_cleanup.cancelled == ["cli:test"]
+            second_provider.gate.set()
+            assert (await asyncio.wait_for(successor, 2)).status is TurnStatus.COMPLETED
+    finally:
+        first_cleanup.release.set()
+        second_provider.gate.set()
+        if running:
+            first_provider.gate.set()
+        await session.aclose()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_cancel_during_handoff_does_not_hang_after_a_build_failure(tmp_path):
+    provider = RecordingProvider()
+    selections = FakeSelections(
+        RuntimeSelection("fake", "model-one", None, None, provider, 128000)
+    )
+    _, _, session, _ = _open_real_session(tmp_path, selections)
+    build = session._build
+
+    def broken_build(selection):
+        raise RuntimeError("assembly build failed")
+
+    session._build = broken_build
+    tasks = []
+    try:
+        turn = asyncio.create_task(session.submit(TurnRequest("cli:test", "first")))
+        tasks.append(turn)
+        await asyncio.sleep(0)
+        cancel = asyncio.create_task(session.cancel("cli:test"))
+        tasks.append(cancel)
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(turn, cancel, return_exceptions=True), 2
+        )
+        assert isinstance(outcomes[0], RuntimeError)
+        assert str(outcomes[0]) == "assembly build failed"
+        assert outcomes[1] is None
+        assert session._pending == 0
+        assert session._slots["cli:test"].cleanup_done.is_set()
+
+        session._build = build
+        successor = await asyncio.wait_for(
+            session.submit(TurnRequest("cli:test", "second")), 2
+        )
+        assert successor.status is TurnStatus.COMPLETED
+        assert len(provider.calls) == 1
+    finally:
+        session._build = build
+        await session.aclose()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_cancelling_queued_compaction_returns_before_the_running_turn(tmp_path):
+    compact_calls = []
+
+    async def compact(session_id, selection):
+        compact_calls.append(session_id)
+        return "summary"
+
+    first_provider = _GatedProvider("first")
+    second_provider = RecordingProvider()
+    selections = FakeSelections(
+        RuntimeSelection("fake", "model-one", None, None, first_provider, 128000)
+    )
+    _, _, session, _ = _open_real_session(tmp_path, selections, compact=compact)
+    tasks = []
+    try:
+        turn = asyncio.create_task(session.submit(TurnRequest("cli:test", "first")))
+        tasks.append(turn)
+        await asyncio.wait_for(first_provider.started.wait(), 2)
+        summary = asyncio.create_task(session.compact("cli:test"))
+        tasks.append(summary)
+        await asyncio.sleep(0)
+        selections.selection = RuntimeSelection(
+            "fake", "model-two", None, None, second_provider, 128000
+        )
+        successor = asyncio.create_task(
+            session.submit(TurnRequest("cli:test", "second"))
+        )
+        tasks.append(successor)
+
+        summary.cancel()
+        for _ in range(8):
+            await asyncio.sleep(0)
+        assert summary.done()
+        assert summary.cancelled()
+        assert not turn.done()
+        assert compact_calls == []
+        assert second_provider.calls == []
+
+        first_provider.gate.set()
+        assert (await asyncio.wait_for(turn, 2)).status is TurnStatus.COMPLETED
+        assert (await asyncio.wait_for(successor, 2)).status is TurnStatus.COMPLETED
+        assert compact_calls == []
+        assert session._pending == 0
+    finally:
+        first_provider.gate.set()
+        await session.aclose()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def test_aclose_aborts_a_queued_submit_before_it_starts_its_turn(tmp_path):
