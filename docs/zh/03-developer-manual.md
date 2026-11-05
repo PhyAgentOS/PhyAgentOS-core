@@ -72,6 +72,21 @@ Timeout 形成 unknown record，恢复不会重复 POST。`forge_tool_start_acti
 
 Core 路径还注册 `agent/capabilities/skill_access_capability.py` 提供的 `activate_skill`。它读取已注册的 Skill 文档并返回本轮有效的 `activation_id`；不启动 Skill runtime，也不属于 Forge 工具。
 
+`forge_task_run_action` 是 `agent/capabilities/forge_capability.py` 中 Agent 层的组合工具。
+它在一次调用里依次调用现有的 `forge_task_create`、`forge_tool_context`、
+`forge_tool_start_action` 和 `forge_task_finalize` handler，因此 ownership 校验、冻结 binding、
+证据采集、取消和 unknown 状态规则都不需要复制。它在每个内部阶段前检查本回合的协作式取消
+token，Action 最多启动一次，默认等待终态 60 秒，只返回紧凑的 task/Action/verdict 视图。
+pending 或 unknown 会在 finalize 前停止；派发前失败和非终态任务不会被报告为成功。派发前取消
+不会启动 Action；派发后取消保留 invocation/attempt 身份、不重发、也不声称成功。多 Action 与
+replan 仍走单独的工具。
+
+`forge_task_finalize` 返回且对应任务确实进入终态后，该能力的 `suppress_tools(context)` 会让
+`composition.hidden_tools` 在本回合剩余步骤隐藏全部已注册工具；prompt fragment 随即要求模型
+根据已记录结果给出自然语言答复。没有终态任务响应的 `UNKNOWN`、`REJECTED` 或传输失败不会
+触发屏障，新回合恢复正常工具可见性。其他能力也可以实现同一个可选
+`suppress_tools(context)` 钩子；Core 的通用组件不需要知道 Forge 规则。
+
 诊断 Query 与绑定调用使用相同 HTTP 方法；每个变更或任务归因 wrapper 都在网络访问前校验
 ownership 与冻结 binding。Tool wrapper 不能自行生成 Gateway identity 或 result。
 

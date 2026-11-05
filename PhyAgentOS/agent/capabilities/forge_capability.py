@@ -35,6 +35,7 @@ from PhyAgentOS.agent.core.types import (
     DomainRefs,
     ExecutionContext,
     ToolCall,
+    ToolDefinition,
     ToolError,
     ToolOutcome,
     ToolRegistration,
@@ -48,7 +49,11 @@ from PhyAgentOS.forge.task import (
 )
 from PhyAgentOS.forge.tool_client import ForgeToolClient
 
-from .forge_task_tools import TASK_TOOL_DEFINITIONS, execute_task_tool
+from .forge_task_tools import (
+    TASK_TOOL_DEFINITIONS,
+    execute_task_tool,
+    verification_schema,
+)
 from .forge_tool_api import TOOL_API_DEFINITIONS, execute_tool_api_tool
 
 __all__ = ["ForgeCapability"]
@@ -488,14 +493,171 @@ def _outcome(
     return _outcome_for_success(call, data, arguments)
 
 
+_RUN_ACTION_TOOL = "forge_task_run_action"
+
 _STAGE_HIDE_BEFORE_ACTIVATION = frozenset(
     {"forge_task_create", "forge_task_begin_revision", "forge_task_finalize",
-     "forge_tool_start_action", "forge_tool_start_session"}
+     "forge_tool_start_action", "forge_tool_start_session", _RUN_ACTION_TOOL}
 )
 _STAGE_HIDE_BEFORE_TASK = frozenset(
     {"forge_task_begin_revision", "forge_task_finalize",
      "forge_tool_start_action", "forge_tool_start_session"}
 )
+# The single-action orchestration creates its own task, so it must not be
+# offered while this session already owns a non-terminal task.
+_STAGE_HIDE_WHEN_TASK = frozenset({_RUN_ACTION_TOOL})
+
+_RUN_ACTION_DEFINITION = ToolDefinition(
+    name=_RUN_ACTION_TOOL,
+    description=(
+        "One-call orchestration for a simple task that needs exactly one Forge Action: "
+        "create the AgentTask, read the live Tool context, start the Action and wait for "
+        "a terminal result, then finalize the task. Use it only when the request needs a "
+        "single Action and no replan; activation by activate_skill still comes first. "
+        "The Action is started at most once. If the result is pending, unknown, failed, "
+        "or cancelled, this tool reports that truthfully and never treats it as success. "
+        "Use forge_task_create / forge_tool_start_action / forge_task_finalize for "
+        "multi-action tasks, replanning, or any additional Query/Session work."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_description": {"type": "string", "minLength": 1},
+            "activation_id": {
+                "type": "string",
+                "pattern": "^activation_[a-z0-9]+$",
+                "description": "Primary activate_skill result from this session turn",
+            },
+            "verification": verification_schema(),
+            "tool_id": {"type": "string", "minLength": 1},
+            "arguments": {"type": "object"},
+            "wait_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 60_000,
+                "description": (
+                    "Optional total wait inside this call for a terminal Action result; "
+                    "defaults to 60000. A timeout stays pending/unknown, not success."
+                ),
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Optional Gateway execution timeout in ms. Omit it when the Gateway's "
+                    "limit is unknown so the Gateway default applies."
+                ),
+            },
+        },
+        "required": [
+            "task_description",
+            "activation_id",
+            "verification",
+            "tool_id",
+            "arguments",
+        ],
+        "additionalProperties": False,
+    },
+)
+
+_COMPACT_ACTION_KEYS = (
+    "tool_id",
+    "status",
+    "invocation_id",
+    "attempt_id",
+    "error",
+)
+
+
+def _compact_task_result(
+    data: Mapping[str, Any],
+    tool_id: str,
+    refs: DomainRefs,
+) -> dict[str, Any]:
+    """Return a small, truthful view of the finalized task and its Action."""
+    records: list[Mapping[str, Any]] = []
+    raw_records = data.get("execution_records")
+    if isinstance(raw_records, list):
+        records.extend(item for item in raw_records if isinstance(item, Mapping))
+    revisions = data.get("revisions")
+    if isinstance(revisions, list):
+        for revision in revisions:
+            if not isinstance(revision, Mapping):
+                continue
+            nested = revision.get("execution_records")
+            if isinstance(nested, list):
+                records.extend(
+                    item for item in nested if isinstance(item, Mapping)
+                )
+    action: Mapping[str, Any] | None = None
+    actions = [item for item in records if item.get("semantics") == "action"]
+    matches = [item for item in actions if item.get("tool_id") == tool_id]
+    chosen = matches or actions
+    if chosen:
+        action = chosen[-1]
+    action_view: dict[str, Any] = {}
+    if action is not None:
+        for key in _COMPACT_ACTION_KEYS:
+            if key in action:
+                action_view[key] = action[key]
+        if action.get("response") is not None:
+            action_view["response"] = action["response"]
+    if not action_view:
+        action_view = {"tool_id": tool_id}
+        if refs.invocation_id is not None:
+            action_view["invocation_id"] = refs.invocation_id
+        if refs.attempt_id is not None:
+            action_view["attempt_id"] = refs.attempt_id
+
+    result: dict[str, Any] = {
+        "task_id": data.get("task_id") or refs.task_id,
+        "status": data.get("status"),
+        "action": action_view,
+    }
+    verdict = data.get("verdict")
+    if isinstance(verdict, Mapping):
+        result["verdict"] = {
+            key: verdict[key]
+            for key in ("verdict", "reason")
+            if isinstance(verdict.get(key), str)
+        }
+    errors = data.get("evidence_errors")
+    if isinstance(errors, list) and errors:
+        result["evidence_errors"] = list(errors)
+    return result
+
+
+def _compact_domain_refs(
+    compact: Mapping[str, Any], fallback: DomainRefs
+) -> DomainRefs:
+    """Keep identity from the compact result, falling back to earlier steps."""
+    task_id = compact.get("task_id")
+    action = compact.get("action")
+    invocation_id = attempt_id = None
+    if isinstance(action, Mapping):
+        value = action.get("invocation_id")
+        invocation_id = value if isinstance(value, str) else None
+        value = action.get("attempt_id")
+        attempt_id = value if isinstance(value, str) else None
+    return DomainRefs(
+        task_id=task_id if isinstance(task_id, str) else fallback.task_id,
+        revision_id=fallback.revision_id,
+        invocation_id=invocation_id or fallback.invocation_id,
+        attempt_id=attempt_id or fallback.attempt_id,
+    )
+
+
+def _task_failure_detail(compact: Mapping[str, Any]) -> str:
+    verdict = compact.get("verdict")
+    if isinstance(verdict, Mapping):
+        reason = verdict.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            return reason
+    errors = compact.get("evidence_errors")
+    if isinstance(errors, list) and errors:
+        return "; ".join(str(item) for item in errors[:3])
+    status = compact.get("status")
+    return f"Forge task finalized as {status or 'not succeeded'}"
 
 
 class ForgeCapability:
@@ -516,6 +678,10 @@ class ForgeCapability:
         self._coordinator = coordinator
         self._client = client
         self._stage_resolver: Callable[[ExecutionContext], str] | None = None
+        # session_id -> (turn_id, task_id, terminal status). The barrier lasts
+        # only for the turn whose finalize produced the terminal task; a later
+        # turn starts with tools again.
+        self._terminal_turns: dict[str, tuple[str, str, str]] = {}
         registrations: list[ToolRegistration] = [
             ToolRegistration(
                 definition=definition,
@@ -532,6 +698,12 @@ class ForgeCapability:
                     parallel_safe=definition.name in _PARALLEL_SAFE_TOOLS,
                 )
                 for definition in TOOL_API_DEFINITIONS
+            )
+            registrations.append(
+                ToolRegistration(
+                    definition=_RUN_ACTION_DEFINITION,
+                    handler=self._run_action_handler(),
+                )
             )
         self._registrations = tuple(registrations)
 
@@ -564,13 +736,101 @@ class ForgeCapability:
         primary activation only ``forge_task_create`` and the mutating task /
         action tools are hidden; before any AgentTask exists, the mutating task
         and action tools stay hidden but every read/query tool remains.
+
+        After a terminal finalize, every Forge tool is hidden for the rest of
+        that turn: the task is over, so the model must answer from recorded
+        facts instead of exploring again. Composition also suppresses tools
+        owned by other capabilities for the same turn.
         """
+        if self._terminal_state(context) is not None:
+            return frozenset(
+                registration.definition.name for registration in self._registrations
+            )
+        if self._stage_resolver is None:
+            # No activation wiring: keep the documented pre-existing behaviour
+            # where every Forge tool is visible.
+            return frozenset()
         stage = self.stage(context)
         if stage == "task":
-            return frozenset()
+            return _STAGE_HIDE_WHEN_TASK
         if stage == "activated":
             return _STAGE_HIDE_BEFORE_TASK
         return _STAGE_HIDE_BEFORE_ACTIVATION
+
+    def suppress_tools(self, context: ExecutionContext) -> bool:
+        """Whether this step must offer no tools at all.
+
+        True only after ``forge_task_finalize`` returned and the corresponding
+        AgentTask is definitively terminal in the store. A failed finalize, an
+        unknown/pending result, or a non-terminal task never sets it.
+        """
+        return self._terminal_state(context) is not None
+
+    def _terminal_state(
+        self, context: ExecutionContext
+    ) -> tuple[str, str, str] | None:
+        """Return this turn's finalized (turn_id, task_id, status), if any."""
+        state = self._terminal_turns.get(context.session_id)
+        if state is None:
+            return None
+        if state[0] != context.turn_id:
+            # A new turn is not bound by the earlier turn's terminal task.
+            self._terminal_turns.pop(context.session_id, None)
+            return None
+        return state
+
+    def _note_terminal_finalize(
+        self,
+        call: ToolCall,
+        context: ExecutionContext,
+        outcome: ToolOutcome,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Record a terminal task only when finalize really produced one.
+
+        ``UNKNOWN``, ``REJECTED`` and still-running results are never evidence
+        of a terminal task. A ``FAILED`` outcome is recorded too when the store
+        says the task is terminal, because the task is over either way; the
+        prompt reports the real status and never calls it success.
+        """
+        if call.name != "forge_task_finalize":
+            return
+        if outcome.status in {
+            ToolStatus.UNKNOWN,
+            ToolStatus.REJECTED,
+            ToolStatus.RUNNING,
+        }:
+            return
+        data = outcome.content.get("data") if outcome.content else None
+        if not isinstance(data, Mapping):
+            # A transport/handler failure carries no task state. It is not a
+            # terminal finalize result even if an older record is terminal.
+            return
+        response_status = data.get("status")
+        if not isinstance(response_status, str) or response_status not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            return
+        task_id = data.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            task_id = arguments.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return
+        try:
+            record = self._coordinator.get_task(task_id)
+        except Exception:
+            return
+        if not getattr(record, "terminal", False):
+            return
+        status = getattr(record, "status", None)
+        status_text = getattr(status, "value", None) or str(status)
+        self._terminal_turns[context.session_id] = (
+            context.turn_id,
+            task_id,
+            status_text,
+        )
 
     def _stage_blocked(self, call: ToolCall, context: ExecutionContext) -> ToolOutcome | None:
         if call.name not in self.hidden_tools(context):
@@ -612,7 +872,9 @@ class ForgeCapability:
                         "blocking": list(exc.blocking),
                     },
                 }
-            return _outcome(call, payload, arguments)
+            outcome = _outcome(call, payload, arguments)
+            self._note_terminal_finalize(call, context, outcome, arguments)
+            return outcome
 
         return handle
 
@@ -629,6 +891,368 @@ class ForgeCapability:
             return _outcome(call, payload, arguments)
 
         return handle
+
+    @staticmethod
+    def _sub_call(
+        parent: ToolCall,
+        name: str,
+        arguments: Mapping[str, Any],
+    ) -> ToolCall:
+        """Build the next internal call without inventing a second dispatch path.
+
+        The orchestration calls the same capability handlers the model would
+        call; only the audit identity is local to the composite call.
+        """
+        return ToolCall(
+            tool_call_id=f"{parent.tool_call_id}:{name}",
+            name=name,
+            arguments=dict(arguments),
+        )
+
+    def _run_action_handler(self):
+        async def handle(call: ToolCall, context: ExecutionContext) -> ToolOutcome:
+            blocked = self._stage_blocked(call, context)
+            if blocked is not None:
+                return blocked
+            return await self._run_single_action(
+                call, context, call.arguments_dict()
+            )
+
+        return handle
+
+    async def _run_single_action(
+        self,
+        call: ToolCall,
+        context: ExecutionContext,
+        arguments: Mapping[str, Any],
+    ) -> ToolOutcome:
+        """Run create -> context -> start (once) -> finalize through handlers.
+
+        The Core loop cannot interleave its own cancellation check between the
+        internal steps of one handler call, so this method checks the turn's
+        cooperative token before every stage. In particular, no Action is
+        dispatched after a cancellation, and an already-dispatched Action is
+        never resent.
+        """
+        if context.cancellation.cancelled:
+            return self._orchestration_cancelled(
+                call, "task creation", completed_before="no task was created"
+            )
+        create_arguments = {
+            "task_description": arguments["task_description"],
+            "activation_id": arguments["activation_id"],
+            "verification": arguments["verification"],
+        }
+        created = await self._task_handler("forge_task_create")(
+            self._sub_call(call, "forge_task_create", create_arguments), context
+        )
+        if created.status is not ToolStatus.SUCCEEDED:
+            return self._orchestration_failure(call, "task creation", created)
+        data = self._outcome_data(created)
+        task_id = data.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return self._orchestration_failure(
+                call,
+                "task creation",
+                _failed_outcome(
+                    call,
+                    "forge_single_action_invalid_task",
+                    "task creation returned no task_id; no Action was started",
+                ),
+            )
+        if context.cancellation.cancelled:
+            return self._orchestration_cancelled(
+                call,
+                "context/readiness check",
+                task_id=task_id,
+                completed_before="the Action was not started",
+            )
+
+        # Reuse the existing live context read. The authoritative readiness decision
+        # stays in start_action's frozen-binding validation, so its rules are not
+        # duplicated here; the Action is not dispatched if this read fails.
+        ready = await self._tool_api_handler("forge_tool_context")(
+            self._sub_call(call, "forge_tool_context", {"tool_id": arguments["tool_id"]}),
+            context,
+        )
+        if ready.status is not ToolStatus.SUCCEEDED:
+            # Readiness is not confirmed, so the Action is not dispatched. The
+            # created task stays non-terminal exactly as the store records it.
+            return self._orchestration_failure(
+                call,
+                "context/readiness check",
+                ready,
+                task_id=task_id,
+                refs=DomainRefs(
+                    task_id=task_id,
+                    revision_id=created.domain_refs.revision_id,
+                ),
+            )
+        if context.cancellation.cancelled:
+            return self._orchestration_cancelled(
+                call,
+                "Action dispatch",
+                task_id=task_id,
+                completed_before="the Action was not started",
+            )
+
+        start_arguments: dict[str, Any] = {
+            "task_id": task_id,
+            "tool_id": arguments["tool_id"],
+            "arguments": arguments["arguments"],
+            "wait_ms": 60_000 if arguments.get("wait_ms") is None else arguments["wait_ms"],
+        }
+        if arguments.get("timeout_ms") is not None:
+            start_arguments["timeout_ms"] = arguments["timeout_ms"]
+        started = await self._tool_api_handler("forge_tool_start_action")(
+            self._sub_call(call, "forge_tool_start_action", start_arguments), context
+        )
+        action_refs = DomainRefs(
+            task_id=task_id,
+            revision_id=created.domain_refs.revision_id,
+            invocation_id=started.domain_refs.invocation_id,
+            attempt_id=started.domain_refs.attempt_id,
+        )
+        if context.cancellation.cancelled:
+            # The Action may already have been dispatched. Keep its identity,
+            # never resend it, and never claim task success.
+            return self._orchestration_cancelled(
+                call,
+                "Action dispatch",
+                task_id=task_id,
+                refs=action_refs,
+                completed_before=(
+                    "the Action was already dispatched at most once; do not resend it"
+                ),
+            )
+        if started.status is ToolStatus.UNKNOWN:
+            # Admission or a pending wait is not success and must not be
+            # finalized. The model gets the real invocation identity instead.
+            return self._orchestration_pending(
+                call, "Action start", started, task_id, action_refs
+            )
+        if started.status is ToolStatus.REJECTED:
+            return self._orchestration_failure(
+                call, "Action start", started, task_id=task_id, refs=action_refs
+            )
+        if (
+            started.status is ToolStatus.FAILED
+            and started.domain_refs.invocation_id is None
+        ):
+            # A pre-dispatch failure (for example a binding/readiness error)
+            # never reached the Gateway, so there is no execution to finalize.
+            return self._orchestration_failure(
+                call, "Action start", started, task_id=task_id, refs=action_refs
+            )
+
+        finalized = await self._task_handler("forge_task_finalize")(
+            self._sub_call(call, "forge_task_finalize", {"task_id": task_id}), context
+        )
+        if context.cancellation.cancelled:
+            return self._orchestration_cancelled(
+                call,
+                "task finalize",
+                task_id=task_id,
+                refs=action_refs,
+                completed_before=(
+                    "the Action was already dispatched at most once and was not resent"
+                ),
+            )
+        if finalized.status is ToolStatus.UNKNOWN:
+            return self._orchestration_pending(
+                call, "task finalize", finalized, task_id, action_refs
+            )
+        final_data = self._outcome_data(finalized)
+        if not final_data:
+            return self._orchestration_failure(
+                call, "task finalize", finalized, task_id=task_id, refs=action_refs
+            )
+
+        compact = _compact_task_result(
+            final_data, arguments["tool_id"], action_refs
+        )
+        refs = _compact_domain_refs(compact, action_refs)
+        if (
+            finalized.status is ToolStatus.SUCCEEDED
+            and started.status is ToolStatus.SUCCEEDED
+        ):
+            return ToolOutcome(
+                tool_call_id=call.tool_call_id,
+                tool_name=call.name,
+                status=ToolStatus.SUCCEEDED,
+                text=_json({"ok": True, "data": compact}),
+                content={"data": compact},
+                domain_refs=refs,
+            )
+
+        status = (
+            finalized.status
+            if finalized.status in {ToolStatus.FAILED, ToolStatus.CANCELLED}
+            else started.status
+        )
+        if status is ToolStatus.SUCCEEDED:
+            status = ToolStatus.FAILED
+        detail = _task_failure_detail(compact)
+        text = (
+            f"Forge single-action task finalized as {compact.get('status') or status.value}; "
+            "this is not success. " + _json({"ok": True, "data": compact})
+        )
+        error = (
+            ToolError("forge_task_not_succeeded", detail)
+            if status is ToolStatus.FAILED
+            else None
+        )
+        return ToolOutcome(
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            status=status,
+            text=text,
+            content={"data": compact, "phase": "finalize"},
+            error=error,
+            domain_refs=refs,
+        )
+
+    @staticmethod
+    def _outcome_data(outcome: ToolOutcome) -> dict[str, Any]:
+        content = outcome.content
+        if not isinstance(content, Mapping):
+            return {}
+        data = content.get("data")
+        return dict(data) if isinstance(data, Mapping) else {}
+
+    def _orchestration_failure(
+        self,
+        call: ToolCall,
+        phase: str,
+        outcome: ToolOutcome,
+        *,
+        task_id: str | None = None,
+        refs: DomainRefs | None = None,
+    ) -> ToolOutcome:
+        """Turn a failed sub-step into a non-success composite result."""
+        status = outcome.status
+        if status is ToolStatus.SUCCEEDED:
+            status = ToolStatus.FAILED
+        content: dict[str, Any] = {
+            "phase": phase,
+            "sub_status": outcome.status.value,
+        }
+        if task_id is not None:
+            content["task_id"] = task_id
+        if outcome.error is not None:
+            content["sub_error"] = {
+                "code": outcome.error.code,
+                "message": outcome.error.message,
+            }
+        if outcome.content:
+            content["sub_content"] = dict(outcome.content)
+        text = (
+            f"Forge single-action orchestration stopped during {phase}: "
+            f"{outcome.text} No later step was run and no success is claimed."
+        )
+        error = (
+            ToolError(
+                outcome.error.code if outcome.error is not None else "forge_single_action",
+                text,
+            )
+            if status in {ToolStatus.FAILED, ToolStatus.REJECTED}
+            else None
+        )
+        return ToolOutcome(
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            status=status,
+            text=text,
+            content=content,
+            error=error,
+            domain_refs=refs or outcome.domain_refs,
+        )
+
+    def _orchestration_cancelled(
+        self,
+        call: ToolCall,
+        phase: str,
+        *,
+        task_id: str | None = None,
+        refs: DomainRefs | None = None,
+        completed_before: str | None = None,
+    ) -> ToolOutcome:
+        """Report cooperative local cancellation without claiming success.
+
+        No further internal step was started at the point this is returned. If
+        the Action had already been dispatched, ``refs`` keeps its invocation
+        and attempt identity so the caller can reconcile it instead of resending.
+        """
+        details: dict[str, Any] = {"phase": phase}
+        if task_id is not None:
+            details["task_id"] = task_id
+        if refs is not None:
+            if refs.invocation_id is not None:
+                details["invocation_id"] = refs.invocation_id
+            if refs.attempt_id is not None:
+                details["attempt_id"] = refs.attempt_id
+        text = (
+            f"Forge single-action orchestration was cancelled locally during {phase}. "
+            f"{completed_before or 'no further step was started'}. No success is "
+            "claimed. " + _json({"ok": True, "data": details})
+        )
+        return ToolOutcome(
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            status=ToolStatus.CANCELLED,
+            text=text,
+            content={"data": details, "phase": phase},
+            error=ToolError("forge_single_action_cancelled", text),
+            domain_refs=refs or DomainRefs(),
+        )
+
+    def _orchestration_pending(
+        self,
+        call: ToolCall,
+        phase: str,
+        outcome: ToolOutcome,
+        task_id: str,
+        refs: DomainRefs,
+    ) -> ToolOutcome:
+        """Report an admitted but non-terminal Action without retrying it."""
+        pending = {
+            "task_id": task_id,
+            "invocation_id": refs.invocation_id,
+            "attempt_id": refs.attempt_id,
+        }
+        domain_status = None
+        if isinstance(outcome.content, Mapping):
+            value = outcome.content.get("domain_status")
+            if isinstance(value, str):
+                domain_status = value
+        if domain_status is not None:
+            pending["domain_status"] = domain_status
+        if phase == "task finalize" and domain_status == "awaiting_replan":
+            text = (
+                "Forge task finalize returned awaiting_replan; this single-action "
+                "orchestration does not replan and did not claim success. Continue "
+                "with forge_task_begin_revision and the individual task/action tools."
+            )
+        elif phase == "task finalize":
+            text = (
+                "Forge task finalize did not confirm a terminal task; no success is "
+                "claimed and the Action was not resent. Inspect forge_task_get and "
+                "follow the recorded task state. " + _json({"ok": True, "data": pending})
+            )
+        else:
+            text = (
+                f"Forge single-action orchestration stopped during {phase}: the remote "
+                "state is unknown and the Action was started at most once. Do not "
+                "resend it. " + _json({"ok": True, "data": pending})
+            )
+        return ToolOutcome(
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            status=ToolStatus.UNKNOWN,
+            text=text,
+            content={"data": pending, "phase": phase, "remote_state": "unknown"},
+            domain_refs=refs,
+        )
 
     def _current_task(self, session_id: str) -> AgentTaskRecord | None:
         """Return this session's newest non-terminal task, if the store can."""
@@ -655,8 +1279,32 @@ class ForgeCapability:
         ``forge_task_get`` when the user asks. Nothing is cached and nothing is
         invented.
         """
+        terminal = self._terminal_state(context)
+        if terminal is not None:
+            _, task_id, status = terminal
+            return (
+                f"Forge task {task_id} is finalized with status={status}. "
+                "This turn's tool use is complete: every tool is unavailable in "
+                "this step. Reply to the user now from the recorded task, Action "
+                "result, verdict, and evidence errors already returned. Do not "
+                "take screenshots, run visual analysis, or search for evidence "
+                "files. Claim success only if status=succeeded; otherwise state "
+                "the failure, cancellation, or unknown remote state plainly."
+            )
         record = self._current_task(context.session_id)
         if record is None or _stale_dispatch_unknown(record):
+            if (
+                record is None
+                and self._stage_resolver is not None
+                and self.stage(context) == "activated"
+            ):
+                return (
+                    "For a simple task that needs exactly one Forge Action, prefer "
+                    "forge_task_run_action: it creates the AgentTask, checks readiness, "
+                    "starts that one Action, waits for a terminal result, and finalizes "
+                    "in one call. Use the individual task/action tools for multiple "
+                    "Actions, replanning, or extra Query/Session work."
+                )
             return None
         nonterminal = sum(
             1 for item in record.execution_records if not item.terminal

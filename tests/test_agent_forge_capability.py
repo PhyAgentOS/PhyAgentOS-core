@@ -224,7 +224,7 @@ def test_registers_the_existing_task_and_tool_api_groups() -> None:
 
     assert [item.definition.name for item in task_only.tool_registrations()] == task_names
     assert [item.definition.name for item in with_client.tool_registrations()] == (
-        task_names + api_names
+        task_names + api_names + ["forge_task_run_action"]
     )
     assert set(task_names) == {
         "forge_task_create",
@@ -685,10 +685,15 @@ def test_legacy_wrappers_share_the_native_definitions() -> None:
         "forge_task_get",
     }
 
-    assert [item.definition.name for item in registrations] == [
+    # The legacy wrapper set keeps its historical order; the native capability
+    # additionally exposes the Agent-level single-action orchestration tool.
+    assert [item.definition.name for item in registrations[: len(legacy_tools)]] == [
         tool.name for tool in legacy_tools
     ]
-    for registration, tool in zip(registrations, legacy_tools, strict=True):
+    assert [item.definition.name for item in registrations[len(legacy_tools):]] == [
+        "forge_task_run_action"
+    ]
+    for registration, tool in zip(registrations, legacy_tools, strict=False):
         assert registration.definition.description == tool.description
         assert registration.definition.parameters == tool.parameters
         assert registration.parallel_safe is (

@@ -129,15 +129,28 @@ def compose_agent(
         for item in capabilities
         if callable(getattr(item, "hidden_tools", None))
     )
-
-    def hidden_tools(context: ExecutionContext) -> frozenset[str]:
-        return frozenset(name for hide in visibility for name in hide(context))
-
+    suppressors = tuple(
+        item.suppress_tools
+        for item in capabilities
+        if callable(getattr(item, "suppress_tools", None))
+    )
     registrations = tuple(
         registration
         for item in capabilities
         for registration in item.tool_registrations()
     )
+    all_tool_names = frozenset(
+        registration.definition.name for registration in registrations
+    )
+
+    def hidden_tools(context: ExecutionContext) -> frozenset[str]:
+        # A capability may declare that this step has nothing left to do. The
+        # whole offered set is then hidden, including exec/image/spawn tools,
+        # so the next model call can only produce a natural-language answer.
+        if any(suppress(context) for suppress in suppressors):
+            return all_tool_names
+        return frozenset(name for hide in visibility for name in hide(context))
+
     definitions = tuple(
         registration.definition for registration in registrations
     )

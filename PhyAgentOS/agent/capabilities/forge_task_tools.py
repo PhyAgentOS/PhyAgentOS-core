@@ -26,6 +26,7 @@ from PhyAgentOS.verification.contracts import TaskVerificationContract
 __all__ = [
     "TASK_TOOL_DEFINITIONS",
     "execute_task_tool",
+    "verification_schema",
 ]
 
 _SUPPORTED_EVIDENCE_KINDS = ("rgb_image", "robot_state")
@@ -222,6 +223,15 @@ def _verification_schema() -> dict[str, Any]:
         },
         "additionalProperties": False,
     }
+
+
+def verification_schema() -> dict[str, Any]:
+    """Return a fresh copy of the task verification JSON Schema.
+
+    The single-call orchestration tool reuses this schema so the model sees the
+    same verification contract as ``forge_task_create``.
+    """
+    return _verification_schema()
 
 
 _CREATE_DEFINITION = ToolDefinition(

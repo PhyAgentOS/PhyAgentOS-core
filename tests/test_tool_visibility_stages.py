@@ -87,7 +87,12 @@ def test_stage_sets_match_the_activation_and_task_boundary() -> None:
     assert "forge_tool_start_action" in _capability("none").hidden_tools(_ctx())
     assert "forge_task_create" not in _capability("activated").hidden_tools(_ctx())
     assert "forge_tool_start_action" in _capability("activated").hidden_tools(_ctx())
-    assert _capability("task").hidden_tools(_ctx()) == frozenset()
+    assert "forge_task_run_action" not in _capability("activated").hidden_tools(_ctx())
+    # The single-action orchestration creates its own task, so it disappears
+    # once this session already has one.
+    assert _capability("task").hidden_tools(_ctx()) == frozenset(
+        {"forge_task_run_action"}
+    )
 
 
 def test_forged_hidden_action_is_rejected_before_the_handler_runs() -> None:

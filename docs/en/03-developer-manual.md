@@ -73,6 +73,25 @@ frozen allowlist view; it never creates or expands an allowlist.
 
 The Core path also registers `activate_skill` from `agent/capabilities/skill_access_capability.py`. It reads a registered Skill document and returns a turn-scoped `activation_id`; it does not start a Skill runtime and is not a Forge tool.
 
+`forge_task_run_action` is the Agent-level orchestration tool in
+`agent/capabilities/forge_capability.py`. It calls the same registered
+`forge_task_create`, `forge_tool_context`, `forge_tool_start_action`, and
+`forge_task_finalize` handlers in one invocation, so ownership checks, the frozen binding,
+evidence collection, cancellation, and unknown-state rules are not duplicated. It checks the
+turn's cooperative cancellation token before each internal stage, starts the Action at most once,
+defaults to a 60-second terminal wait, and returns only a compact task/Action/verdict view.
+Pending or unknown results stop before finalize; pre-dispatch failures and non-terminal tasks are
+not reported as success. Cancellation before dispatch starts no Action; cancellation after
+dispatch keeps the invocation/attempt identity, never resends, and claims no success. Multi-Action
+and replan work keeps using the individual tools.
+
+After a finalize returns and the corresponding task is definitively terminal, the capability's
+`suppress_tools(context)` makes `composition.hidden_tools` hide every registered tool for the rest
+of that turn. The prompt fragment then asks for a natural-language answer based on the recorded
+result. `UNKNOWN`, `REJECTED`, and transport failures without a terminal task response do not
+activate the barrier, and a later turn starts with normal tool visibility. Other capabilities may
+implement the same optional `suppress_tools(context)` hook; no core component learns Forge rules.
+
 Diagnostic Query and bound calls invoke the same HTTP methods. Every mutating or task-attributed
 wrapper validates ownership and the frozen Tool binding before network access. Tool wrappers must
 never invent a Gateway identity or result.

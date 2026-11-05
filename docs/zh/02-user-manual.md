@@ -670,6 +670,17 @@ forge_tool_query(tool_id, arguments)
 每个 origin session（或无绑定槽位）最多一个非终态 AgentTask；诊断 Query 不占该槽位，不同
 session 可以各自创建，所有执行仍按 Gateway operation 的 `max_concurrency` 竞争。
 
+只包含一个 Action 的简单任务可以直接调用
+`forge_task_run_action(task_description, activation_id, verification, tool_id, arguments, wait_ms?)`，
+不必手工分步。它在一次工具调用中走同一套 create、context/readiness、start 和 finalize 操作，
+Action 最多启动一次，等待终态（默认 60 秒），并返回紧凑的 task/Action/verdict 结果。
+pending、unknown、failed 或 cancelled 都保持非成功，不会被当作完成去 finalize。多 Action、
+replan 或额外 Query/Session 调用仍使用上面的手工顺序。
+
+`forge_task_finalize` 返回明确的终态任务后，本回合剩余步骤不再提供任何工具。Agent 必须根据
+已记录的结果作答，包括失败、取消、unknown 远端状态或 evidence error，不要继续截图、做视觉
+分析或寻找证据文件。
+
 ## 7. 定义验证
 
 `audit`、`enforce` 或 `recovery` 必须提供 goal 和至少一项 success criterion：

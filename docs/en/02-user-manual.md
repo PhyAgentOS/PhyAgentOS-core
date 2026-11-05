@@ -776,6 +776,19 @@ Each origin session (or the unbound slot) has at most one non-terminal AgentTask
 does not occupy that slot, different sessions create independently, and all execution still
 competes according to Gateway operation `max_concurrency`.
 
+For a simple task that needs exactly one Action, use
+`forge_task_run_action(task_description, activation_id, verification, tool_id, arguments, wait_ms?)`
+instead of the manual sequence. It calls the same create, context/readiness, start and finalize
+operations in one tool call, starts the Action at most once, waits for a terminal result (60 seconds
+by default), and returns a compact task/Action/verdict result. A pending, unknown, failed, or
+cancelled outcome stays non-success and is never finalized as completion. Use the manual sequence
+for multiple Actions, replanning, or additional Query/Session calls.
+
+After `forge_task_finalize` returns a definitively terminal task, the rest of that turn offers no
+tools. The Agent must answer from the recorded result, including any failure, cancellation,
+unknown remote state, or evidence error, instead of taking more screenshots, running visual
+analysis, or searching for evidence files.
+
 ## 7. Define verification
 
 For `audit`, `enforce`, or `recovery`, provide a goal and at least one success criterion:
