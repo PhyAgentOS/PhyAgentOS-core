@@ -14,11 +14,11 @@ PhyAgentOS ships with a Docker-based quick deployment that requires no manual Py
 |:-----|:-----|
 | Python 3.12 runtime | All `pyproject.toml` deps installed via `uv` |
 | `paos` CLI | Registered as the entrypoint (`ENTRYPOINT`) |
-| Node.js 20 | Strictly builds the WhatsApp bridge from locked npm dependencies |
+| Node.js 20 | Runtime for `npx`-based MCP servers and the bundled ClawHub skill |
 | Config directory | `/root/.PhyAgentOS` (persisted to the host via a volume mount) |
 | Default service | Interactive CLI (`paos agent`); switchable to a long-running gateway |
 
-The image does **not** include Dora CLI, concrete Forge Skills or nodes, GPU / CUDA, Isaac Sim,
+The image does **not** include Dora CLI, concrete Forge Skills or Forge nodes, GPU / CUDA, Isaac Sim,
 BEHAVIOR-1K, or other robot Runtime dependencies. The stock image runs the general Agent and its
 message-bus gateway; it does not provide a managed Forge Skill Runtime. Run that Runtime from a
 host-native PhyAgentOS installation following the

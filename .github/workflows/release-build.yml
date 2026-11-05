@@ -66,43 +66,9 @@ jobs:
           .venv/bin/ruff check PhyAgentOS tests
           .venv/bin/python -m compileall -q PhyAgentOS tests
 
-  bridge-test:
-    name: Node 20 bridge on Ubuntu 20.04
-    runs-on: ubuntu-24.04
-    container:
-      image: ubuntu:20.04
-    timeout-minutes: 20
-
-    steps:
-      - name: Prepare Ubuntu 20.04 container
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl git libstdc++6
-          rm -rf /var/lib/apt/lists/*
-          . /etc/os-release
-          test "$VERSION_ID" = "20.04"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-          persist-credentials: false
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: bridge/package-lock.json
-
-      - name: Build bridge
-        working-directory: bridge
-        run: |
-          npm ci
-          npm run build
-
   package:
     name: Build distributions on Ubuntu 20.04
-    needs: [python-test, bridge-test]
+    needs: [python-test]
     runs-on: ubuntu-24.04
     container:
       image: ubuntu:20.04

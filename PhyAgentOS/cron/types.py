@@ -25,7 +25,7 @@ class CronPayload:
     message: str = ""
     # Deliver response to channel
     deliver: bool = False
-    channel: str | None = None  # e.g. "whatsapp"
+    channel: str | None = None  # e.g. "telegram"
     to: str | None = None  # e.g. phone number
 
 

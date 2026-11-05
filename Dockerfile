@@ -4,7 +4,7 @@ LABEL org.opencontainers.image.title="PhyAgentOS" \
       org.opencontainers.image.version="1.1.1" \
       org.opencontainers.image.source="https://github.com/PhyAgentOS/PhyAgentOS-core"
 
-# Install Node.js 20 for the WhatsApp bridge
+# Install Node.js 20 for npx-based MCP servers and the bundled ClawHub skill.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git && \
     mkdir -p /etc/apt/keyrings && \
@@ -20,20 +20,13 @@ WORKDIR /app
 
 # Install Python dependencies first (cached layer)
 COPY pyproject.toml README.md LICENSE ./
-RUN mkdir -p PhyAgentOS bridge && touch PhyAgentOS/__init__.py && \
+RUN mkdir -p PhyAgentOS && touch PhyAgentOS/__init__.py && \
     uv pip install --system --no-cache . && \
-    rm -rf PhyAgentOS bridge
+    rm -rf PhyAgentOS
 
 # Copy the full source and install
 COPY PhyAgentOS/ PhyAgentOS/
-COPY bridge/ bridge/
 RUN uv pip install --system --no-cache .
-
-# Build the WhatsApp bridge from the committed lock file. A failed dependency
-# install or TypeScript compilation must fail the image build.
-WORKDIR /app/bridge
-RUN npm ci && npm run build
-WORKDIR /app
 
 # Release smoke check: verifies the installed console entry point and runtime version.
 RUN paos --version

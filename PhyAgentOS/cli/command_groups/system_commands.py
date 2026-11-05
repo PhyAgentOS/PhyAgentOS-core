@@ -64,7 +64,7 @@ def register_system_commands(app) -> None:
         console.print("     Set the default: [cyan]paos provider use <provider>[/cyan]")
         console.print("     Get one at: https://openrouter.ai/keys")
         console.print("  2. Chat: [cyan]paos agent -m \"Hello!\"[/cyan]")
-        console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/PhyAgentOS#-chat-apps[/dim]")
+        console.print("\n[dim]Want Telegram? See: https://github.com/HKUDS/PhyAgentOS#-chat-apps[/dim]")
 
     @app.command()
     def status():

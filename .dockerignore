@@ -9,5 +9,4 @@ build/
 .env
 .assets
 node_modules/
-bridge/dist/
 workspace/

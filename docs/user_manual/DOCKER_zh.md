@@ -14,11 +14,11 @@ PhyAgentOS 提供基于 Docker 的快速部署方案，无需手动配置 Python
 |:-----|:-----|
 | Python 3.12 运行时 | 由 `uv` 安装 `pyproject.toml` 中的全部依赖 |
 | `paos` CLI | 已注册为入口命令（`ENTRYPOINT`） |
-| Node.js 20 | 从锁定的 npm 依赖严格编译 WhatsApp bridge |
+| Node.js 20 | 为基于 npx 的 MCP server 和内置 ClawHub 技能提供运行时 |
 | 配置目录 | `/root/.PhyAgentOS`（通过卷挂载到宿主机持久化） |
 | 默认服务 | 交互式 CLI（`paos agent`），可切换为长驻网关 |
 
-镜像**不包含** Dora CLI、具体 Forge Skill 或 Node、GPU / CUDA、Isaac Sim、BEHAVIOR-1K
+镜像**不包含** Dora CLI、具体 Forge Skill 或 Forge node、GPU / CUDA、Isaac Sim、BEHAVIOR-1K
 及其他机器人 Runtime 依赖。标准镜像运行通用 Agent 与消息总线 gateway，不提供托管 Forge
 Skill Runtime。需要该 Runtime 时，应按[用户手册](../zh/02-user-manual.md#托管-skill-profile-所需的-dora-cli)
 使用宿主机原生 PhyAgentOS 环境运行，或者构建包含 Dora CLI v0.4.1、`dora-message` v0.7.0
