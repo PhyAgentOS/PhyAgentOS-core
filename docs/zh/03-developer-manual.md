@@ -176,7 +176,9 @@ Registry 元数据或直接下载端点解析 size。Registry 一旦返回 diges
 
 `discover_active_runtime` 核对持久化 state、Dora flow、Gateway health 与 required Tool
 contexts。availability provider 贯通 SkillsLoader、ExperienceCoordinator 与
-SkillActivationManager。Skill 发现顺序为 workspace、installed、built-in。
+SkillActivationManager。Skill 发现顺序为 workspace、installed、built-in。该顺序只决定文档正文：
+Forge 的 binding 身份（版本、manifest 与 candidate）始终来自 installed bundle，因此 workspace
+的 `SKILL.md` 只覆盖工作流正文，不会成为独立的安装源。
 
 ## 11. Experience 与 evolution 接入
 
@@ -455,7 +457,7 @@ service 的 cycle lock 串行，两个周期不会重叠。同一 session 的回
 
 ### Skill 激活作用域
 
-`activate_skill` 是 `agent/capabilities/skill_access_capability.py` 提供的 Core 工具。一次激活只属于一个 `session_id` 和一个 `turn_id`；上一回合、其他 session 或上一个进程的 id 都会被拒绝。激活记录只在内存里，重启后必须重新激活。一回合允许一个 primary Skill 和任意多个 supporting Skill。激活只读 Skill 文档，不启动 Skill runtime。
+`activate_skill` 是 `agent/capabilities/skill_access_capability.py` 提供的 Core 工具。一次激活只属于一个 `session_id` 和一个 `turn_id`；上一回合、其他 session 或上一个进程的 id 都会被拒绝。激活记录只在内存里，重启后必须重新激活。一回合允许一个 primary Skill 和任意多个 supporting Skill。激活只读 Skill 文档，不启动 Skill runtime。installed bundle 存在时，即使 workspace 的 `SKILL.md` 覆盖了文档正文，激活仍会预览当前 Runtime；只有 workspace 或 builtin 文档、没有 installed bundle 的 Skill 只能做文档激活，不能创建 AgentTask。installed bundle 存在但没有健康 Runtime 时，激活会在返回 activation id 之前失败。
 
 ### Core 路径未覆盖的部分
 

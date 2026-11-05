@@ -946,7 +946,11 @@ class AgentTaskCoordinator:
             )
             candidate_id = activation.binding_candidate_id
             if not candidate_id:
-                raise AgentTaskError("primary Skill activation has no Forge binding candidate")
+                raise AgentTaskError(
+                    "primary Skill activation has no Forge binding candidate; "
+                    "only an installed Forge Skill with a ready Runtime can create "
+                    "an AgentTask"
+                )
             try:
                 binding = await self.binding_resolver.freeze(
                     candidate_id,

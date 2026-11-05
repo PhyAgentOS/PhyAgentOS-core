@@ -86,8 +86,7 @@ class TurnSkillActivationManager:
         path = Path(skill["path"])
         content = path.read_text(encoding="utf-8")
         content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        manifest_path = path.parent / "skill.yaml"
-        version = load_manifest(manifest_path).version if manifest_path.is_file() else None
+        version = None
         candidate_id = None
         if self.binding_resolver is not None:
             from PhyAgentOS.forge.interaction.binding import verified_extension
@@ -96,12 +95,25 @@ class TurnSkillActivationManager:
                 installed = self.binding_resolver.catalog.get(name)
             except (LookupError, FileNotFoundError):
                 installed = None
-            if installed is not None and verified_extension(installed) is not None:
-                if path.resolve() != (installed.bundle_root / "SKILL.md").resolve():
-                    raise ValueError("interaction Skill cannot be shadowed by workspace content")
-            if version is not None:
+            if installed is not None:
+                if verified_extension(installed) is not None:
+                    if path.resolve() != (installed.bundle_root / "SKILL.md").resolve():
+                        raise ValueError(
+                            "interaction Skill cannot be shadowed by workspace content"
+                        )
+                # Forge identity belongs to the installed bundle. A workspace
+                # SKILL.md may override the workflow text, but its adjacent
+                # skill.yaml is not an installed manifest and must not decide
+                # whether a binding preview happens.
+                version = installed.version
                 candidate = await self.binding_resolver.preview(name)
                 candidate_id = candidate.candidate_id
+        if version is None:
+            # Document-only Skill: keep local metadata when present, but never
+            # turn a workspace or builtin document into a Forge binding.
+            manifest_path = path.parent / "skill.yaml"
+            if manifest_path.is_file():
+                version = load_manifest(manifest_path).version
 
         if self._sessions.get(session_key) is not scope:
             raise ValueError("Skill activation turn changed during binding preview")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,8 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
+from PhyAgentOS.agent.services.skill_documents import SkillDocumentLoader
+from PhyAgentOS.agent.services.turn_activation import TurnSkillActivationManager
 from PhyAgentOS.agent_legacy.experience.activation import SkillActivationManager
 from PhyAgentOS.agent_legacy.experience.store import ExperienceStore
 from PhyAgentOS.agent_legacy.tools.forge_tool_api import (
@@ -183,6 +186,7 @@ async def _bound_system(
     monkeypatch: pytest.MonkeyPatch,
     *,
     profile_tools: list[str] | None = None,
+    workspace_overlay: bool = False,
 ):
     installed = tmp_path / "skills"
     _write_skill(installed, profile_tools=profile_tools)
@@ -208,6 +212,10 @@ async def _bound_system(
     registry = ActiveRuntimeRegistry(runtime)
     resolver = ForgeSkillBindingResolver(registry, catalog=SkillCatalog(installed))
     workspace = tmp_path / "workspace"
+    if workspace_overlay:
+        overlay = workspace / "skills" / "example-forge" / "SKILL.md"
+        overlay.parent.mkdir(parents=True)
+        overlay.write_text("# Workspace overlay\n", encoding="utf-8")
     activation = SkillActivationManager(
         workspace=workspace,
         store=ExperienceStore(workspace),
@@ -250,6 +258,21 @@ async def _bound_system(
         origin_session_key="cli:test",
     )
     return coordinator, task, client, invocations, sessions, task_bindings
+
+
+async def test_legacy_workspace_overlay_binds_the_installed_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, task, _, _, _, _ = await _bound_system(
+        tmp_path, monkeypatch, workspace_overlay=True
+    )
+    binding = task.primary_skill_binding
+    assert binding is not None
+    assert binding.skill_version == "1.2.3"
+    overlay = tmp_path / "workspace" / "skills" / "example-forge" / "SKILL.md"
+    assert binding.workflow_document_sha256 == hashlib.sha256(
+        overlay.read_bytes()
+    ).hexdigest()
 
 
 async def test_binding_freezes_runtime_and_rejects_toolspec_drift(
@@ -743,3 +766,79 @@ async def test_binding_reports_profile_missing_from_installed_bundle(
         ForgeSkillBindingError, match="no longer declares profile 'local'"
     ):
         await resolver.preview("example-forge")
+
+
+async def test_core_workspace_overlay_binds_the_installed_bundle(
+    tmp_path: Path,
+) -> None:
+    installed = tmp_path / "skills"
+    _write_skill(installed)
+    workspace = tmp_path / "workspace"
+    overlay = workspace / "skills" / "example-forge" / "SKILL.md"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_text("# Workspace overlay\n", encoding="utf-8")
+
+    documents = SkillDocumentLoader(
+        workspace,
+        builtin_skills_dir=tmp_path / "builtin",
+        installed_skills_dir=installed,
+        runtime_availability_provider=lambda _name: True,
+    )
+    client = FakeGatewayClient()
+    invocations: set[str] = set()
+    sessions: set[str] = set()
+    task_bindings: set[str] = set()
+    runtime = ActiveSkillRuntime(
+        skill_name="example-forge",
+        skill_version="1.2.3",
+        profile="local",
+        runtime_instance_id="runtime-test-1",
+        gateway_url="http://127.0.0.1:9",
+        gateway_identity="gateway-test-1",
+        client=client,  # type: ignore[arg-type]
+        invocation_ids=invocations,
+        session_ids=sessions,
+        task_binding_ids=task_bindings,
+    )
+    resolver = ForgeSkillBindingResolver(
+        ActiveRuntimeRegistry(runtime),
+        catalog=SkillCatalog(installed),
+        skills_loader=documents,
+    )
+    manager = TurnSkillActivationManager(documents, binding_resolver=resolver)
+    activated, content = await manager.activate(
+        session_key="cli:test",
+        turn_id="turn-1",
+        name="example-forge",
+        role="primary",
+    )
+    assert activated.source == "workspace"
+    assert activated.skill_version == "1.2.3"
+    assert activated.binding_candidate_id is not None
+    assert content == "# Workspace overlay\n"
+
+    coordinator = AgentTaskCoordinator(
+        workspace=workspace,
+        config=ForgeConfig(),
+        client=client,  # type: ignore[arg-type]
+        binding_resolver=resolver,
+        activation_manager=manager,
+        runtime_invocation_ids=invocations,
+        runtime_session_ids=sessions,
+        runtime_task_binding_ids=task_bindings,
+    )
+    task = await coordinator.create_task(
+        task_description="run the example workflow",
+        verification=TaskVerificationContract(mode="off"),
+        activation_id=activated.activation_id,
+        origin_session_key="cli:test",
+    )
+    binding = task.primary_skill_binding
+    assert binding is not None
+    assert binding.skill_version == "1.2.3"
+    assert binding.workflow_document_sha256 == hashlib.sha256(
+        overlay.read_bytes()
+    ).hexdigest()
+    assert binding.skill_document_sha256 == hashlib.sha256(
+        (installed / "example-forge" / "SKILL.md").read_bytes()
+    ).hexdigest()

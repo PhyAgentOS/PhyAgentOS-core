@@ -23,8 +23,22 @@ from PhyAgentOS.agent.core import (
 )
 from PhyAgentOS.agent.services.skill_documents import SkillDocumentLoader
 from PhyAgentOS.agent.services.turn_activation import TurnSkillActivationManager
-from PhyAgentOS.forge.task import AgentTaskRecord, PlanRevision
+from PhyAgentOS.config.schema import ForgeConfig
+from PhyAgentOS.forge.binding import ForgeSkillBindingError
+from PhyAgentOS.forge.task import (
+    AgentTaskCoordinator,
+    AgentTaskError,
+    AgentTaskRecord,
+    PlanRevision,
+)
 from PhyAgentOS.providers.base import LLMResponse, ToolCallRequest
+from PhyAgentOS.verification.contracts import TaskVerificationContract
+
+
+def _installed_manifest(tmp_path, name="primary", version="1.0.0"):
+    root = tmp_path / "installed" / name
+    root.mkdir(parents=True)
+    return SimpleNamespace(version=version, bundle_root=root)
 
 
 def _manager(tmp_path):
@@ -118,7 +132,7 @@ async def test_document_change_cannot_reuse_old_document_identity(tmp_path):
         await manager.activate(session_key="A", turn_id="one", name="primary")
 
 
-async def test_delayed_binding_preview_cannot_publish_into_a_new_turn(tmp_path, monkeypatch):
+async def test_delayed_binding_preview_cannot_publish_into_a_new_turn(tmp_path):
     manager = _manager(tmp_path)
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -127,13 +141,11 @@ async def test_delayed_binding_preview_cannot_publish_into_a_new_turn(tmp_path, 
         await release.wait()
         return SimpleNamespace(candidate_id="candidate")
 
+    installed = _installed_manifest(tmp_path)
     manager.binding_resolver = SimpleNamespace(
-        catalog=SimpleNamespace(get=lambda name: (_ for _ in ()).throw(LookupError())),
+        catalog=SimpleNamespace(get=lambda name: installed),
         preview=preview,
     )
-    path = tmp_path / "skills" / "primary" / "skill.yaml"
-    path.write_text("test")
-    monkeypatch.setattr("PhyAgentOS.agent.services.turn_activation.load_manifest", lambda path: SimpleNamespace(version="1"))
     activation = asyncio.create_task(manager.activate(session_key="A", turn_id="one", name="primary"))
     await entered.wait()
     manager.begin_turn("A", "two")
@@ -143,7 +155,7 @@ async def test_delayed_binding_preview_cannot_publish_into_a_new_turn(tmp_path, 
     assert manager.current("A", "two") == ()
 
 
-async def test_document_change_during_preview_is_not_published(tmp_path, monkeypatch):
+async def test_document_change_during_preview_is_not_published(tmp_path):
     manager = _manager(tmp_path)
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -152,14 +164,10 @@ async def test_document_change_during_preview_is_not_published(tmp_path, monkeyp
         await release.wait()
         return SimpleNamespace(candidate_id="candidate")
 
+    installed = _installed_manifest(tmp_path)
     manager.binding_resolver = SimpleNamespace(
-        catalog=SimpleNamespace(get=lambda name: (_ for _ in ()).throw(LookupError())),
+        catalog=SimpleNamespace(get=lambda name: installed),
         preview=preview,
-    )
-    (tmp_path / "skills" / "primary" / "skill.yaml").write_text("test")
-    monkeypatch.setattr(
-        "PhyAgentOS.agent.services.turn_activation.load_manifest",
-        lambda path: SimpleNamespace(version="1"),
     )
     activation = asyncio.create_task(
         manager.activate(session_key="A", turn_id="one", name="primary")
@@ -172,6 +180,110 @@ async def test_document_change_during_preview_is_not_published(tmp_path, monkeyp
     with pytest.raises(ValueError, match="changed during activation"):
         await activation
     assert manager.current("A", "one") == ()
+
+
+async def test_workspace_overlay_binds_the_installed_manifest(tmp_path):
+    manager = _manager(tmp_path)
+    installed = _installed_manifest(tmp_path, version="2.3.4")
+    previewed = []
+
+    async def preview(name):
+        previewed.append(name)
+        return SimpleNamespace(candidate_id="candidate_shadow")
+
+    manager.binding_resolver = SimpleNamespace(
+        catalog=SimpleNamespace(get=lambda name: installed),
+        preview=preview,
+    )
+    activation, content = await manager.activate(
+        session_key="A", turn_id="one", name="primary"
+    )
+    assert activation.source == "workspace"
+    assert activation.skill_version == "2.3.4"
+    assert activation.binding_candidate_id == "candidate_shadow"
+    assert "# primary" in content
+    assert previewed == ["primary"]
+
+
+async def test_workspace_manifest_does_not_make_a_binding(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    (tmp_path / "skills" / "primary" / "skill.yaml").write_text("test")
+    monkeypatch.setattr(
+        "PhyAgentOS.agent.services.turn_activation.load_manifest",
+        lambda path: SimpleNamespace(version="9.9.9"),
+    )
+
+    async def preview(_name):
+        raise AssertionError("preview must not run without an installed bundle")
+
+    manager.binding_resolver = SimpleNamespace(
+        catalog=SimpleNamespace(get=lambda name: (_ for _ in ()).throw(LookupError())),
+        preview=preview,
+    )
+    activation, _ = await manager.activate(
+        session_key="A", turn_id="one", name="primary"
+    )
+    assert activation.skill_version == "9.9.9"
+    assert activation.binding_candidate_id is None
+
+
+async def test_interaction_skill_still_rejects_workspace_shadow(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    installed = _installed_manifest(tmp_path)
+    monkeypatch.setattr(
+        "PhyAgentOS.forge.interaction.binding.verified_extension",
+        lambda manifest: {"contract": {}},
+    )
+    manager.binding_resolver = SimpleNamespace(
+        catalog=SimpleNamespace(get=lambda name: installed),
+        preview=None,
+    )
+    with pytest.raises(ValueError, match="cannot be shadowed"):
+        await manager.activate(session_key="A", turn_id="one", name="primary")
+
+
+async def test_installed_skill_without_runtime_fails_activation(tmp_path):
+    manager = _manager(tmp_path)
+    installed = _installed_manifest(tmp_path)
+
+    async def preview(_name):
+        raise ForgeSkillBindingError("no ready Forge Skill runtime is active")
+
+    manager.binding_resolver = SimpleNamespace(
+        catalog=SimpleNamespace(get=lambda name: installed),
+        preview=preview,
+    )
+    capability = SkillAccessCapability(manager)
+    registration, = capability.tool_registrations()
+    outcome = await registration.handler(
+        ToolCall("call", "activate_skill", {"name": "primary"}), _context()
+    )
+    assert outcome.status is ToolStatus.FAILED
+    assert "no ready Forge Skill runtime" in outcome.text
+    assert manager.current("cli:test", "turn-1") == ()
+
+
+async def test_workspace_only_activation_cannot_create_a_forge_task(tmp_path):
+    manager = _manager(tmp_path)
+    activation, _ = await manager.activate(
+        session_key="A", turn_id="one", name="primary"
+    )
+    assert activation.binding_candidate_id is None
+
+    coordinator = AgentTaskCoordinator(
+        workspace=tmp_path,
+        config=ForgeConfig(),
+        client=None,
+        binding_resolver=object(),
+        activation_manager=manager,
+    )
+    with pytest.raises(AgentTaskError, match="only an installed Forge Skill"):
+        await coordinator.create_task(
+            task_description="work",
+            verification=TaskVerificationContract(mode="off"),
+            activation_id=activation.activation_id,
+            origin_session_key="A",
+        )
 
 
 async def test_real_core_can_recover_from_historical_activation_id(tmp_path):

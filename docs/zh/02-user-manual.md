@@ -716,6 +716,8 @@ invocation。
 
 注册 Skill 与工作流匹配时，在第一次工作流工具调用前使用 `activate_skill(name, role)`。
 Skill 发现优先级为 workspace、已安装、内置；Runtime availability 参与激活资格判断。
+已安装 Skill 激活时会预览当前 Runtime，Runtime 未就绪则激活失败；workspace 的 `SKILL.md`
+可以覆盖文档正文，但不能覆盖已安装版本和 binding 身份。
 
 Experience 记录全部 Agent tool calls，并把 AgentTask、PlanRevision、invocation 引用、验证和
 显式 Skill activation 归入一个 episode。Scoped Lesson 只是建议，不能替代任务 criteria 或

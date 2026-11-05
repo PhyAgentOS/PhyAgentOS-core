@@ -123,9 +123,11 @@ Session；shared Session 可跨 task finalize 存续；runtime-owned Session 由
 
 ## 7. Binding、Identity 与关联
 
-`activate_skill` 读取已安装工作流并预览当前 Runtime。创建 task 时重新校验 candidate，冻结
-Skill 名称/版本、manifest 与工作流 hash、profile、Runtime instance、Gateway identity、所需
-ToolSpec hash 与 Node artifact ID。每次执行都复核 allowlist、semantics、readiness、ToolSpec hash
+`activate_skill` 读取解析后的工作流文档（workspace overlay 优先）并预览当前 Runtime；binding
+身份来自 installed bundle。workspace 的 `SKILL.md` 不需要自带 `skill.yaml`。installed bundle
+存在但没有健康 Runtime 时，激活会失败，不会返回不可用的 activation id。创建 task 时重新校验
+candidate，冻结 Skill 名称/版本、manifest 与工作流 hash、profile、Runtime instance、Gateway
+identity、所需 ToolSpec hash 与 Node artifact ID。每次执行都复核 allowlist、semantics、readiness、ToolSpec hash
 和 Runtime identity。
 
 | Identity | 所有者 | 含义 |

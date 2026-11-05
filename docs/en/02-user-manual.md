@@ -824,7 +824,9 @@ operator deliberately uses force.
 
 Use `activate_skill(name, role)` before the first workflow tool call when a registered Skill
 matches. Workspace, installed, and built-in Skills are discovered in that priority order. Runtime
-availability is part of activation eligibility.
+availability is part of activation eligibility. For an installed Skill, activation previews the
+current Runtime and fails if it is not ready; a workspace `SKILL.md` may override the document
+text but not the installed version or binding identity.
 
 Experience records all Agent tool calls and associates AgentTask, PlanRevisions, invocation
 references, verification, and explicit Skill activation with one episode. Scoped Lessons are

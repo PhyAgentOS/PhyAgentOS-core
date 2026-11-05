@@ -129,8 +129,11 @@ registered independently.
 
 ## 7. Binding, identity, and correlation
 
-`activate_skill` reads the installed workflow and previews the current Runtime. Task creation
-revalidates that candidate and freezes the Skill name/version, manifest and workflow hashes,
+`activate_skill` reads the resolved workflow document (workspace overlay first) and previews the
+current Runtime; the binding identity comes from the installed bundle. A workspace `SKILL.md`
+does not need its own `skill.yaml`. If an installed bundle exists but no healthy Runtime is ready,
+activation fails instead of returning an unusable activation id. Task creation revalidates that
+candidate and freezes the Skill name/version, manifest and workflow hashes,
 profile, Runtime instance, Gateway identity, required ToolSpec hashes and Node artifact IDs. Every
 task execution rechecks membership, semantics, readiness, ToolSpec hash, and Runtime identity.
 

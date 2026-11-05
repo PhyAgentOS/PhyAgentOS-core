@@ -20,6 +20,8 @@ ACTIVATE_SKILL = ToolDefinition(
     description=(
         "Read and activate a registered Skill for this turn before using its workflow. "
         "Returns the full document and a fresh activation_id for forge_task_create. "
+        "For an installed Skill, activation previews the current Runtime and fails if that "
+        "Runtime is not ready; a workspace SKILL.md may override the document text. "
         "Use one primary Skill and optional supporting Skills. Activation does not start a runtime."
     ),
     parameters={
@@ -79,6 +81,8 @@ class SkillAccessCapability:
             "Skills: call activate_skill before using a matching workflow. "
             "Only activation_ids returned in this turn are valid; historical ids are not authorization. "
             "For physical work activate a primary Skill, then create an AgentTask. "
+            "Only an installed Skill with a ready Runtime can create an AgentTask; "
+            "workspace and builtin documents are not bindable. "
             "Do not ask the user to supply activation ids. "
             "Independent read-only Forge calls may be issued together in one model step; "
             "Forge Actions and Sessions remain sequential. "

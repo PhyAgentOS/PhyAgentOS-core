@@ -188,7 +188,10 @@ downloaded Skill manifest before Node resolution rather than appended to the Reg
 
 `discover_active_runtime` reconciles persisted state, Dora flow, Gateway health, and required Tool
 contexts. Its availability provider flows through SkillsLoader, ExperienceCoordinator, and
-SkillActivationManager. Skill discovery order is workspace, installed, built-in.
+SkillActivationManager. Skill discovery order is workspace, installed, built-in. That order selects
+the document text only: Forge binding identity (version, manifest, and candidate) always comes from
+the installed bundle, so a workspace `SKILL.md` can overlay the workflow text without becoming a
+separate install source.
 
 ## 11. Experience and evolution integration
 
@@ -643,7 +646,11 @@ Run a single scheduler owner; this is not a multi-gateway exactly-once claim.
 belongs to one `session_id` and one `turn_id`; ids from an earlier turn, another session, or a
 previous process are rejected. Activation records are held in memory, so a restart requires
 activating again. One primary Skill and any number of supporting Skills are allowed in a turn.
-Activation reads the Skill document and does not start a Skill runtime.
+Activation reads the Skill document and does not start a Skill runtime. When an installed bundle
+exists, activation previews the current Runtime even if a workspace `SKILL.md` overlays the
+document; a workspace or builtin document without an installed bundle stays document-only and
+cannot create an AgentTask. If the installed bundle exists but no healthy Runtime is ready,
+activation fails before returning an activation id.
 
 ### What the Core path does not cover
 
