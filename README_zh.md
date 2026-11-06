@@ -137,7 +137,7 @@ Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`�
     }
   },
   "resourceRegistry": {
-    "url": "https://paos-resource-manager.dev.x-era.com"
+    "url": "https://paos-resource-platform.dev.x-era.com"
   }
 }
 ```

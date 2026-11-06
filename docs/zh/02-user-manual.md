@@ -294,7 +294,7 @@ docker compose run --rm phyagentos-cli agent --provider openai --model gpt-5 --r
       "associationQuality": "best_effort"
     }
   },
-  "resourceRegistry": {"url": "https://paos-resource-manager.dev.x-era.com"}
+  "resourceRegistry": {"url": "https://paos-resource-platform.dev.x-era.com"}
 }
 ```
 

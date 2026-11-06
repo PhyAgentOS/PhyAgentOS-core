@@ -44,7 +44,7 @@ a real environment. Keep this optional extension separate from default robot/Ski
 
 | JSON field | Type | Default | Constraint and meaning |
 |:-----------|:-----|:--------|:-----------------------|
-| `url` | string | `https://paos-resource-manager.dev.x-era.com` | HTTP(S) Resource Registry. `PAOS_RESOURCE_REGISTRY_URL` overrides it; an empty value permits only local bundles or an explicit static index. |
+| `url` | string | `https://paos-resource-platform.dev.x-era.com` | HTTP(S) Resource Registry. `PAOS_RESOURCE_REGISTRY_URL` overrides it; an empty value permits only local bundles or an explicit static index. |
 
 The Registry is queried only by explicit `paos skill search/install/update` or `paos forge-node
 install` commands. Starting PAOS never downloads a Skill.
@@ -258,7 +258,7 @@ must still be started explicitly.
     }
   },
   "resourceRegistry": {
-    "url": "https://paos-resource-manager.dev.x-era.com"
+    "url": "https://paos-resource-platform.dev.x-era.com"
   }
 }
 ```

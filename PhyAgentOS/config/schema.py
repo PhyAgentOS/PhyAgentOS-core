@@ -301,7 +301,7 @@ class ForgeConfig(Base):
     evidence: ForgeEvidenceConfig = Field(default_factory=ForgeEvidenceConfig)
     interaction: InteractionConfig = Field(default_factory=InteractionConfig)
 
-DEFAULT_RESOURCE_REGISTRY_URL = "https://paos-resource-manager.dev.x-era.com"
+DEFAULT_RESOURCE_REGISTRY_URL = "https://paos-resource-platform.dev.x-era.com"
 
 
 class ResourceRegistryConfig(Base):

@@ -137,7 +137,7 @@ The configuration file is serialized in camelCase; snake_case keys are also acce
     }
   },
   "resourceRegistry": {
-    "url": "https://paos-resource-manager.dev.x-era.com"
+    "url": "https://paos-resource-platform.dev.x-era.com"
   }
 }
 ```
