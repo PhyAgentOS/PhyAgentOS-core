@@ -162,6 +162,8 @@ You should receive a model response; `paos agent` opens an interactive conversat
 Need another provider or deployment option? See the [user manual](docs/en/02-user-manual.md) · [Docker](docs/user_manual/DOCKER.md).
 
 <a id="robot-skills"></a>
+New to embodied agents? Follow the [beginner simulation walkthrough](example/beginner-simulation/README.md) for conversational CLI use, an MP4 recording Node and an editable-node exercise ([Linux functional report](example/beginner-simulation/VALIDATION.md)).
+
 <a id="simulation-quickstart"></a>
 ## Quickstart · Control a robot in MuJoCo
 

@@ -161,6 +161,8 @@ paos agent
 其他模型服务与部署方式见 [用户手册](docs/zh/02-user-manual.md) · [Docker 部署](docs/user_manual/DOCKER_zh.md).
 
 <a id="robot-skills"></a>
+第一次接触具身 Agent？可按[新手仿真教程](example/beginner-simulation/README_zh.md)体验对话 CLI、MP4 录制节点及源码修改后重新接入（[Linux 功能报告](example/beginner-simulation/VALIDATION_zh.md)）。
+
 <a id="simulation-quickstart"></a>
 ## Quickstart · 在 MuJoCo 中操控机器人
 
