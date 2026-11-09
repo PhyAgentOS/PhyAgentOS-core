@@ -232,6 +232,21 @@ paos provider use opper --model claude-sonnet-4-6 --reasoning-effort none
 在已有会话中，依次执行 `/effort none`、`/provider opper`，然后执行 `/model <model-id>`。
 未设置 `providers.opper.defaultModel` 时，切换 Provider 会沿用原模型 ID。
 
+**[Standard Compute](https://standardcompute.com)**（`standardcompute`）使用相同的网关配置方式。在
+https://standardcompute.com 创建密钥，填入 `providers.standardcompute.apiKey`，或在启动时提供
+`STANDARDCOMPUTE_API_KEY` / `PAOS_STANDARDCOMPUTE_API_KEY`。默认地址为
+`https://api.stdcmpt.com/v1`。模型 ID 可以填写 `StandardCompute`，每个请求会被发送到能够处理它的、
+已启用的最便宜模型，并自动回退；也可以填写 `anthropic/claude-sonnet-5.5`、`openai/gpt-5.6-luna`
+这类固定模型 ID，完整列表见 `GET https://api.stdcmpt.com/v1/models`。
+本接入同样沿用 PAOS 对网关推理强度的保守校验，选择时请清除显式推理强度：
+
+```bash
+paos provider use standardcompute --model StandardCompute --reasoning-effort none
+```
+
+在已有会话中，依次执行 `/effort none`、`/provider standardcompute`，然后执行 `/model <model-id>`。
+未设置 `providers.standardcompute.defaultModel` 时，切换 Provider 会沿用原模型 ID。
+
 优先级为 **会话覆盖 → 进程启动参数 → 配置默认值**。每轮请求及其重试、工具调用固定使用
 开始时的 Provider、模型和思考程度。切换只影响同一会话的后续请求；其他会话、正在运行的
 子 Agent、Forge 任务、verification、evolution、记忆整理、Cron 和 Heartbeat 继续使用启动配置。
