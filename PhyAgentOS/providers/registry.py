@@ -257,6 +257,24 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # UberLLM: OpenAI-compatible gateway, model ids like "deepseek/deepseek-v4-flash".
+    # "custom_openai" sends the model id upstream unchanged, so the vendor prefix is kept.
+    ProviderSpec(
+        name="uberllm",
+        keywords=("uberllm",),
+        env_key="UBERLLM_API_KEY",
+        display_name="UberLLM",
+        litellm_prefix="custom_openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="uberllm.dev",
+        default_api_base="https://api.uberllm.dev/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(
