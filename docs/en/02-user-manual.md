@@ -246,6 +246,21 @@ In an existing session, run `/effort none`, then `/provider opper`, followed by
 `/model <model-id>`. Without `providers.opper.defaultModel`, switching providers retains the
 previous model ID.
 
+**[UberLLM](https://uberllm.dev)** (`uberllm`) uses the same gateway configuration. Create a key at
+https://uberllm.dev/signup and put it in `providers.uberllm.apiKey`, or supply `UBERLLM_API_KEY` /
+`PAOS_UBERLLM_API_KEY` at startup. The default endpoint is `https://api.uberllm.dev/v1`. Model IDs
+keep their vendor prefix, such as `deepseek/deepseek-v4-flash` or `anthropic/claude-sonnet-4.6`; the
+current list and prices are at https://uberllm.dev/models. This integration also uses PAOS's
+conservative gateway effort validation, so clear any explicit reasoning effort when selecting it:
+
+```bash
+paos provider use uberllm --model deepseek/deepseek-v4-flash --reasoning-effort none
+```
+
+In an existing session, run `/effort none`, then `/provider uberllm`, followed by
+`/model <model-id>`. Without `providers.uberllm.defaultModel`, switching providers retains the
+previous model ID.
+
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
 session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.
