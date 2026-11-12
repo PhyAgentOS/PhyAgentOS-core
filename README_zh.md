@@ -161,6 +161,8 @@ paos agent
 其他模型服务与部署方式见 [用户手册](docs/zh/02-user-manual.md) · [Docker 部署](docs/user_manual/DOCKER_zh.md).
 
 <a id="robot-skills"></a>
+第一次接触具身 Agent？可按[新手仿真教程](example/beginner-simulation/README_zh.md)体验对话 CLI、MP4 录制节点及源码修改后重新接入（[Linux 功能报告](example/beginner-simulation/VALIDATION_zh.md)）。
+
 <a id="simulation-quickstart"></a>
 ## Quickstart · 在 MuJoCo 中操控机器人
 
@@ -265,6 +267,12 @@ paos agent -m "使用 robot-control-sim 的 mujoco-piper。 \
 ```bash
 paos skill stop robot-control-sim
 ```
+
+普通停止会先根据配置的工作区恢复保留的执行引用。
+也可使用 `paos skill reconcile robot-control-sim --workspace /path/to/workspace` 显式重试恢复。
+无法确认终态的动作仍受保护；`--force` 表示明确授权终止 runtime。
+每轮 runtime 使用独立的 Dora flow 名称，可通过 `paos skill status` 查看。
+平台限制见[运行恢复与进程归属](docs/user_development_guide/track_b/RUNTIME_zh.md#运行恢复与进程归属)。
 
 ### 在此基础上二次开发
 

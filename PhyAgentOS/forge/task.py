@@ -303,6 +303,22 @@ class AgentTaskStore:
                     return task, record
         return None
 
+    def bound_tasks(self, binding_ids: set[str]) -> list[AgentTaskRecord]:
+        """Read only tasks still referenced by this runtime, including terminal tasks."""
+        records = []
+        identities = sorted(binding_ids)
+        with self._lock, self._connection() as connection:
+            for offset in range(0, len(identities), 400):
+                batch = identities[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    "SELECT record_json FROM agent_tasks WHERE "
+                    "json_extract(record_json, '$.primary_skill_binding.binding_id') "
+                    f"IN ({placeholders})", batch,
+                ).fetchall()
+                records.extend(AgentTaskRecord.model_validate_json(row["record_json"]) for row in rows)
+        return records
+
     def has_event(self, task_id: str, event_type: str) -> bool:
         with self._connection() as connection:
             return connection.execute(
@@ -1071,16 +1087,45 @@ class AgentTaskCoordinator:
         """Repair local execution facts from Gateway GETs without redispatching POSTs."""
         if self.interaction.supervisor is not None:
             await self.interaction.supervisor.recover()
+        if self.binding_resolver is not None:
+            runtime = self.binding_resolver.runtime_registry.current()
+            states = getattr(getattr(runtime, "invocation_ids", None), "store", None)
+            if states is not None:
+                from PhyAgentOS.forge.reconciliation import reconcile_runtime_references
+                report = await reconcile_runtime_references(
+                    runtime.skill_name, states=states, tasks=self.store, client=runtime.client,
+                )
+                for reason in report.unresolved:
+                    logger.warning("Runtime reconciliation: {}", reason)
+                # Persistent Runtime recovery is wholly owned by the identity-
+                # checked, lifecycle-locked service. Never fall through to a
+                # second writer after a busy lock or a binding mismatch.
+                try:
+                    return self.store.active()
+                except Exception as exc:
+                    logger.warning("Cannot read active task after reconciliation: {}", exc)
+                    return None
         task = self.store.active()
         if task is not None and self.interaction.managed(task.task_id):
             return task
         if task is None:
             return None
         binding = task.primary_skill_binding
+        if binding is not None and self.binding_resolver is not None:
+            runtime = self.binding_resolver.runtime_registry.current()
+            if runtime is None or (
+                runtime.runtime_instance_id != binding.runtime_instance_id
+                or runtime.gateway_identity != binding.gateway_identity
+                or runtime.gateway_url != binding.gateway_url
+                or runtime.skill_name != binding.skill_name
+                or runtime.profile != binding.runtime_profile
+            ):
+                logger.warning("Task {} retains a binding to a different Runtime", task.task_id)
+                return task
         if binding is not None and self.runtime_task_binding_ids is not None:
             self.runtime_task_binding_ids.add(binding.binding_id)
         for record in task.execution_records:
-            if record.terminal or record.semantics == "query":
+            if (record.terminal and record.status != "unknown") or record.semantics == "query":
                 continue
             if not record.invocation_id:
                 self._finish_execution(

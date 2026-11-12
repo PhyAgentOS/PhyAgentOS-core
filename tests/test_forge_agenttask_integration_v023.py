@@ -668,6 +668,7 @@ def test_force_stop_attempts_remote_controls_and_audits_unknown_effects(
 
     monkeypatch.setattr(manager, "_request_gateway_control", control)
     monkeypatch.setattr(manager, "_stop_flow", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(manager, "_flow_running", lambda *_args: False)
 
     stopped = manager.stop("runtime-skill", force=True)
 

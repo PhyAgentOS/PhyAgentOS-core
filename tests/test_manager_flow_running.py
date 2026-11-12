@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from PhyAgentOS.skill_runtime.manager import RuntimeManager
+import pytest
+
+from PhyAgentOS.skill_runtime.manager import RuntimeManager, RuntimeManagerError
 
 FLOW = "paos-libero-lingbot_va"
 
@@ -49,6 +51,17 @@ def test_wrong_name_is_not_active() -> None:
     assert RuntimeManager._has_active_flow(flows, FLOW) is False
 
 
-def test_empty_and_garbage() -> None:
-    assert RuntimeManager._has_active_flow(RuntimeManager._parse_flow_list(""), FLOW) is False
-    assert RuntimeManager._has_active_flow(RuntimeManager._parse_flow_list("not json"), FLOW) is False
+@pytest.mark.parametrize("text", ["not json", "{}", '[{"name":"x"}]', ACTIVE + 'garbage'])
+def test_unobservable_state_is_not_treated_as_stopped(text) -> None:
+    with pytest.raises(RuntimeManagerError, match="Cannot confirm"):
+        RuntimeManager._parse_flow_list(text)
+
+
+def test_empty_json_array_proves_no_flow() -> None:
+    assert RuntimeManager._parse_flow_list("[]") == []
+    assert RuntimeManager._parse_flow_list("") == []  # Dora 0.4.1 empty NDJSON
+
+
+def test_unknown_status_does_not_prove_termination() -> None:
+    with pytest.raises(RuntimeManagerError, match="unrecognized Dora status"):
+        RuntimeManager._has_active_flow([{"name": FLOW, "status": "Unknown"}], FLOW)

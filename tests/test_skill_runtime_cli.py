@@ -21,6 +21,7 @@ def test_skill_command_exposes_runtime_lifecycle_commands() -> None:
         "status",
         "logs",
         "stop",
+        "reconcile",
         "search",
         "install",
         "update",
@@ -44,3 +45,20 @@ def test_skill_distribution_commands_accept_static_index(force_color: str | None
         result = runner.invoke(app, ["skill", command, "--help"])
         assert result.exit_code == 0
         assert "--index" in unstyle(result.stdout)
+
+
+def test_reconcile_reports_unresolved_references_and_workspace(tmp_path, monkeypatch):
+    from PhyAgentOS.cli import commands
+    from PhyAgentOS.forge.reconciliation import ReconciliationReport
+
+    calls = []
+
+    def reconcile(skill, workspace):
+        calls.append((skill, workspace))
+        return ReconciliationReport(unresolved=["action-one: remote state is unknown"])
+
+    monkeypatch.setattr(commands, "_reconcile_skill_references", reconcile)
+    result = CliRunner().invoke(app, ["skill", "reconcile", "demo", "--workspace", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "remote state is unknown" in result.stdout
+    assert calls == [("demo", tmp_path)]

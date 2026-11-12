@@ -28,6 +28,7 @@ from PhyAgentOS.skill_runtime.manifest import (
     RuntimeProfile,
     SkillManifest,
 )
+from PhyAgentOS.skill_runtime.processes import RUNTIME_MARKER, RuntimeProcessTracker
 from PhyAgentOS.skill_runtime.state import RuntimeState, RuntimeStateStore, utc_now
 
 
@@ -109,9 +110,24 @@ class RuntimeManager:
             and previous.profile == profile_name
             and previous.status in {"starting", "running"}
         ):
-            report = self.status(skill_name)
-            if report.ready:
-                return report.state  # type: ignore[return-value]
+            try:
+                report = self.status(skill_name)
+            except RuntimeManagerError as exc:
+                # A reboot leaves the old state saying "running" while no Dora
+                # coordinator exists, so readiness cannot be observed. Start
+                # must still proceed: it brings the coordinator up itself.
+                self._log(skill_name, f"cannot observe previous Runtime: {self._safe_error(exc)}")
+            else:
+                if report.ready:
+                    return report.state  # type: ignore[return-value]
+
+        if previous is not None:
+            remnants = RuntimeProcessTracker(self.state_store.root, previous.runtime_instance_id).snapshot()
+            if remnants or previous.active_invocations or previous.active_sessions or previous.active_task_bindings:
+                raise RuntimeManagerError(
+                    "Previous Runtime still owns processes or execution references; "
+                    "run skill reconcile or skill stop --force before starting a new generation"
+                )
 
         try:
             binary_root = self.environment_builder.prepare(manifest, profile_name)
@@ -119,6 +135,13 @@ class RuntimeManager:
             raise RuntimeManagerError(str(exc)) from exc
         self.runtime_root = binary_root
         self._preflight(manifest, profile, binary_root)
+        if previous is not None:
+            # Restore observation on a cold host, then strictly recheck. A failed
+            # query is not evidence that the previous generation has exited.
+            # Keep its state intact until this check succeeds.
+            self._ensure_dora_up(manifest, profile, binary_root)
+            if self._flow_running(previous.flow_name):
+                raise RuntimeManagerError("Previous Dora flow is still running; stop it before restarting")
         if self._gateway_snapshot(manifest) is not None:
             raise RuntimeManagerError(
                 f"Gateway address {manifest.gateway_url} is already in use; "
@@ -133,6 +156,9 @@ class RuntimeManager:
             gateway_url=manifest.gateway_url,
             started_at=utc_now(),
         )
+        # Rollback must never address another generation by a reusable name.
+        flow_name = f"{flow_name}-{starting.runtime_instance_id}"
+        starting = replace(starting, flow_name=flow_name)
         self.state_store.save(starting)
         self._log(skill_name, f"starting profile={profile_name} flow={flow_name}")
         launched = False
@@ -157,12 +183,22 @@ class RuntimeManager:
             starting = replace(starting, gateway_identity=identity)
             running = starting.with_status("running")
             self.state_store.save(running)
+            RuntimeProcessTracker(self.state_store.root, running.runtime_instance_id).snapshot()
             self._log(skill_name, "runtime ready")
             return running
         except Exception as exc:
             message = self._safe_error(exc)
             if launched:
-                self._stop_flow(flow_name, force=True, check=False)
+                try:
+                    self._stop_flow(flow_name, force=True, check=False)
+                except Exception as cleanup_error:
+                    message += f"; rollback: {self._safe_error(cleanup_error)}"
+                try:
+                    remaining = RuntimeProcessTracker(self.state_store.root, starting.runtime_instance_id).terminate()
+                    if remaining:
+                        message += f"; rollback left node PIDs {sorted(remaining)}"
+                except Exception as cleanup_error:
+                    message += f"; process cleanup: {self._safe_error(cleanup_error)}"
             failed = starting.with_status("failed", error=message)
             self.state_store.save(failed)
             self._log(skill_name, f"startup failed: {message}")
@@ -206,7 +242,10 @@ class RuntimeManager:
         reconciled = state
         if live_ready and state.status in {"starting", "running", "failed"}:
             reconciled = state.with_status("running")
-        elif state.status == "stopping" and not flow_running:
+        elif (
+            state.status == "stopping" and not flow_running
+            and not RuntimeProcessTracker(self.state_store.root, state.runtime_instance_id).snapshot()
+        ):
             reconciled = state.with_status(
                 "stopped", active_invocations=(), active_sessions=(), active_task_bindings=()
             )
@@ -240,8 +279,8 @@ class RuntimeManager:
         state = self.state_store.load(skill_name)
         if state is None:
             raise RuntimeManagerError(f"Skill {skill_name!r} has no runtime state")
-        if state.status == "stopped" and not self._flow_running(state.flow_name):
-            return state
+        processes = RuntimeProcessTracker(self.state_store.root, state.runtime_instance_id)
+        processes.snapshot()
         active_refs = (
             list(state.active_invocations)
             + list(state.active_sessions)
@@ -282,7 +321,23 @@ class RuntimeManager:
         self.state_store.save(stopping)
         self._log(skill_name, f"stopping flow={state.flow_name} force={force}")
         try:
-            self._stop_flow(state.flow_name, force=force)
+            try:
+                self._stop_flow(state.flow_name, force=force)
+            except RuntimeManagerError:
+                if not force:
+                    raise
+                # --force still owns cleanup if the CLI times out waiting for
+                # stdout held open by a detached descendant. Verify afterwards.
+            remaining = processes.terminate() if force else processes.snapshot()
+            if remaining:
+                raise RuntimeManagerError(
+                    f"Runtime node PIDs still alive: {sorted(remaining)}; "
+                    "references retained; use --force for explicit process cleanup"
+                )
+            self._wait_until_stopped(state.flow_name)
+            remaining = processes.snapshot()
+            if remaining:
+                raise RuntimeManagerError(f"Runtime node PIDs still alive after flow exit: {sorted(remaining)}")
         except Exception as exc:
             message = self._safe_error(exc)
             failed = stopping.with_status("failed", error=message)
@@ -450,6 +505,15 @@ class RuntimeManager:
         dora = shutil.which("dora")
         assert dora is not None
         dataflow = self._launch_dataflow(binary_root, profile)
+        state = self.state_store.load(skill.name)
+        if state is None:
+            raise RuntimeManagerError("Runtime state is missing before launch")
+        # The shared daemon, not the CLI, spawns nodes. Bind ownership in each
+        # node's rendered environment so detached descendants inherit it too.
+        from PhyAgentOS.skill_runtime.installer import _inject_node_environment
+        dataflow.write_text(_inject_node_environment(
+            dataflow.read_text(), {}, {RUNTIME_MARKER: state.runtime_instance_id},
+        ))
         env = {
             **os.environ,
             **profile.environment,
@@ -485,20 +549,27 @@ class RuntimeManager:
             raise RuntimeManagerError("dora is not installed or not available on PATH")
         command = [dora, "stop", "--name", flow_name]
         command.extend(["--force"] if force else ["--grace-duration", "5s"])
-        result = self._run(command, cwd=self.runtime_root, timeout=15)
-        if check and result.returncode != 0 and self._flow_running(flow_name):
-            raise RuntimeManagerError("dora stop failed and the flow is still running")
+        self._run(command, cwd=self.runtime_root, timeout=15)
+        if check:
+            self._wait_until_stopped(flow_name)
+
+    def _wait_until_stopped(self, flow_name: str) -> None:
+        deadline = time.monotonic() + min(self.health_timeout_s, 3.0)
+        while self._flow_running(flow_name):
+            if time.monotonic() >= deadline:
+                raise RuntimeManagerError("Dora flow is still running after stop; references retained")
+            time.sleep(max(0.05, self.poll_interval_s))
 
     def _flow_running(self, flow_name: str) -> bool:
         dora = shutil.which("dora")
         if dora is None:
-            return False
+            raise RuntimeManagerError("Cannot confirm Runtime state: dora is not available on PATH")
         result = self._run(
             [dora, "list", "--format", "json", "--name", flow_name],
             timeout=5,
         )
         if result.returncode != 0:
-            return False
+            raise RuntimeManagerError("Cannot confirm Runtime state: dora list failed")
         return self._has_active_flow(
             self._parse_flow_list(result.stdout or ""), flow_name
         )
@@ -512,14 +583,20 @@ class RuntimeManager:
         """
         text = (output or "").strip()
         if not text:
+            # Dora 0.4.1 emits NDJSON, including zero lines for no matching
+            # flows. _flow_running accepts this only after a zero CLI exit.
             return []
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
             data = None
         if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
+            if not all(isinstance(item, dict) and isinstance(item.get("status"), str) for item in data):
+                raise RuntimeManagerError("Cannot confirm Runtime state: invalid dora list entries")
+            return data
         if isinstance(data, dict):
+            if not isinstance(data.get("status"), str):
+                raise RuntimeManagerError("Cannot confirm Runtime state: invalid dora list entry")
             return [data]
         entries: list[dict[str, Any]] = []
         for line in text.splitlines():
@@ -528,10 +605,11 @@ class RuntimeManager:
                 continue
             try:
                 item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict):
-                entries.append(item)
+            except json.JSONDecodeError as exc:
+                raise RuntimeManagerError("Cannot confirm Runtime state: invalid dora list JSON") from exc
+            if not isinstance(item, dict) or not isinstance(item.get("status"), str):
+                raise RuntimeManagerError("Cannot confirm Runtime state: invalid dora list entry")
+            entries.append(item)
         return entries
 
     @staticmethod
@@ -546,8 +624,11 @@ class RuntimeManager:
         for item in flows:
             if item.get("name") not in {None, flow_name}:
                 continue
-            if str(item.get("status", "")).lower() == "running":
+            status = str(item.get("status", "")).lower()
+            if status in {"running", "starting", "stopping", "building"}:
                 running.append(item)
+            elif status not in {"finished", "failed", "succeeded", "stopped"}:
+                raise RuntimeManagerError(f"Cannot confirm Runtime state: unrecognized Dora status {status!r}")
         if not running:
             return False
         with_nodes = [item for item in running if item.get("nodes") not in (None, 0)]

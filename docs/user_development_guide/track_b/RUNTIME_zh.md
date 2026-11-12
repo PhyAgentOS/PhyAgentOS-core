@@ -133,6 +133,36 @@ Task、Runtime、Gateway 和 provider 的身份不能互相替代；provider 重
 [RuntimeState](../../../PhyAgentOS/skill_runtime/state.py)、
 [任务绑定](../../../PhyAgentOS/forge/binding.py)。
 
+### 运行恢复与进程归属
+
+`paos skill reconcile <name> [--workspace /path/to/workspace]` 通过 Gateway GET
+恢复保留的 Action/Session 引用，也检查已结束任务中的 `unknown` 执行记录。
+恢复会核对冻结的 Runtime 与 Gateway 身份，补录执行事实而不改变任务原有结论；
+只有任务已结束且所有远端执行均确认终态，才释放任务绑定。
+Agent 启动复用相同恢复逻辑；普通 `skill stop` 在检查活跃引用前也会重试恢复。
+Gateway 不可达、身份变更、缺少任务日志或远端状态未知时保留引用，恢复过程不发送控制 POST。
+生命周期锁被占用或 Runtime 状态缺失时同样记为「保留」而不抛错：恢复不得阻断
+Agent 启动，也不得阻断非强制的停止。由 interaction 管理的任务仍由其 supervisor 负责恢复。
+
+停止命令返回后还会确认 Dora flow 已退出。缺少 Dora、查询失败和 JSON 损坏都属于
+无法观测，不能证明执行已结束。`skill stop --force` 会额外对属于该轮 Runtime 的
+Linux 进程执行 TERM/KILL，确认退出后再清理引用，不关闭共享 Dora 服务。
+验证失败时保留引用并报错；新一轮 Runtime 不能覆盖尚未释放的引用或已知存活进程，
+冷机上 `start` 会先恢复 coordinator，再严格确认旧 flow 已退出，才替换旧状态；
+仍无法观测时保留旧状态并报错。每轮新 flow 使用独立名称，回滚仅操作本次启动。
+持久化 Agent 恢复与 CLI 共用持锁的对账路径，锁被占用或 Runtime 身份不匹配时，
+不会再进入另一条引用写入路径。
+
+新启动的节点通过 dataflow 环境接收 `PAOS_RUNTIME_INSTANCE_ID`，由共享 daemon
+创建的节点也会携带此标识。Linux 会发现同用户且携带该精确标识的进程，记录
+boot/PID/启动时间，并通过 pidfd 清理，覆盖脱离进程组的子进程并避免 PID 复用误杀。
+缺少 pidfd API，或内核返回 `ENOSYS` / `EOPNOTSUPP` 时，会在重新核对启动时间后
+回退到 `kill`；权限错误仍明确报错。
+节点应向子进程保留标识，启动脚本尽量 `exec` 最终程序。
+这是协作式跟踪，不是 cgroup 隔离：在发现前移除标识或无法读取环境的子进程可能无法识别。
+升级前的进程没有标识，需要人工检查并停止；其他平台仅验证 Dora flow 退出。
+更强的 Linux 隔离需要在 daemon 创建节点的位置建立每个 flow 的 cgroup，不能只包装 CLI。
+
 ## 4. robot-control-sim 的实际组装
 
 ### 4.1 从哪几个文件读出运行关系

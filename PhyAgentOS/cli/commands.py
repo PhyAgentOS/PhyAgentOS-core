@@ -1384,6 +1384,39 @@ def skill_logs(
         console.print("[dim]No lifecycle logs recorded.[/dim]")
 
 
+def _reconcile_skill_references(skill_name: str, workspace: Path | None = None):
+    from PhyAgentOS.config.loader import load_config
+    from PhyAgentOS.forge.reconciliation import reconcile_runtime_references
+    from PhyAgentOS.forge.task import AgentTaskStore
+    from PhyAgentOS.skill_runtime.state import RuntimeStateStore
+
+    return asyncio.run(reconcile_runtime_references(
+        skill_name, states=RuntimeStateStore(),
+        tasks=AgentTaskStore(workspace or load_config().workspace_path),
+    ))
+
+
+@skill_app.command("reconcile")
+def skill_reconcile(
+    skill_name: str = typer.Argument(..., help="Installed Skill name"),
+    workspace: Path | None = typer.Option(None, "--workspace", help="Workspace that owns the task journal"),
+):
+    """Recover retained Action/Session references using Gateway GETs only."""
+    try:
+        report = _reconcile_skill_references(skill_name, workspace)
+    except Exception as error:
+        _skill_runtime_error(error)
+        return
+    console.print(
+        f"Released: {len(report.released_invocations)} invocations, "
+        f"{len(report.released_sessions)} Sessions, {len(report.released_bindings)} task bindings"
+    )
+    for reason in report.unresolved:
+        console.print(f"Retained: {reason}", markup=False)
+    if report.unresolved:
+        raise typer.Exit(1)
+
+
 @skill_app.command("stop")
 def skill_stop(
     skill_name: str = typer.Argument(..., help="Installed Skill name"),
@@ -1392,11 +1425,26 @@ def skill_stop(
         "--force",
         help="Force-stop despite active invocations, Sessions, or task bindings",
     ),
+    workspace: Path | None = typer.Option(None, "--workspace", help="Workspace that owns the task journal"),
 ):
     """Stop a managed Skill dataflow without shutting down shared Dora services."""
     from PhyAgentOS.skill_runtime.manager import RuntimeManager
+    from PhyAgentOS.skill_runtime.state import RuntimeStateStore
 
     try:
+        current = RuntimeStateStore().load(skill_name)
+        if not force and current is not None and (
+            current.active_invocations or current.active_sessions or current.active_task_bindings
+        ):
+            try:
+                report = _reconcile_skill_references(skill_name, workspace)
+            except Exception as error:  # noqa: BLE001 - recovery must not block stop
+                console.print(
+                    f"Retained: reconciliation failed: {error}", markup=False
+                )
+            else:
+                for reason in report.unresolved:
+                    console.print(f"Retained: {reason}", markup=False)
         state = RuntimeManager().stop(skill_name, force=force)
     except Exception as error:
         _skill_runtime_error(error)

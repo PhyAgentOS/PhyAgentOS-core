@@ -71,9 +71,7 @@ def _setup(tmp_path: Path) -> tuple[SkillCatalog, Path, Path, RuntimeStateStore]
             },
         },
     }
-    (bundle / "skill.yaml").write_text(
-        yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8"
-    )
+    (bundle / "skill.yaml").write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
 
     runtime = tmp_path / "runtime"
     states = RuntimeStateStore(tmp_path / "state")
@@ -135,7 +133,7 @@ def test_start_uses_named_attached_launcher_for_relative_mujoco_dataflow(
     assert start_command[1:] == [
         "start",
         "--name",
-        "paos-move-arm-by-ee-mujoco",
+        state.flow_name,
         "dataflow.yaml",
     ]
     assert cwd == manager.runtime_root.parent / "launch" / "profiles" / "mujoco"
@@ -146,11 +144,13 @@ def test_start_uses_named_attached_launcher_for_relative_mujoco_dataflow(
     rendered = (cwd / "dataflow.yaml").read_text()
     assert "${FORGE_RUNTIME_BIN}" not in rendered
     assert f"path: {manager.runtime_root}/gateway" in rendered
+    assert (
+        yaml.safe_load(rendered)["nodes"][0]["env"]["PAOS_RUNTIME_INSTANCE_ID"]
+        == state.runtime_instance_id
+    )
 
 
-def test_start_is_idempotent_when_live_runtime_is_ready(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_start_is_idempotent_when_live_runtime_is_ready(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     state = RuntimeState(
         skill_name="move-arm-by-ee",
@@ -193,9 +193,7 @@ def test_status_marks_stale_running_state_failed(tmp_path: Path, monkeypatch) ->
     assert "Dora flow is not running" in (report.state.last_error or "")
 
 
-def test_start_failure_rolls_back_flow_and_persists_diagnostic(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_start_failure_rolls_back_flow_and_persists_diagnostic(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     stopped: list[tuple[str, bool, bool]] = []
     monkeypatch.setattr("shutil.which", lambda name: "dora")
@@ -223,7 +221,8 @@ def test_start_failure_rolls_back_flow_and_persists_diagnostic(
     assert state is not None
     assert state.status == "failed"
     assert state.last_error == "dora start failed"
-    assert stopped == [("paos-move-arm-by-ee-mujoco", True, False)]
+    assert stopped == [(state.flow_name, True, False)]
+    assert state.flow_name.endswith(state.runtime_instance_id)
 
 
 def test_stop_refuses_nonterminal_invocations_without_force(tmp_path: Path) -> None:
@@ -241,6 +240,68 @@ def test_stop_refuses_nonterminal_invocations_without_force(tmp_path: Path) -> N
 
     with pytest.raises(RuntimeManagerError, match="non-terminal"):
         manager.stop("move-arm-by-ee")
+
+
+def _previous_generation(manager: RuntimeManager, status: str = "stopped") -> None:
+    manager.state_store.save(
+        RuntimeState(
+            skill_name="move-arm-by-ee",
+            profile="mujoco",
+            status=status,
+            flow_name="paos-move-arm-by-ee-mujoco",
+            gateway_url="http://127.0.0.1:19002",
+        )
+    )
+
+
+@pytest.mark.parametrize("after_boot", ["absent", "live", "error"])
+def test_start_restores_observation_before_replacing_previous_generation(
+    tmp_path, monkeypatch, after_boot
+):
+    manager = _manager(tmp_path)
+    _previous_generation(manager, status="running")
+    old = manager.state_store.load("move-arm-by-ee")
+    ready = False
+    stops = []
+    monkeypatch.setattr("shutil.which", lambda name: "dora")
+    monkeypatch.setattr(
+        manager, "_run", lambda command, **kw: subprocess.CompletedProcess(command, 0, "", "")
+    )
+    monkeypatch.setattr(manager, "_gateway_snapshot", lambda manifest: None)
+
+    def ensure(*args):
+        nonlocal ready
+        ready = True
+
+    def observe(flow):
+        if not ready or after_boot == "error":
+            raise RuntimeManagerError("Cannot confirm Runtime state: dora list failed")
+        return after_boot == "live"
+
+    monkeypatch.setattr(manager, "_ensure_dora_up", ensure)
+    monkeypatch.setattr(manager, "_flow_running", observe)
+    monkeypatch.setattr(manager, "_stop_flow", lambda flow, **kw: stops.append(flow))
+    monkeypatch.setattr(
+        manager,
+        "_start_flow",
+        lambda *args: (_ for _ in ()).throw(RuntimeManagerError("reached launch")),
+    )
+    expected = {
+        "absent": "reached launch",
+        "live": "Previous Dora flow",
+        "error": "Cannot confirm",
+    }[after_boot]
+    with pytest.raises(RuntimeManagerError, match=expected):
+        manager.start("move-arm-by-ee", "mujoco")
+    assert ready
+    current = manager.state_store.load("move-arm-by-ee")
+    if after_boot == "absent":
+        assert current.flow_name != old.flow_name
+        assert current.flow_name.endswith(current.runtime_instance_id)
+        assert stops == [current.flow_name]
+    else:
+        assert current == old
+        assert not stops
 
 
 def test_start_rejects_node_that_does_not_match_lock(tmp_path: Path) -> None:
@@ -265,9 +326,7 @@ def test_status_checks_the_profile_tool_list(tmp_path: Path, monkeypatch) -> Non
     bundle = manager.catalog.root / "move-arm-by-ee"
     data = yaml.safe_load((bundle / "skill.yaml").read_text())
     data["profiles"]["mujoco"]["required_tools"] = ["motion.move_pose"]
-    (bundle / "skill.yaml").write_text(
-        yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
-    )
+    (bundle / "skill.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     manager.state_store.save(
         RuntimeState(
             skill_name="move-arm-by-ee",
@@ -294,9 +353,7 @@ def test_status_checks_the_profile_tool_list(tmp_path: Path, monkeypatch) -> Non
     assert report.ready is True
 
 
-def test_status_reports_profile_missing_from_installed_bundle(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_status_reports_profile_missing_from_installed_bundle(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     manager.state_store.save(
         RuntimeState(
