@@ -257,6 +257,24 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # Runcrate: OpenAI-compatible inference API, ids like "deepseek-ai/DeepSeek-V4.1-Flash".
+    # "custom_openai" sends the model id upstream unchanged, so the vendor prefix is kept.
+    ProviderSpec(
+        name="runcrate",
+        keywords=("runcrate",),
+        env_key="RUNCRATE_API_KEY",
+        display_name="Runcrate",
+        litellm_prefix="custom_openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="runcrate.ai",
+        default_api_base="https://api.runcrate.ai/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(

@@ -246,6 +246,22 @@ In an existing session, run `/effort none`, then `/provider opper`, followed by
 `/model <model-id>`. Without `providers.opper.defaultModel`, switching providers retains the
 previous model ID.
 
+**[Runcrate](https://www.runcrate.ai)** (`runcrate`) uses the same gateway configuration. Create a
+key at https://www.runcrate.ai/dashboard/api-keys and put it in `providers.runcrate.apiKey`, or
+supply `RUNCRATE_API_KEY` / `PAOS_RUNCRATE_API_KEY` at startup. The default endpoint is
+`https://api.runcrate.ai/v1`. Model IDs keep their vendor prefix, such as
+`deepseek-ai/DeepSeek-V4.1-Flash` or `zai-org/GLM-5.3`; the full list is at
+https://www.runcrate.ai/inference/pricing. This integration also uses PAOS's conservative gateway
+effort validation, so clear any explicit reasoning effort when selecting it:
+
+```bash
+paos provider use runcrate --model deepseek-ai/DeepSeek-V4.1-Flash --reasoning-effort none
+```
+
+In an existing session, run `/effort none`, then `/provider runcrate`, followed by
+`/model <model-id>`. Without `providers.runcrate.defaultModel`, switching providers retains the
+previous model ID.
+
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
 session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.
