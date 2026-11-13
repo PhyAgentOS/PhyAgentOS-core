@@ -430,6 +430,7 @@ class ProvidersConfig(Base):
     cheaperinference: ProviderConfig = Field(default_factory=ProviderConfig)  # Cheaper Inference
     api_route: ProviderConfig = Field(default_factory=ProviderConfig)  # API Route gateway
     opper: ProviderConfig = Field(default_factory=ProviderConfig)  # Opper gateway
+    standardcompute: ProviderConfig = Field(default_factory=ProviderConfig)  # Standard Compute gateway
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 

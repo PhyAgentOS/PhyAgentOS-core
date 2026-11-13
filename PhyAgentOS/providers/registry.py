@@ -257,6 +257,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         strip_model_prefix=False,
         model_overrides=(),
     ),
+    # Standard Compute: OpenAI-compatible gateway. The default model id "StandardCompute"
+    # is routed per request; pinned ids such as "anthropic/claude-sonnet-5.5" keep their
+    # vendor prefix because "custom_openai" sends the model id upstream unchanged.
+    ProviderSpec(
+        name="standardcompute",
+        keywords=("standardcompute",),
+        env_key="STANDARDCOMPUTE_API_KEY",
+        display_name="Standard Compute",
+        litellm_prefix="custom_openai",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="stdcmpt.com",
+        default_api_base="https://api.stdcmpt.com/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
     ProviderSpec(
