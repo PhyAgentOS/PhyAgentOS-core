@@ -308,7 +308,9 @@ class LiteLLMProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
 
-        reasoning_content = getattr(message, "reasoning_content", None) or None
+        # Keep "" as well: DeepSeek thinking mode rejects later requests in a
+        # tool-call turn whose assistant message omits reasoning_content.
+        reasoning_content = getattr(message, "reasoning_content", None)
         thinking_blocks = getattr(message, "thinking_blocks", None) or None
 
         return LLMResponse(
