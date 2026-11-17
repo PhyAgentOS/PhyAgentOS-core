@@ -466,6 +466,7 @@ evidence。Evolution fail-open，反思错误不会改变执行或验证。
 
 | 现象 | 检查项 |
 |:-----|:-------|
+| 设置了代理后，Provider 配置或测试报 `Endpoint configuration error`，或 httpx 报 `Invalid port`、`Invalid IDNA hostname`、`Unknown scheme for proxy URL` | httpx 0.28.1 及更早版本无法解析部分代理环境变量的写法。`paos` 启动时只在当前进程内改写这些值，系统设置不变：`socks://` 改为 `socks5://`；`NO_PROXY` 中带方括号的 IPv6（如 `[::1]`）去掉方括号；`/128` 单地址网段（如 `::1/128`）改为该地址；更大的 IPv6 网段（如 `fd00::/8`）和非 ASCII 域名被删除，发往这些地址的请求改走代理。变量名不区分大小写，`NO_PROXY` 也接受 `;` 分隔。直接导入 PhyAgentOS 的脚本需自行修改这些环境变量。 |
 | Tool 不存在或未就绪 | 运行 `forge_tool_context`，检查 ToolSpec、binding、Endpoint 与 Runtime profile。 |
 | Skill 无法安装 | 确认 Skill Bundle 元数据包含 size、SHA-256，每个 Node lock 包含 SHA-256，且 Registry/index Node 能解析为具有明确大小的直接下载。 |
 | Skill 无法启动 | 运行 `paos skill status` 与 `logs`，检查 Dora、dataflow、assets、nodes 和 Gateway `/tools`。 |
