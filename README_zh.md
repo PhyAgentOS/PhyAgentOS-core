@@ -137,7 +137,7 @@ Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`�
     }
   },
   "resourceRegistry": {
-    "url": "https://paos-resource-manager.dev.x-era.com"
+    "url": "https://paos-resource-platform.dev.x-era.com"
   }
 }
 ```
@@ -147,6 +147,31 @@ Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`�
 所声明的 Gateway URL；启动 Agent 不会隐式启动或下载某个具体 Skill。
 
 </details>
+
+#### Skill 与 Node 下载使用的资源服务
+
+当前托管 dev Registry API 为 `https://paos-resource-platform.dev.x-era.com`。
+配置时只填写 API 根地址，不要追加 `/v1` 或前端页面路径：
+
+```bash
+export PAOS_RESOURCE_REGISTRY_URL=https://paos-resource-platform.dev.x-era.com
+```
+
+长期使用时，在 `~/.PhyAgentOS/config.json` 中，
+按上面的示例设置 `resourceRegistry.url`。非空的 `PAOS_RESOURCE_REGISTRY_URL`
+**优先于配置文件**，已有的旧环境变量也要更新或取消。修改本文档不会自动迁移
+用户已有配置或旧版 Core 的默认地址。
+
+例如，安装 [LIBERO 快速启动](example/quickstart/libero-quickstart.md) 使用的精确版本：
+
+```bash
+paos skill install libero --version 0.3.4-ubuntu20.1
+```
+
+旧地址 `paos-resource-manager.dev.x-era.com` 若返回 **HTTP 503
+`no healthy upstream`**，表示该域名的网关没有健康的后端实例。先切换到当前 API
+再重试，不能据此判断 Skill 版本不存在。公开 Skill／Node 查询和安装无需平台
+管理员密码或 GitHub token；运行环境、系统和模型要求仍以对应 Skill 的快速启动为准。
 
 ### 3. 运行第一条请求
 

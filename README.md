@@ -137,7 +137,7 @@ The configuration file is serialized in camelCase; snake_case keys are also acce
     }
   },
   "resourceRegistry": {
-    "url": "https://paos-resource-manager.dev.x-era.com"
+    "url": "https://paos-resource-platform.dev.x-era.com"
   }
 }
 ```
@@ -148,6 +148,35 @@ PAOS connects only to the Gateway URL in the manifest of the explicitly started,
 Runtime. It never starts or downloads a concrete Skill merely because the Agent starts.
 
 </details>
+
+#### Resource Registry for Skill and Node downloads
+
+Use the hosted dev Registry API at `https://paos-resource-platform.dev.x-era.com`.
+Set the API origin only, without `/v1` or a frontend page path:
+
+```bash
+export PAOS_RESOURCE_REGISTRY_URL=https://paos-resource-platform.dev.x-era.com
+```
+
+For persistent configuration, set `resourceRegistry.url` in `~/.PhyAgentOS/config.json`
+as shown above. A non-empty
+`PAOS_RESOURCE_REGISTRY_URL` takes precedence over that file, so update or unset any
+old environment override as well. Existing configuration and older Core defaults
+are not automatically migrated by changing this README.
+
+For example, install the exact LIBERO version used by the
+[LIBERO quickstart](example/quickstart/libero-quickstart.md):
+
+```bash
+paos skill install libero --version 0.3.4-ubuntu20.1
+```
+
+If the legacy endpoint `paos-resource-manager.dev.x-era.com` returns **HTTP 503
+`no healthy upstream`**, its gateway has no healthy backend. Switch the Registry
+URL to the current API before retrying; this error does not establish that a Skill
+version is missing. Public Skill/Node lookup and installation do not require a
+platform administrator password or a GitHub token. Follow each Skill's quickstart
+for its runtime, operating system and model requirements.
 
 ### 3. Run your first request
 
