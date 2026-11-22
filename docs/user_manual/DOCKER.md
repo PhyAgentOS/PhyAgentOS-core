@@ -1,6 +1,6 @@
 # Docker Deployment Guide
 
-> Version: 1.1.1 · [中文](DOCKER_zh.md)
+> Version: 1.2.0 · [中文](DOCKER_zh.md)
 
 PhyAgentOS ships with a Docker-based quick deployment that requires no manual Python / Node.js setup. Together with the [`scripts/install.sh`](../../scripts/install.sh) one-click script, you can build, initialize, and run in under a minute.
 

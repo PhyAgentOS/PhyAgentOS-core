@@ -15,55 +15,26 @@
 
 **完成标准：PAOS 环境安装完成，能够通过 paos agent 进行对话。**
 
-### 切换到 libero runtime 分支
+### Core 与评测版本
 
-libero 0.3.4 Skill 依赖 per-profile `required_tools`、`PAOS_SKILL_PROFILE` 透传和
-`openai_responses` provider，须使用专用 runtime 分支：
-
-```bash
-export PAOS_CORE="$HOME/PhyAgentOS-core"
-export RUNTIME_URL="https://gitlab.ex-ai.cn/PhyAgentOS/framework/phyagentos.git"
-export RUNTIME_BRANCH="qinhan/libero-0.3.4-runtime"
-
-if [ -d "$PAOS_CORE/.git" ]; then
-  git -C "$PAOS_CORE" remote set-url origin "$RUNTIME_URL"
-  git -C "$PAOS_CORE" fetch origin "$RUNTIME_BRANCH"
-  git -C "$PAOS_CORE" checkout -B "$RUNTIME_BRANCH" "origin/$RUNTIME_BRANCH"
-else
-  git clone --branch "$RUNTIME_BRANCH" "$RUNTIME_URL" "$PAOS_CORE"
-fi
-
-cd "$PAOS_CORE"
-python -m pip install -e .
-hash -r
-```
-
-**检查结果：**
+Core v1.2.0 提供按 profile 选择工具、传递 `PAOS_SKILL_PROFILE` 和使用 `openai_responses` 模型服务的能力。在 Python 3.11 或 3.12 虚拟环境中安装发行版，然后查看 Core 和 Dora 版本。
 
 ```bash
-git -C "$PAOS_CORE" branch --show-current
-git -C "$PAOS_CORE" rev-parse HEAD
+python -m pip install "PhyAgentOS-ai==1.2.0"
+paos --version
 dora --version
 ```
 
-应分别显示 `qinhan/libero-0.3.4-runtime`、
-`e3f1adee1ceab2f09a27b1c0706c2260981ace0e`、`dora-cli 0.4.1`。
-commit 对不上时不要安装 libero 0.3.4。
+本教程使用 `libero` 0.3.4-ubuntu20.1 的 6 个策略配置，示例选择 `pi05` 与 `gpt6_pi05`。原始运行使用 Dora CLI 0.4.1 和 Core 提交 `e3f1adee1ceab2f09a27b1c0706c2260981ace0e`。新版 LIBERO 0.3.9-ubuntu20.1 提供 11 个策略配置。[各基准的安装命令与策略表](../../docs/benchmarks.md#benchmark-skills)
 
 ## 1. 安装 Node 与 Skill
 
-Skill 归档和它锁定的 Node 制品都要装好，缺一个都会在启动时报缺文件。
+### 安装本教程使用的 LIBERO 版本
 
-### 安装 libero Skill
-
-```bash
-paos skill install libero --version 0.3.4-ubuntu20.1
-```
-
-**检查结果：** 显示安装成功。若注册表里还没有 0.3.4，改用本地包：
+从版本条目的 `download_url` 下载归档，保存为 `libero-0.3.4-ubuntu20.1.tar.gz`，在该目录执行安装。[0.3.4-ubuntu20.1 版本条目](https://paos-resource-platform.dev.x-era.com/v1/skills/libero?version=0.3.4-ubuntu20.1)
 
 ```bash
-paos skill install /abs/path/libero-0.3.4-ubuntu20.1.tar.gz --local --yes
+paos skill install ./libero-0.3.4-ubuntu20.1.tar.gz --local --yes
 ```
 
 ### 安装 Node（node id 用 skill.yaml 里的锁名）
@@ -87,7 +58,7 @@ paos forge-node verify libero gateway
 paos forge-node verify libero libero_benchmark
 ```
 
-**检查结果：** 版本为 0.3.4-ubuntu20.1（或更高），profile 共 6 个
+**检查结果：** 版本为 0.3.4-ubuntu20.1，profile 共 6 个
 （act / gpt6 / gpt6_pi05 / kai0 / lingbot_va / pi05），两条 verify 均通过。
 
 **注意：** 不要用 0.3.1-ubuntu20.1——那一版的 profile `dataflow.yaml` 漏了节点级 env

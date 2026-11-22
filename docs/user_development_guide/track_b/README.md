@@ -92,7 +92,7 @@ against compatible Gateway, provider, Core and artifact versions.
 | --- | --- | --- |
 | Forge source snapshot | Dora 1.x / Forge 2.x; Common 2.1.0, other five families 2.0.0 | Pin commits/locks; do not automatically replace older Nodes |
 | Forge maintenance line | `stable/1.x`, Dora 0.4 compatibility | Still verify exact tags/commits for old Nodes |
-| Current Core release | Core v1.1.1 | See the [changelog](../../../CHANGELOG.md) |
+| Current Core release | Core v1.2.0 | See the [changelog](../../../CHANGELOG.md) |
 | Recorded runtime example | Core v1.1.0, Dora CLI 0.4.1, robot-control-sim 0.1.2 | Interpret behavior using the original locked artifacts |
 | Piper X demo | Model, profile and workflow changes on that baseline | Preserve nine Node locks; no protocol upgrade |
 

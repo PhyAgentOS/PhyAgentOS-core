@@ -1,0 +1,98 @@
+{
+  "date": "2026-11-08",
+  "platform": "Linux x86_64, Python 3.11, isolated venv/PAOS instance, Xvfb",
+  "core_version": "1.1.1",
+  "skill": "robot-control-sim 0.1.2",
+  "dora_python": "0.4.1",
+  "dora_cli": "0.4.1",
+  "profiles": [
+    {
+      "profile": "viewer",
+      "passed": true,
+      "actions": [
+        {
+          "name": "reset-before",
+          "passed": true
+        },
+        {
+          "name": "joint-motion",
+          "passed": true,
+          "max_joint_error_rad": 0.0038914552226839982
+        },
+        {
+          "name": "reset-after",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "profile": "recording-full",
+      "passed": true,
+      "actions": [
+        {
+          "name": "reset-before",
+          "passed": true
+        },
+        {
+          "name": "joint-motion",
+          "passed": true,
+          "max_joint_error_rad": 0.00397514112999367
+        },
+        {
+          "name": "reset-after",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "profile": "custom-full",
+      "passed": true,
+      "actions": [
+        {
+          "name": "reset-before",
+          "passed": true
+        },
+        {
+          "name": "joint-motion",
+          "passed": true,
+          "max_joint_error_rad": 0.004041495132408812
+        },
+        {
+          "name": "reset-after",
+          "passed": true
+        }
+      ]
+    }
+  ],
+  "tests": {
+    "beginner": 13,
+    "subtests": 11,
+    "affected_modules": 78
+  },
+  "videos": {
+    "simulation.mp4": {
+      "sha256": "78e6e4f2f03e90161161049395ee3afe4bd52f1b020761b1263f7413fd502c07",
+      "frames": 900,
+      "duration_seconds": 30,
+      "width": 640,
+      "height": 480,
+      "codec": "h264",
+      "pixel_format": "yuv420p"
+    },
+    "custom-simulation.mp4": {
+      "sha256": "fd71b7a8bc9dcce76d8c0b10696ddc6b1e74a7f78568895ba994bc08a3cac07b",
+      "frames": 900,
+      "duration_seconds": 30,
+      "width": 640,
+      "height": 480,
+      "codec": "h264",
+      "pixel_format": "yuv420p"
+    }
+  },
+  "limitations": [
+    "Native Tool API exercise verified; model-driven chat walkthrough not run in this acceptance.",
+    "No hardware, resource publication, other OS or whole-repository test suite.",
+    "Explicit Tool queue_size=1000 mitigates published-profile drops; transport races remain possible.",
+    "First unmodified profile run failed (viewer display library; final reset unknown); it was not replayed or counted as passing."
+  ]
+}

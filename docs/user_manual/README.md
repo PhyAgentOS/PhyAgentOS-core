@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-> Version: 1.1.1
+> Version: 1.2.0
 
 This is the operations reference for startup, reconciliation, stop, recovery and backups. Development starts with the [contribution guide](../../CONTRIBUTING.md). If the optional [interaction extension](../interaction/README.md) is enabled, also follow its journal/Runner ownership and shutdown limits; ordinary robot procedures do not replace them.
 
@@ -27,7 +27,7 @@ the explicit lifecycle of installed Bundle profiles; it does not replace Gateway
 
 ### PAOS host
 
-- Python 3.11 or 3.12 and the intended v1.1.1 environment are installed.
+- Python 3.11 or 3.12 and the intended v1.2.0 environment are installed.
 - `paos status` resolves the expected config, workspace, model, and provider.
 - Workspace, PAOS data paths, and artifact paths have sufficient permissions and disk space.
 - Verification provider credentials are available when non-`off` tasks are allowed.
@@ -180,7 +180,7 @@ it must not remove task records, invocation references, or evolution history.
 
 ## 10. Operational acceptance checklist
 
-- [ ] Package and runtime version report 1.1.1.
+- [ ] Package and runtime version report 1.2.0.
 - [ ] General Agent tools and dynamic MCP tools remain registered.
 - [ ] Required Skill Bundle and all node artifacts verify.
 - [ ] Managed Runtime reaches ready and all Tool contexts are healthy.

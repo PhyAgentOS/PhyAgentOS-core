@@ -91,7 +91,7 @@ MuJoCo 在当前分类中属于 Simulator Operator，本身可以产生仿真状
 | --- | --- | --- |
 | Forge 源码快照 | Dora 1.x / Forge 2.x；Common 2.1.0，其余五家族 2.0.0 | 以固定提交和依赖锁为准，不自动替代旧 Node |
 | Forge 维护线 | `stable/1.x`，Dora 0.4 兼容线 | 旧节点维护仍需核对具体 tag/commit |
-| 当前 Core 发布版本 | Core v1.1.1 | 参见 [更新记录](../../../CHANGELOG.md) |
+| 当前 Core 发布版本 | Core v1.2.0 | 参见 [更新记录](../../../CHANGELOG.md) |
 | 本组历史运行示例 | Core v1.1.0、Dora CLI 0.4.1、robot-control-sim 0.1.2 | 依照原 Skill 锁定的制品解释行为 |
 | Piper X demo | 在上行基线上修改模型、profile 和工作流 | 保留九个 Node locks，未进行协议升级 |
 

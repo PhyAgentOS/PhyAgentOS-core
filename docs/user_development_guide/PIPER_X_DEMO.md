@@ -5,11 +5,10 @@
 [Bundle and Tool integration reference](README.md) · [TrackB framework](track_b/README.md) · [Three development modes](track_b/SKILL_DEVELOPMENT.md) · [Example code](../../example/robot-control-sim-piper-x/README.md)
 
 > A reusable extension tutorial for MuJoCo simulation, joint targets and end-effector poses.
-> Documentation target: Core v1.1.1. Recorded runtime baseline: Core v1.1.0, Dora CLI 0.4.1, original robot-control-sim 0.1.2 Node locks.
-> The recorded robot validation below has not been rerun for v1.1.1.
+> Use Core v1.2.0 for development. The recorded Piper X run used Core v1.1.0, Dora CLI 0.4.1 and the Node locks from robot-control-sim 0.1.2.
 > Companion scripts build/validate a derived Skill without upgrading its locked Nodes.
 
-**Platform availability:** External resource submissions and changes to existing registered repositories are not yet open. They must wait for the approval service to be completed and opened. Current registration/publication is administrator-managed. Local development and validation can proceed; platform publication steps below are conditional on that workflow becoming available. See the [contribution guide](../../CONTRIBUTING.md).
+Develop and test the Skill locally. Platform maintainers handle registration and publication. [Contribution guide](../../CONTRIBUTING.md)
 
 ## 1. Goal, baseline and scope
 
@@ -39,7 +38,7 @@ publication still follows the destination platform's process.
 
 ## 2. Prepare the environment and upstream Skill
 
-Use Linux x86_64, Python 3.12, Git, Dora CLI 0.4.1 and a Core v1.1.1 CLI environment; reproducing the original recorded validation requires Core v1.1.0.
+Use Linux x86_64, Python 3.12, Git, Dora CLI 0.4.1 and a Core v1.2.0 CLI environment. Use Core v1.1.0 to reproduce the recorded run.
 Keep Core and model-building environments separate so MuJoCo/numpy do not modify Core dependencies.
 See the [Core user manual](../en/02-user-manual.md) for installation, then check:
 
@@ -50,16 +49,13 @@ paos skill install robot-control-sim --version 0.1.2
 paos skill inspect robot-control-sim
 ```
 
-In Core v1.1.1, as in the recorded v1.1.0 baseline, Registry `--version` constrains downloaded content rather than querying historical versions.
-If the current Registry has advanced, use a retained official immutable URL or local 0.1.2 archive:
+Registry `--version` checks the downloaded bundle version. To reproduce the recorded run from the 0.1.2 archive, install that bundle locally.
 
 ```bash
 paos skill install /path/to/robot-control-sim-0.1.2.tar.gz --local
 ```
 
-Do not relabel another version as 0.1.2. Installation validates Bundle/Node digests; resolve missing Nodes
-through Registry or separately acquired matching archives. Nine Nodes are required; see the
-[source mapping](track_b/REPOSITORIES.md#3-robot-control-sim-node-to-source-mapping).
+Installation checks the bundle and its nine Node digests. Use the Registry or matching archives to install those Nodes. [Node source mapping](track_b/REPOSITORIES.md#3-robot-control-sim-node-to-source-mapping).
 
 ## 3. Generate the model and independent profile
 

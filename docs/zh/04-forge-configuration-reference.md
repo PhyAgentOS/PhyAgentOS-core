@@ -1,6 +1,6 @@
 # Forge 配置参考
 
-> 适用于 PhyAgentOS 1.1.1 与统一的 Forge Gateway Tool API。
+> 适用于 PhyAgentOS 1.2.0 与统一的 Forge Gateway Tool API。
 
 ## 1. 配置位置与命名
 
@@ -41,7 +41,7 @@ PAOS 只通过 `/tools` 与 `/invocations` 调用 Query、Action 和 Session，�
 
 | JSON 字段 | 类型 | 默认值 | 约束与含义 |
 |:----------|:-----|:-------|:-----------|
-| `url` | string | `https://paos-resource-manager.dev.x-era.com` | HTTP(S) Resource Registry；`PAOS_RESOURCE_REGISTRY_URL` 优先。空值只允许本地 Bundle 或显式静态 index。 |
+| `url` | string | `https://paos-resource-platform.dev.x-era.com` | HTTP(S) Resource Registry；`PAOS_RESOURCE_REGISTRY_URL` 优先。空值只允许本地 Bundle 或显式静态 index。 |
 
 只有显式执行 `paos skill search/install/update` 或 `paos forge-node install` 才会访问 Registry；
 启动 PAOS 不会下载 Skill。
@@ -251,7 +251,7 @@ Instance 字段：`robotId`、`workspace` 必填；`enabled=true`；`profileName
     }
   },
   "resourceRegistry": {
-    "url": "https://paos-resource-manager.dev.x-era.com"
+    "url": "https://paos-resource-platform.dev.x-era.com"
   }
 }
 ```

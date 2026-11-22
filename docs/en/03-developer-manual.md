@@ -2,7 +2,7 @@
 
 [中文](../zh/03-developer-manual.md) · [Documentation index](../README.md)
 
-> Documentation version: 1.1.1.
+> Documentation version: 1.2.0.
 
 This manual covers Core implementation: AgentTask coordination, persistence, binding, verification and Runtime management. For robot, Node and Skill development, start with the [TrackB framework guide](../user_development_guide/track_b/README.md). The [Forge Tool API contract](../forge/README.md) is the canonical reference for routes, identities and lifecycle semantics.
 

@@ -1,6 +1,6 @@
 # Docker 部署指南
 
-> 版本：1.1.1 · [English](DOCKER.md)
+> 版本：1.2.0 · [English](DOCKER.md)
 
 PhyAgentOS 提供基于 Docker 的快速部署方案，无需手动配置 Python / Node.js 环境。配合 [`scripts/install.sh`](../../scripts/install.sh) 一键脚本，可在一分钟内完成构建、初始化与运行。
 

@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-> 版本：1.1.1
+> 版本：1.2.0
 
 选择开发模式及实施流程请使用 [TrackB Skill 开发手册](track_b/SKILL_DEVELOPMENT_zh.md)。本文集中维护 ToolSpec 示例、manifest v2 字段、启动 hook、打包与接口一致性检查细节。公开 HTTP 和生命周期语义以 [Forge Tool API 契约](../forge/README_zh.md)为准。
 

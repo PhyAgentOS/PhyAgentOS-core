@@ -5,7 +5,7 @@
 [整体架构](README_zh.md) · [仓库目录](REPOSITORIES_zh.md) · [公共协议](PROTOCOLS_zh.md) · [Runtime 关系](RUNTIME_zh.md) · [Skill 开发](SKILL_DEVELOPMENT_zh.md)
 
 本文先说明逻辑职责，再按公开 `robot-control-sim` 0.1.2 的 `mujoco-piper` profile 解释实际组装。
-本指南面向 Core v1.1.1；历史实例使用 Core v1.1.0、Dora CLI 0.4.1 及原始 Node locks；最新 Forge 源码与旧二进制的版本边界见
+本指南面向 Core v1.2.0。历史实例使用 Core v1.1.0、Dora CLI 0.4.1 及原始 Node locks；最新 Forge 源码与旧二进制的版本边界见
 [总览](README_zh.md#5-理论边界实现版本与源码快照)。
 
 ## 1. 先区分三个 Runtime 含义

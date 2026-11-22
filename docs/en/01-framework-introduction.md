@@ -2,7 +2,7 @@
 
 [中文](../zh/01-framework-introduction.md) · [Documentation index](../README.md)
 
-> Documentation version: 1.1.1 · implementation baseline: 2026-10-23 source, schemas, and tests.
+> Documentation version: 1.2.0 · implementation baseline: 2026-11-22 source, schemas, and tests.
 
 ## 1. Positioning
 

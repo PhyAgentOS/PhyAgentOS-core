@@ -1,6 +1,6 @@
 # Agent 经验与 Skill 自进化
 
-> 文档版本：1.1.1。本文描述基于 AgentTask record 的 Agent 校验、经验、Lesson 与 Skill 演化链。
+> 文档版本：1.2.0。本文描述基于 AgentTask record 的 Agent 校验、经验、Lesson 与 Skill 演化链。
 
 ## 1. 目标与边界
 

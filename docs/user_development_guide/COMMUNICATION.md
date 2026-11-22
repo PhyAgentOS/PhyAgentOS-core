@@ -2,7 +2,7 @@
 
 [中文](COMMUNICATION_zh.md) · [Documentation index](../README.md)
 
-> Version: 1.1.1
+> Version: 1.2.0
 
 This reference covers Core message, observation, verification and persistence boundaries. For Forge Node messages and dataflow ports, use [TrackB protocols](track_b/PROTOCOLS.md). HTTP routes and invocation semantics have one canonical definition in the [API contract](../forge/README.md).
 

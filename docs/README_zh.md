@@ -2,12 +2,9 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-版本：**1.1.1**<br>
-实现基线：**Forge Skill binding、Query/Action/Session Tool API、AgentTask recovery、版本作用域经验，2026-10-23**
+**PhyAgentOS Core v1.2.0 · 2026-11-22**
 
-本目录面向用户、运维和开发者。源码、配置 Schema 与测试定义当前行为；历史设计报告不替代运行契约。
-开发从[贡献指南](../CONTRIBUTING_zh.md) → [TrackB 总览](user_development_guide/track_b/README_zh.md) → [三种开发模式](user_development_guide/track_b/SKILL_DEVELOPMENT_zh.md) → [Piper X 示例](user_development_guide/PIPER_X_DEMO_zh.md)进入。
-外部平台贡献提交及已有登记仓库修改需等待审批服务完成并开放，当前可先本地开发验证。
+用户手册介绍安装、Forge 工具调用与任务恢复。开发者可从 [TrackB 总览](user_development_guide/track_b/README_zh.md) 选择扩展方式，再用 [Piper X 示例](user_development_guide/PIPER_X_DEMO_zh.md) 接入自己的机械臂。源码评审及资源登记流程见[贡献指南](../CONTRIBUTING_zh.md)。
 
 ## 核心手册
 
@@ -19,7 +16,10 @@
 
 ## 专题手册
 
-- [Benchmark 文档](benchmarks.md)：测评结果、耗时、Token 消耗与评测口径。
+- [MuJoCo Quickstart](quickstart-mujoco_zh.md)：安装仿真 Skill、控制关节与末端位姿，以及停止与恢复。
+- [FAQ](FAQ_zh.md)：资源服务、完整配置示例与会话记忆恢复。
+- 在 DeepSeek Harness 对话中安装和运行 Forge Skill，查询工具执行结果。[DSH 插件仓库](https://github.com/PhyAgentOS/PhyAgentOS-DSH-Plugin)
+- 选择 RoboTwin、LIBERO、CALVIN 的策略配置，使用 RoboDojo π0.5 开发包，查阅评测口径与历史结果。[Benchmark Skill 指南](benchmarks.md#benchmark-skills)
 
 - [Game 接入前通用交互基础](interaction/README_zh.md)：可选协议、真实任务治理、后台 Runner、恢复安全门及假环境验收。
 
@@ -41,7 +41,7 @@
 | 负责长期在线和故障处理 | [运行手册](user_manual/README_zh.md) → [Core 通信架构](user_development_guide/COMMUNICATION_zh.md) |
 | 用 Docker 快速部署 | [Docker 部署指南](user_manual/DOCKER_zh.md) |
 | 在 Gateway 增加新机器人动作 | [TrackB 开发手册](user_development_guide/track_b/SKILL_DEVELOPMENT_zh.md) → [节点协议](user_development_guide/track_b/PROTOCOLS_zh.md) |
-| 开发与打包 Forge Skill，开放后发布 | [TrackB Skill 开发](user_development_guide/track_b/SKILL_DEVELOPMENT_zh.md) → [Bundle 参考](user_development_guide/README_zh.md#5-打包发布与本地闭环) |
+| 开发、打包并提交 Forge Skill | [TrackB Skill 开发](user_development_guide/track_b/SKILL_DEVELOPMENT_zh.md) → [Bundle 参考](user_development_guide/README_zh.md#5-打包发布与本地闭环) |
 | 修改证据、验证、恢复或持久化 | [Core 开发者手册](zh/03-developer-manual.md) → [Forge 接入契约](forge/README_zh.md) |
 | 使用或扩展任务经验、Lesson 与 Skill 自进化 | [Agent 经验与 Skill 自进化](zh/05-agent-experience-and-skill-evolution.md) → [Core 开发者手册](zh/03-developer-manual.md) |
 

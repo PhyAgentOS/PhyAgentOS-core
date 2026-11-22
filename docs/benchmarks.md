@@ -2,31 +2,46 @@
 
 [English README](../README.md) · [中文 README](../README_zh.md)
 
-Values are transcribed from the three latest benchmark screenshots supplied by the maintainer. Model labels, ordering, and source categories follow the figures. PAOS entries are PhyAgentOS results; muted entries are labeled as public-leaderboard references in the source figures.
+<a id="benchmark-skills"></a>
+## Benchmark Skills / 评测 Skill
 
-以下数值来自维护者提供的最新三张评测截图，模型名称、顺序和来源分类按原图保留。PAOS 为 PhyAgentOS 结果，浅色条目在原图中标为公开榜单参考值。
+Choose a Skill for the environment and a profile for the policy. Each benchmark records the episode outcome using its native scoring rules. 按评测环境选择 Skill，按策略选择 profile，每个回合由相应基准按原生规则评分。
 
-**Units / 单位:** success rate (%) / 成功率；average time (seconds/task) / 平均耗时（秒/任务）；tokens (tokens/task) / Token 消耗（Tokens/任务）。M = million tokens / 百万 Token；“~” = approximate / 约；“—” = not reported / 未提供，不代表零。
+| Benchmark | Distribution / 获取方式 | Profiles / 配置 | Evaluation / 评测方式 |
+| --- | --- | --- | --- |
+| RoboTwin 2.0 | [`robotwin-benchmark` 0.3.1](https://paos-resource-platform.dev.x-era.com/v1/skills/robotwin-benchmark?version=0.3.1) | `g05`, `pi05`, `smolvla`, `act`, `lingbot_va` | Dual-arm manipulation. ACT uses task 38, `put_bottles_dustbin`. 双臂操作，ACT 对应第 38 项瓶子入桶任务。 |
+| LIBERO | [`libero` 0.3.9-ubuntu20.1](https://paos-resource-platform.dev.x-era.com/v1/skills/libero?version=0.3.9-ubuntu20.1) | `act`, `diffusion`, `fastwam`, `g05`, `gpt6`, `gpt6_pi05`, `kai0`, `lingbot_va`, `pi05`, `smolvla`, `vla_jepa` | Choose direct VLM control, VLA execution or VLM-supervised π0.5. 可选择视觉模型直接控制、VLA 执行或视觉模型监督 π0.5。 |
+| CALVIN | [`calvin-benchmark` 0.2.4](https://paos-resource-platform.dev.x-era.com/v1/skills/calvin-benchmark?version=0.2.4) | `vla-mcil-1207`, `vla-pi05-1129` | LH-MTLC reports average sequence length and SR1–SR5. MTLC reports task success rate. 长序列报告平均完成链长及各链长成功率，单任务报告成功率。 |
+| RoboDojo | [`robodojo-bench-pi05` developer package / 开发包](https://github.com/Yuchen-Pen/PhyAgentOS-core/blob/abfa457d2624de5ba63c96faf68fc31a62c65d52/example/robodojo-benchmark/release-usage.md) | `pi05` | Bottle disposal, episode-boundary stops and consecutive episodes with one policy process. 支持瓶子入桶、回合边界停止和同一策略进程连续执行。 |
+
+Install a public Registry Skill with `paos`. 通过 `paos` 安装公开 Registry 中的评测 Skill。
+
+```bash
+paos skill install robotwin-benchmark --version 0.3.1
+paos skill install libero --version 0.3.9-ubuntu20.1
+paos skill install calvin-benchmark --version 0.2.4
+```
+
+Read the installed Skill's instructions for its simulator assets, model weights and GPU settings, then start the selected profile. 安装后按 Skill 说明准备仿真资产、权重和 GPU 配置，再启动所选 profile。
+
+```bash
+paos skill inspect libero
+paos skill start libero --profile pi05
+```
 
 ## Evaluation context / 评测口径
 
+The historical tables below reproduce aggregate values from the project figures. The Source column distinguishes PhyAgentOS runs and public leaderboard entries. Each entry follows the task sample and evaluation protocol of its source.
+
+下表按项目原图收录历史汇总数据。来源列标明 PhyAgentOS 实验与公开榜单条目，各条目采用相应来源的任务样本与评测协议。
+
 | Benchmark | Task scope / 任务范围 |
 | --- | --- |
-| LIBERO | `libero-10` (labeled LIBERO-Long in the figures / 图中标为 LIBERO-Long) |
+| LIBERO | `libero-10` (LIBERO-Long in the figures / 图中标为 LIBERO-Long) |
 | RoboDojo | 10 randomly sampled tasks / 随机抽样 10 个任务 |
 | RoboTwin | 10 randomly sampled tasks / 随机抽样 10 个任务 |
 
-These task scopes were confirmed by the maintainer. Sample counts vary for some models; a uniform number of initial states or total episodes is not specified. Public-leaderboard references may use different protocols.
-
-以上任务范围由维护者确认。部分模型采用不同的样本量，因此不统一声明初始状态数或总评测次数。公开榜单参考结果可能采用不同评测协议。
-
-The supplied screenshots do not specify evaluation dates, exact sampled task IDs, per-model episode counts, seeds, model checkpoint identifiers, compute budgets, reset/retry policies, or per-baseline source URLs. No raw run logs or reproducible evaluation commands accompanied them. Values are reported as supplied, not independently reproduced by this documentation change. Cross-method comparisons may use different evaluation protocols; no matched-protocol ranking or statistical significance is claimed.
-
-截图未注明评测日期、抽样任务的具体 ID、各模型的 episode 数量、随机种子、模型 checkpoint、计算预算、重置/重试策略或各基线的原始来源链接，也未附原始日志和可复现命令。本次文档改版按所提供结果展示，没有独立复跑测评。不同方法可能采用不同评测协议，因此不声明同条件排名或统计显著性。
-
-For a reproducible release, attach the exact Skill bundle/profile, Core revision, environment version, model configuration, evaluation command, episode-level logs, and the original baseline references to this page.
-
-发布可复现结果时，请在本页补充精确的 Skill Bundle/profile、Core revision、环境版本、模型配置、评测命令、逐 episode 日志及基线原始引用。
+Success is a percentage. Time and token counts are per task. M denotes millions, ~ marks approximations and a dash marks an empty source cell. 成功率以百分比计，耗时和 Token 按任务计。M 表示百万，~ 表示约数，破折号对应原图中的空项。
 
 ## LIBERO-Long
 
@@ -87,6 +102,6 @@ For a reproducible release, attach the exact Skill bundle/profile, Core revision
 
 ## Image consistency / 图像一致性
 
-The Chinese figures are unmodified originals. English figures translate the same 30 rows, preserving model labels, success rates, time and token values, ordering, and source categories. The tables above provide the exact-value reference; missing values are not treated as zero. Source labels do not establish exact model/checkpoint identities.
+The English figures translate all 30 rows of the Chinese originals. The tables reproduce the model labels, values, row order and source categories from the figures.
 
-中文图使用未经修改的原图。英文图翻译相同的 30 条结果，保留模型名称、成功率、耗时、Token 消耗、顺序及来源分类。精确数值以上方表格为准，未提供的数值不视为零。来源命名不代表已核实精确模型或 checkpoint 身份。
+英文图对应中文原图的全部 30 条记录。表格沿用原图的模型名称、数值、顺序和来源分类。

@@ -5,11 +5,10 @@
 [Bundle 与 Tool 接入参考](README_zh.md) · [TrackB 框架说明](track_b/README_zh.md) · [三种开发模式](track_b/SKILL_DEVELOPMENT_zh.md) · [示例代码](../../example/robot-control-sim-piper-x/README_zh.md)
 
 > 本教程将一次实际二次开发过程整理为可复用示例。范围：MuJoCo 仿真、关节目标和末端位姿运动。
-> 文档目标版本：Core v1.1.1。历史运行基线：Core v1.1.0、Dora CLI 0.4.1、robot-control-sim 0.1.2 原始 Node locks。
-> 下文记录的机器人验证尚未在 v1.1.1 上重新执行。
+> 开发环境使用 Core v1.2.0。本文记录的 Piper X 实验使用 Core v1.1.0、Dora CLI 0.4.1 和 robot-control-sim 0.1.2 锁定的节点。
 > 配套脚本生成并验证派生 Skill，不升级锁定的 Node。
 
-**平台开放范围：** 外部贡献提交及已有登记仓库修改暂未开放，需等待审批服务完成并开放。当前登记与发布由管理员维护；可先进行本地开发验证。下文的平台发布步骤以相关流程开放为前提，详见[贡献指南](../../CONTRIBUTING_zh.md)。
+在本地开发和测试 Skill，由平台维护者登记并发布。[贡献指南](../../CONTRIBUTING_zh.md)
 
 ## 1. 目标、基线与边界
 
@@ -38,7 +37,7 @@ Agent / diagnostic Tool API client
 
 ## 2. 准备环境和上游 Skill
 
-在 Linux x86_64 上准备 Python 3.12、Git、Dora CLI 0.4.1，以及 Core v1.1.1 的 CLI 环境；复现原始验证记录时使用 Core v1.1.0。
+在 Linux x86_64 上准备 Python 3.12、Git、Dora CLI 0.4.1，以及 Core v1.2.0 的 CLI 环境。复现记录中的实验使用 Core v1.1.0。
 本文示例文件随开发手册提供；Core 运行环境与模型构建环境分开，避免 MuJoCo/numpy 依赖改变 Core 环境。
 基础安装见 [Core 用户手册](../zh/02-user-manual.md)。先确认：
 
@@ -49,15 +48,13 @@ paos skill install robot-control-sim --version 0.1.2
 paos skill inspect robot-control-sim
 ```
 
-Registry 的 `--version` 是下载后约束，不是历史版本查询。如果当前 Registry 已更新，
-应使用保存的官方不可变 URL 或本地 0.1.2 归档：
+Registry 的 `--version` 用于核对下载包的版本。使用 0.1.2 归档复现教程时，可从本地安装。
 
 ```bash
 paos skill install /path/to/robot-control-sim-0.1.2.tar.gz --local
 ```
 
-不要将其他版本改名为 0.1.2。安装会验证 Bundle/Node 摘要；缺失 Node 需从 Registry 或
-独立取得的匹配归档安装。配置依赖九个节点，参见 [Node 源码映射](track_b/REPOSITORIES_zh.md#3-robot-control-sim-的-node-与源码映射)。
+安装时会核对 Bundle 及其 9 个 Node 的摘要。可从 Registry 或对应的归档安装这些节点。[Node 源码映射](track_b/REPOSITORIES_zh.md#3-robot-control-sim-的-node-与源码映射)。
 
 ## 3. 生成模型和独立 profile
 

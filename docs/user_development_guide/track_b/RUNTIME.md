@@ -5,7 +5,7 @@
 [Overview](README.md) · [Repositories](REPOSITORIES.md) · [Protocols](PROTOCOLS.md) · [Runtime](RUNTIME.md) · [Skill development](SKILL_DEVELOPMENT.md)
 
 This page explains logical responsibilities, then the public robot-control-sim 0.1.2 `mujoco-piper` deployment.
-This guide targets Core v1.1.1; the recorded example uses Core v1.1.0, Dora CLI 0.4.1 and original Node locks. See the
+This guide targets Core v1.2.0. The recorded example uses Core v1.1.0, Dora CLI 0.4.1 and original Node locks. See the
 [overview](README.md#5-architecture-versions-and-source-snapshots) for source/binary version boundaries.
 
 ## 1. Three meanings of Runtime
