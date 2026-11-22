@@ -5,39 +5,33 @@
 <a id="resource-registry"></a>
 ## Which Resource Registry should I use for Skill and Node downloads?
 
-Use the hosted dev Registry API at `https://paos-resource-platform.dev.x-era.com`.
-Set the API origin only, without `/v1` or a frontend page path:
+Core v1.2.0 downloads public Skill and Node bundles from `https://paos-resource-platform.dev.x-era.com`. To select the Registry for a shell, set its API origin.
 
 ```bash
 export PAOS_RESOURCE_REGISTRY_URL=https://paos-resource-platform.dev.x-era.com
 ```
 
-For persistent configuration, set `resourceRegistry.url` in `~/.PhyAgentOS/config.json`
-as shown in the configuration example below. A non-empty
-`PAOS_RESOURCE_REGISTRY_URL` takes precedence over that file, so update or unset any
-old environment override as well. Existing configuration and older Core defaults
-are not automatically migrated by changing this README.
+For a persistent setting, use `resourceRegistry.url` in `~/.PhyAgentOS/config.json`. Core reads a populated `PAOS_RESOURCE_REGISTRY_URL` first, then the configuration file, then the built-in URL. To switch from the legacy `paos-resource-manager.dev.x-era.com` endpoint after an HTTP 503 response, update the active setting and retry. Public downloads support anonymous access.
 
-For example, install the exact LIBERO version used by the
-[LIBERO quickstart](../example/quickstart/libero-quickstart.md):
+Install the eleven-profile LIBERO release and inspect its runtime requirements.
 
 ```bash
-paos skill install libero --version 0.3.4-ubuntu20.1
+paos skill install libero --version 0.3.9-ubuntu20.1
+paos skill inspect libero
 ```
 
-If the legacy endpoint `paos-resource-manager.dev.x-era.com` returns **HTTP 503
-`no healthy upstream`**, its gateway has no healthy backend. Switch the Registry
-URL to the current API before retrying; this error does not establish that a Skill
-version is missing. Public Skill/Node lookup and installation do not require a
-platform administrator password or a GitHub token. Follow each Skill's quickstart
-for its runtime, operating system and model requirements.
+The `--version` option checks the version of the Registry bundle. To reproduce the six-profile quickstart, download the archive from the `download_url` in its versioned Registry entry and install it locally. [LIBERO 0.3.4 Registry entry](https://paos-resource-platform.dev.x-era.com/v1/skills/libero?version=0.3.4-ubuntu20.1) · [LIBERO quickstart](../example/quickstart/libero-quickstart.md)
+
+```bash
+paos skill install ./libero-0.3.4-ubuntu20.1.tar.gz --local
+```
 
 <a id="configuration"></a>
 ## Where can I find a full configuration example?
 
-The configuration file is `~/.PhyAgentOS/config.json`; see the [user manual](en/02-user-manual.md) for other providers and options.
+Configure providers and runtime options in `~/.PhyAgentOS/config.json`. [User manual](en/02-user-manual.md)
 
-The configuration file is serialized in camelCase; snake_case keys are also accepted.
+Core writes camelCase keys and also accepts snake_case input.
 
 ```json
 {
@@ -87,14 +81,17 @@ The configuration file is serialized in camelCase; snake_case keys are also acce
 }
 ```
 
-The `front` source is only an example. `resourceRegistry.url` selects a generic package registry;
-it may be empty when all artifacts are installed from local bundles or a supplied static index.
-PAOS connects only to the Gateway URL in the manifest of the explicitly started, healthy Skill
-Runtime. It never starts or downloads a concrete Skill merely because the Agent starts.
+Set `requiredImageSources` to a camera name from your Skill, such as `front`. Use `resourceRegistry.url` for a hosted registry or choose a local bundle or a static package index at install time. Start the Skill explicitly with `paos skill start`. The Agent connects to the Gateway declared by that healthy runtime.
 
 <a id="session-memory"></a>
 ## How are session memories archived and recovered?
 
-`contextWindowTokens` controls the archival threshold, not the model context limit; a nonpositive value disables automatic archival. When LiteLLM is already loaded, requests resolve the configured model ID against its local catalog (including native `anthropic/` and `openai/` prefixes), reserve output space within the known window, and keep the latest complete turn. Gateway routes require their own catalog entry; they do not inherit a native model limit. Direct-only `custom` / `openai_responses` processes do not load LiteLLM just for this check, so catalog-based request protection is inactive unless another path has loaded it; bounded archival still applies. Unknown deployment aliases do not receive an invented hard limit from the archival threshold. If known-window protection cannot fit the current turn or fixed instructions, PAOS reports the cause without deleting the session. Image inputs receive an approximate 2,048-token allowance per image rather than counting base64 as text; actual vision usage varies by model and resolution.
+Set `contextWindowTokens` to a positive archival threshold to enable automatic archival. PAOS divides long histories into bounded chunks, keeps complete messages together when they fit, and saves a checkpoint after each chunk. The archiver checks the `save_memory` result, gives plain-text responses one format-repair retry and reports archival errors in the conversation. Automatic retries pause for 60 seconds.
 
-Memory archival uses automatic tool selection with validated `save_memory` results and one format-repair retry for plain-text responses. Large histories are processed in bounded fragments with durable progress checkpoints, preferring complete messages when they fit. Archival failures appear in the reply and retries pause for 60 seconds. `/new` first saves the complete raw session under `<workspace>/sessions/archives/`; if LLM archival fails, it still starts a new session and reports the backup path. Raw backups retain the original conversation and any pending archival checkpoint for later recovery; a backup is not a completed memory summary.
+When LiteLLM is loaded, PAOS uses its local catalog to resolve model windows, reserves room for output and retains the latest complete turn. Native `anthropic/` and `openai/` IDs use their catalog entries. Gateway routes use their own entries. Direct `custom` and `openai_responses` processes use bounded archival independently of catalog lookup. A request that exceeds a known window reports the cause and preserves the session. Image budgeting uses about 2,048 tokens per image, with actual usage set by the model and resolution.
+
+Use `/new` to back up the raw conversation and its archival checkpoint under `<workspace>/sessions/archives/` and start a new session. For a Skill with a retained Action or Session, query the Gateway again by invocation ID and reconcile its runtime bindings.
+
+```bash
+paos skill reconcile robot-control-sim
+```

@@ -2,6 +2,28 @@
 
 All notable changes to PhyAgentOS are documented here. Categories follow Keep a Changelog.
 
+## [v1.2.0] - 2026-11-22
+
+DeepSeek Harness integration, benchmark policies and runtime recovery.
+
+### Added
+
+- Run Forge Skills from a DeepSeek Harness conversation with `@x-era/dsh-forge` 0.2.0. Search and install Skills, select a profile, start the runtime, call Gateway tools and read invocation results. [DSH plugin](https://github.com/PhyAgentOS/PhyAgentOS-DSH-Plugin)
+- Choose from 18 policy profiles in three public Registry Skills. RoboTwin 2.0 offers five profiles, LIBERO eleven and CALVIN two. The RoboDojo π0.5 developer package supports bottle disposal, stopping at episode boundaries and consecutive episodes in one policy process. [Benchmark Skills](docs/benchmarks.md#benchmark-skills)
+- Control a simulated Piper arm, record an MP4 and edit a Dora recorder Node in the bilingual [Piper walkthrough](example/beginner-simulation/README.md).
+
+### Changed
+
+- Core uses the hosted resource Registry for Skill and Node downloads. Set `PAOS_RESOURCE_REGISTRY_URL` to select a Registry for the current process. [Configuration](docs/FAQ.md#resource-registry)
+- Stable GitHub Releases publish their wheel and source distribution to PyPI. The release workflow compares SHA-256 digests and installs the published wheel in a clean Python environment.
+
+### Fixed and improved
+
+- Conversation archives process long histories in chunks and persist checkpoints. `/new` backs up the full session before opening a new conversation.
+- `paos skill reconcile <skill>` looks up retained Action and Session invocations by identity. Runtime shutdown checks Dora flow termination and tracks the Linux processes owned by each runtime generation.
+
+[Full comparison with v1.1.1](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.1.1...v1.2.0)
+
 ## [v1.1.1] - 2026-10-23
 
 Skill development, execution reliability and the Opper gateway. Changes since v1.1.0.

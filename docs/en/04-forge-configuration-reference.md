@@ -1,6 +1,6 @@
 # Forge Configuration Reference
 
-> Applies to PhyAgentOS 1.1.1 and the unified Forge Gateway Tool API.
+> Applies to PhyAgentOS 1.2.0 and the unified Forge Gateway Tool API.
 
 ## 1. Location and naming
 

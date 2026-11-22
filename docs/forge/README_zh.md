@@ -2,7 +2,7 @@
 
 [English](README.md) · [文档索引](../README_zh.md)
 
-> 适用于 PhyAgentOS 1.1.1。
+> 适用于 PhyAgentOS 1.2.0。
 
 本文是公开 Tool API 路由、身份和 invocation/task 语义的统一契约。节点消息与 dataflow 参见 [TrackB 协议](../user_development_guide/track_b/PROTOCOLS_zh.md)；可选交互另有[受限扩展契约](../interaction/README_zh.md)。
 

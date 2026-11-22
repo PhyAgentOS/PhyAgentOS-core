@@ -2,7 +2,7 @@
 
 [English](../en/03-developer-manual.md) · [文档索引](../README_zh.md)
 
-> 文档版本：1.1.1。
+> 文档版本：1.2.0。
 
 本文面向 Core 实现：AgentTask 协调、持久化、binding、验证和 Runtime 管理。机器人、Node 与 Skill 开发请从 [TrackB 框架说明](../user_development_guide/track_b/README_zh.md)开始。HTTP 路由、身份和生命周期语义以 [Forge Tool API 契约](../forge/README_zh.md)为准。
 

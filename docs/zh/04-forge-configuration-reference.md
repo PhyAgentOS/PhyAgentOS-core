@@ -1,6 +1,6 @@
 # Forge 配置参考
 
-> 适用于 PhyAgentOS 1.1.1 与统一的 Forge Gateway Tool API。
+> 适用于 PhyAgentOS 1.2.0 与统一的 Forge Gateway Tool API。
 
 ## 1. 配置位置与命名
 

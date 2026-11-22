@@ -11,20 +11,20 @@
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4264ce" alt="MIT License"></a>
     <img src="https://img.shields.io/badge/Python-3.11%2B-4264ce?logo=python&amp;logoColor=white" alt="Python 3.11 or newer">
-    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.1.1-4264ce" alt="Release v1.1.1"></a>
+    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.2.0-4264ce" alt="Release v1.2.0"></a>
     <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/stargazers"><img src="https://img.shields.io/github/stars/PhyAgentOS/PhyAgentOS-core?style=flat&amp;color=4264ce" alt="GitHub stars"></a>
   </p>
   <p><a href="README.md">English</a> · <a href="README_zh.md">简体中文</a></p>
   <p>
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
-    <a href="#release">v1.1.1</a> ·
+    <a href="#release">v1.2.0</a> ·
     <a href="#quick-start">安装配置</a> ·
     <a href="docs/quickstart-mujoco_zh.md">仿真 Quickstart</a> ·
     <a href="#quickstart-examples">快速启动示例</a> ·
     <a href="#documentation">文档导航</a>
   </p>
-  <p><a href="#release"><b>v1.1.1 · Skill 开发、执行可靠性与 Opper 网关</b></a></p>
+  <p><a href="#release"><b>v1.2.0 · DeepSeek Harness 接入、多策略基准评测与运行恢复</b></a></p>
 </div>
 
 ---
@@ -47,17 +47,21 @@
 | **可复用的物理执行能力** | 将环境相关工具与 Runtime 封装为版本化 Skill，使认知规划与机器人接入保持解耦。 |
 
 <a id="release"></a>
-## v1.1.1 更新亮点
+## v1.2.0 更新亮点
 
-**Skill 开发、执行可靠性与 Opper 网关。** 相对 v1.1.0 的主要变化：
+- **在 DeepSeek Harness 中运行 Forge Skill。** 直接在 DSH 对话中搜索和安装 Skill，选择配置、启动运行环境，再调用 Gateway 工具读取执行结果。[DSH 插件仓库](https://github.com/PhyAgentOS/PhyAgentOS-DSH-Plugin) · [npm 安装包 0.2.0](https://www.npmjs.com/package/@x-era/dsh-forge/v/0.2.0)
+- **选择评测基准和策略。** 公开 Registry 提供 RoboTwin 2.0 的 5 个、LIBERO 的 11 个和 CALVIN 的 2 个策略配置。RoboDojo 的 π0.5 开发包支持瓶子入桶任务，可在回合边界停止，也可在同一策略进程中连续执行多个回合。[评测 Skill 与策略配置](docs/benchmarks.md#benchmark-skills)
+- **恢复长会话与 Skill 执行状态。** 会话按块归档并保存进度，`paos skill reconcile <skill>` 可向 Gateway 查询保留的 Action 或 Session 并更新运行绑定。Piper 教程带你控制机械臂、录制 MP4 并修改录像节点。[会话恢复](docs/FAQ_zh.md#session-memory) · [Piper 教程](example/beginner-simulation/README_zh.md)
 
-- **Opper 网关：** 新增 OpenAI 兼容接入，支持 Provider 选择、环境变量凭据和原样传递模型标识。
-- **本地 Skill 开发：** 本地修改工作流文档和 Node 可执行文件后可带警告运行，绑定与经验仍记录实际激活的工作流哈希；显式 Node 校验和安装缓存验收保持严格。
-- **Action 拒绝处理：** Gateway 明确在分发前拒绝的请求记为失败，不再阻塞后续重试或成功任务的最终判定；超时和远端执行不确定时仍保留原有保护。
-- **Piper X 开发示例：** 双语 Track B 指南与独立仿真 Skill 示例覆盖模型转换、原始 Node locks、打包和历史验证记录；原始运行基线见 [Piper X 指南](docs/user_development_guide/PIPER_X_DEMO_zh.md)。
-- **文档整理：** 合并双语手册和贡献指南，新增带实时 GIF 的 MuJoCo Quickstart，并保留评测文档入口。
+使用 Node.js 24.9 或更高版本，安装插件适配的 DSH 并启动 Web 对话界面。
 
-查看[完整更新记录](CHANGELOG.md)和[相对 v1.1.0 的全部变更](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.1.0...v1.1.1)。
+```bash
+npm install --global @deepseek-ai/dsh@0.2.2-rc.1
+dsh plugin --profile web add @x-era/dsh-forge
+dsh web
+```
+
+[完整更新记录](CHANGELOG.md) · [与 v1.1.1 的版本对比](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.1.1...v1.2.0)
 
 <a id="quick-start"></a>
 ## 安装与配置
@@ -67,13 +71,15 @@
 ### 1. 安装与初始化
 
 ```bash
-git clone --branch v1.1.1 https://github.com/PhyAgentOS/PhyAgentOS-core.git
+git clone --branch v1.2.0 https://github.com/PhyAgentOS/PhyAgentOS-core.git
 cd PhyAgentOS-core
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 paos onboard
 ```
+
+也可在 Python 虚拟环境中从 PyPI 安装同一版本，运行 `python -m pip install "PhyAgentOS-ai==1.2.0"`，然后执行 `paos onboard`。
 
 Windows PowerShell 请将激活命令替换为 `.venv\Scripts\Activate.ps1`。
 
@@ -87,8 +93,7 @@ paos provider use openrouter --model anthropic/claude-sonnet-4
 ```
 
 Docker/Secret 输入、进程启动覆盖和 `/provider`、`/model`、`/effort`、`/status` 会话命令见
-[Provider CLI 指南](docs/zh/02-user-manual.md#2-配置模型与-forge)。会话切换只影响后续请求，
-不改变正在执行的任务及其他会话。
+[Provider CLI 指南](docs/zh/02-user-manual.md#2-配置模型与-forge)。切换后的配置从当前会话的下一条请求起生效。
 
 完整配置示例、资源下载地址和排障见 [FAQ](docs/FAQ_zh.md)。
 
@@ -134,12 +139,15 @@ paos agent
 <a id="news"></a>
 ## News · 最新动态
 
+**2026-11-22 · v1.2.0 发布。** 在 DeepSeek Harness 中运行 Forge Skill，按评测基准选择策略，恢复会话和任务执行状态。[发布说明与安装包](https://github.com/PhyAgentOS/PhyAgentOS-core/releases/tag/v1.2.0)
+
 **2026-10-23 · v1.1.1 发布：** 新增 Opper 网关，完善本地 Skill 开发和 Action 拒绝处理，并补充双语 Track B 与 Piper X 开发指南。[查看发布说明与安装包](https://github.com/PhyAgentOS/PhyAgentOS-core/releases/tag/v1.1.1)。
 
 **2026-10-10 · GOSIM Shenzhen 2026：** PhyAgentOS 入选 Spotlight，并将在开源机器人分论坛做主题分享。[查看活动公告与现场信息](docs/news/gosim-shenzhen-2026_zh.md)。
 
 | 版本 | 日期 | 更新 |
 | --- | --- | --- |
+| **v1.2.0** | 2026-11-22 | DeepSeek Harness 插件入口、多策略 Benchmark Skill、会话归档与 Skill 运行恢复。 |
 | **v1.1.1** | 2026-10-23 | Opper 网关、本地 Skill 开发与 Action 拒绝处理修复、双语 Track B 和 Piper X 指南，以及 MuJoCo Quickstart。 |
 | **v1.1.0** | 2026-10-09 | 集中式 Provider 管理、直接 OpenAI Responses 与新网关接入、Skill Runtime 打包和启动改进，以及默认关闭的受治理交互基础。 |
 | **v1.0.0** | 2026-08-30 | Initial stable release of PhyAgentOS. |
@@ -150,7 +158,7 @@ paos agent
 
 ## 参与贡献与社区
 
-请先阅读[贡献指南](CONTRIBUTING_zh.md)与开发手册，建议优先参与 TrackB 的 Node、Skill 和机器人/环境接入开发。资源平台的外部贡献提交及已有登记仓库修改暂未开放，需等待审批服务完成并开放后支持；现阶段可进行本地开发验证，具体范围与源码评审流程见贡献指南。
+欢迎通过 TrackB 开发 Node、组装 Skill 或接入机器人与仿真环境。贡献指南介绍本地开发流程、源码评审和由维护者负责的资源登记。[贡献指南](CONTRIBUTING_zh.md)
 
 <details>
 <summary>开发检查命令</summary>

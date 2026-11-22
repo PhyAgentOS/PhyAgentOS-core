@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-> Version: 1.1.1
+> Version: 1.2.0
 
 Use the [TrackB Skill development manual](track_b/SKILL_DEVELOPMENT.md) to choose a development mode and follow its procedure. This reference owns ToolSpec examples, manifest-v2 fields, startup hooks, packaging and conformance details. Public HTTP and lifecycle semantics are defined in the [Forge Tool API contract](../forge/README.md).
 

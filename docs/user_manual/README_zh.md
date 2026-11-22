@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-> 版本：1.1.1
+> 版本：1.2.0
 
 本文是启动、核对、停止、恢复与备份的运行参考。开发请从[贡献指南](../../CONTRIBUTING_zh.md)开始。若启用可选[交互扩展](../interaction/README_zh.md)，还需遵循其 journal/Runner 所有权与停机限制，普通机器人流程不替代这些要求。
 
@@ -27,7 +27,7 @@ Gateway 负责执行，PAOS 负责用户任务聚合与语义判定。Skill Runt
 
 ### PAOS 主机
 
-- 已安装 Python 3.11/3.12 和目标 v1.1.1 环境；
+- 已安装 Python 3.11/3.12 和目标 v1.2.0 环境；
 - `paos status` 指向预期 config、workspace、model 和 provider；
 - Workspace、PAOS data paths 和 artifact paths 具备权限与磁盘空间；
 - 允许非 `off` 任务时，Verification provider 凭据可用。
@@ -175,7 +175,7 @@ references 或 evolution 历史。
 
 ## 10. 运行验收清单
 
-- [ ] Package 与 runtime version 均为 1.1.1；
+- [ ] Package 与 runtime version 均为 1.2.0；
 - [ ] 通用 Agent tools 与动态 MCP tools 仍注册；
 - [ ] 所需 Skill Bundle 与全部 Node artifact 校验通过；
 - [ ] 托管 Runtime ready，所有 Tool contexts 健康；

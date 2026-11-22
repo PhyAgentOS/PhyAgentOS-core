@@ -2,7 +2,7 @@
 
 [English](../en/01-framework-introduction.md) · [文档索引](../README_zh.md)
 
-> 文档版本：1.1.1 · 实现基线：2026-10-23 源码、配置 Schema 与测试。
+> 文档版本：1.2.0 · 实现基线：2026-11-22 源码、配置 Schema 与测试。
 
 ## 1. 项目定位
 

@@ -11,20 +11,20 @@
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-4264ce" alt="MIT License"></a>
     <img src="https://img.shields.io/badge/Python-3.11%2B-4264ce?logo=python&amp;logoColor=white" alt="Python 3.11 or newer">
-    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.1.1-4264ce" alt="Release v1.1.1"></a>
+    <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/Release-v1.2.0-4264ce" alt="Release v1.2.0"></a>
     <a href="https://github.com/PhyAgentOS/PhyAgentOS-core/stargazers"><img src="https://img.shields.io/github/stars/PhyAgentOS/PhyAgentOS-core?style=flat&amp;color=4264ce" alt="GitHub stars"></a>
   </p>
   <p><a href="README.md">English</a> · <a href="README_zh.md">简体中文</a></p>
   <p>
     <a href="#what">What</a> ·
     <a href="#why">Why</a> ·
-    <a href="#release">v1.1.1</a> ·
+    <a href="#release">v1.2.0</a> ·
     <a href="#quick-start">Install</a> ·
     <a href="docs/quickstart-mujoco.md">Quickstart</a> ·
     <a href="#quickstart-examples">Examples</a> ·
     <a href="#documentation">Documentation</a>
   </p>
-  <p><a href="#release"><b>v1.1.1 · Skill development, execution reliability and the Opper gateway</b></a></p>
+  <p><a href="#release"><b>v1.2.0 · DeepSeek Harness integration, benchmark policies and runtime recovery</b></a></p>
 </div>
 
 ---
@@ -47,17 +47,21 @@
 | **Reusable physical capabilities** | Package environment-specific tools and runtimes as versioned Skills, keeping cognitive planning separate from robot integration. |
 
 <a id="release"></a>
-## What's new in v1.1.1
+## What's new in v1.2.0
 
-**Skill development, execution reliability and the Opper gateway.** Changes since v1.1.0:
+- **Run Forge Skills from DeepSeek Harness.** Search the Registry, install a Skill, select a profile, start the runtime and call its Gateway tools from a DSH conversation. [DSH plugin repository](https://github.com/PhyAgentOS/PhyAgentOS-DSH-Plugin) · [npm package 0.2.0](https://www.npmjs.com/package/@x-era/dsh-forge/v/0.2.0)
+- **Choose a benchmark and policy.** The public Registry offers five policy profiles for RoboTwin 2.0, eleven for LIBERO and two for CALVIN. The RoboDojo π0.5 developer package runs bottle-disposal episodes and can stop at episode boundaries or run consecutive episodes in one policy process. [Benchmark Skills and profiles](docs/benchmarks.md#benchmark-skills)
+- **Resume long-running work.** Conversation archives save progress in chunks. Run `paos skill reconcile <skill>` to query a retained Action or Session and update its runtime bindings. The Piper walkthrough shows how to move the arm, record an MP4 and edit the recorder Node. [Session recovery](docs/FAQ.md#session-memory) · [Piper walkthrough](example/beginner-simulation/README.md)
 
-- **Opper gateway:** OpenAI-compatible routing with provider selection, environment credentials and unchanged model identifiers.
-- **Local Skill development:** locally edited workflow documents and Node executables can run with warnings, while bindings and experience retain the activated workflow hash. Explicit Node verification and install-cache acceptance remain strict.
-- **Action rejection handling:** structured pre-dispatch Gateway rejections are recorded as failed and do not block a later retry or successful task finalization. Timeouts and uncertain remote execution retain their existing guards.
-- **Piper X development example:** bilingual Track B guides and an independent simulation Skill example cover model conversion, original Node locks, packaging and recorded validation. See the [Piper X guide](docs/user_development_guide/PIPER_X_DEMO.md) for its original runtime baseline.
-- **Clearer documentation:** consolidated bilingual manuals and contribution guidance, a MuJoCo Quickstart with live GIFs, and retained benchmark documentation links.
+Start DSH Web with Node.js 24.9 or later and the plugin’s supported host version.
 
-See the [full changelog](CHANGELOG.md) and [changes since v1.1.0](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.1.0...v1.1.1).
+```bash
+npm install --global @deepseek-ai/dsh@0.2.2-rc.1
+dsh plugin --profile web add @x-era/dsh-forge
+dsh web
+```
+
+[Changelog](CHANGELOG.md) · [Changes since v1.1.1](https://github.com/PhyAgentOS/PhyAgentOS-core/compare/v1.1.1...v1.2.0)
 
 <a id="quick-start"></a>
 ## Install and configure
@@ -67,13 +71,15 @@ Start with a model-backed CLI conversation, then follow the dedicated [MuJoCo Qu
 ### 1. Install and initialize
 
 ```bash
-git clone --branch v1.1.1 https://github.com/PhyAgentOS/PhyAgentOS-core.git
+git clone --branch v1.2.0 https://github.com/PhyAgentOS/PhyAgentOS-core.git
 cd PhyAgentOS-core
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 paos onboard
 ```
+
+For a PyPI installation, run `python -m pip install "PhyAgentOS-ai==1.2.0"` in a virtual environment, then `paos onboard`.
 
 On Windows PowerShell, replace the activation command with `.venv\Scripts\Activate.ps1`.
 
@@ -88,7 +94,7 @@ paos provider use openrouter --model anthropic/claude-sonnet-4
 
 See the [provider CLI guide](docs/en/02-user-manual.md#2-configure-the-model-and-forge) for
 Docker/secret input, process overrides and session commands (`/provider`, `/model`, `/effort`, `/status`).
-Session switches affect subsequent turns only and leave running tasks and other sessions unchanged.
+Session switches apply from the next turn in the current conversation.
 
 See the [FAQ](docs/FAQ.md) for full configuration examples, Registry downloads and troubleshooting.
 
@@ -134,12 +140,15 @@ New to embodied agents? Follow the [beginner simulation walkthrough](example/beg
 <a id="news"></a>
 ## News
 
+**2026-11-22 · v1.2.0 released.** Run Forge Skills from DeepSeek Harness, choose policies across benchmark suites and recover session and runtime state. [Release notes and packages](https://github.com/PhyAgentOS/PhyAgentOS-core/releases/tag/v1.2.0)
+
 **2026-10-23 · v1.1.1 released:** Opper gateway support, local Skill development and Action rejection fixes, plus bilingual Track B and Piper X guides. [Release notes and packages](https://github.com/PhyAgentOS/PhyAgentOS-core/releases/tag/v1.1.1).
 
 **2026-10-10 · GOSIM Shenzhen 2026:** PhyAgentOS has been selected for Spotlight and will present in the Open Source Robotics track. [Read the announcement and event details](docs/news/gosim-shenzhen-2026.md).
 
 | Version | Date | Update |
 | --- | --- | --- |
+| **v1.2.0** | 2026-11-22 | DeepSeek Harness plugin entry point, benchmark policy profiles, checkpointed conversation archives and Skill runtime recovery. |
 | **v1.1.1** | 2026-10-23 | Opper gateway, local Skill development and Action rejection fixes, bilingual Track B and Piper X guides, and a MuJoCo Quickstart. |
 | **v1.1.0** | 2026-10-09 | Centralized provider management, direct OpenAI Responses and new gateways, Skill Runtime packaging and startup improvements, and an opt-in governed interaction foundation. |
 | **v1.0.0** | 2026-08-30 | Initial stable release of PhyAgentOS. |
@@ -150,7 +159,7 @@ See the [full changelog](CHANGELOG.md).
 
 ## Contributing & community
 
-Start with the [contribution guide](CONTRIBUTING.md) and the development manuals. We recommend focusing on TrackB Nodes, Skills and robot/environment integrations. External resource-platform submissions and changes to existing registered repositories are not yet open; they require completion and opening of the approval service. Local development and validation can proceed; see the guide for the current scope and source-review process.
+Contribute TrackB Nodes, package Skills, or connect a robot or simulator. The guide covers local development, source review and maintainer-led resource registration. [Contribution guide](CONTRIBUTING.md)
 
 <details>
 <summary>Development checks</summary>

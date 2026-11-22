@@ -6,7 +6,7 @@ on:
       tag:
         description: Tag to build
         required: true
-        default: v1.1.1
+        default: v1.2.0
         type: string
   push:
     tags:
@@ -35,7 +35,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl git libstdc++6
+            ca-certificates curl ffmpeg git libstdc++6
           rm -rf /var/lib/apt/lists/*
           . /etc/os-release
           test "$VERSION_ID" = "20.04"

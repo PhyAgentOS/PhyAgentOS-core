@@ -2,7 +2,7 @@
 
 [English](../en/02-user-manual.md) · [文档索引](../README_zh.md)
 
-> 文档版本：1.1.1。
+> 文档版本：1.2.0。
 
 ## 1. 安装与初始化
 
@@ -31,7 +31,7 @@ ruff check PhyAgentOS tests
 
 运行通用 Agent、搜索 Skill 或完成 `paos skill install` 不需要 Dora。`paos skill start` 需要
 主机预先安装 Dora CLI，因为 RuntimeManager 使用 `dora` 命令管理所选 profile。PhyAgentOS
-1.1.1 以 Dora CLI v0.4.1 及 `dora-message` v0.7.0 作为 Forge Skill 兼容基线；可复现部署
+1.2.0 以 Dora CLI v0.4.1 及 `dora-message` v0.7.0 作为 Forge Skill 兼容基线；可复现部署
 应固定该精确版本。
 
 Linux 或 macOS 使用带版本的官方 installer：

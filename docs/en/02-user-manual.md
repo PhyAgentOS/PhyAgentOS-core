@@ -2,7 +2,7 @@
 
 [中文](../zh/02-user-manual.md) · [Documentation index](../README.md)
 
-> Documentation version: 1.1.1.
+> Documentation version: 1.2.0.
 
 ## 1. Install and initialize
 
@@ -31,7 +31,7 @@ The default configuration is `~/.PhyAgentOS/config.json`; the default workspace 
 
 Dora is not needed to run the general Agent, search for a Skill, or complete `paos skill install`.
 It is a host prerequisite for `paos skill start`, because RuntimeManager uses the `dora` command to
-manage the selected profile. PhyAgentOS 1.1.1 uses Dora CLI v0.4.1 and `dora-message` v0.7.0 as its
+manage the selected profile. PhyAgentOS 1.2.0 uses Dora CLI v0.4.1 and `dora-message` v0.7.0 as its
 Forge Skill compatibility baseline; pin this exact release for reproducible deployments.
 
 Linux or macOS, using the versioned official installer:

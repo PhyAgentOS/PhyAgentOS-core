@@ -36,7 +36,7 @@ tag、构建和发布说明仍由维护者确认，PyPI 上传与验证自动完
 
 ```sh
 gh workflow run publish-pypi.yml \
-  --repo PhyAgentOS/PhyAgentOS-core --ref main -f tag=v1.1.1
+  --repo PhyAgentOS/PhyAgentOS-core --ref main -f tag=v1.2.0
 ```
 
 工作流要求 GitHub Release 的三个附件齐全，核对 SHA256、包内项目名称和版本，再查询 PyPI：

@@ -13,7 +13,7 @@ graphical display or virtual display for MuJoCo and the image viewer.
 
 ## 1. Install Dora
 
-v1.1.1 retains the Dora CLI **0.4.1** (`dora-message` **0.7.0**) compatibility baseline:
+v1.2.0 retains the Dora CLI **0.4.1** (`dora-message` **0.7.0**) compatibility baseline:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \

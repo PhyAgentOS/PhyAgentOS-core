@@ -45,7 +45,7 @@ enter the existing stable release tag. The CLI equivalent is:
 
 ```sh
 gh workflow run publish-pypi.yml \
-  --repo PhyAgentOS/PhyAgentOS-core --ref main -f tag=v1.1.1
+  --repo PhyAgentOS/PhyAgentOS-core --ref main -f tag=v1.2.0
 ```
 
 The workflow requires all three GitHub Release attachments, checks SHA256 and

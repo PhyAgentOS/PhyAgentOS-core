@@ -2,7 +2,7 @@
 
 [English](COMMUNICATION.md) · [文档索引](../README_zh.md)
 
-> 版本：1.1.1
+> 版本：1.2.0
 
 本文说明 Core 消息、观测、验证与持久化边界。Forge 节点消息和 dataflow 端口参见 [TrackB 协议](track_b/PROTOCOLS_zh.md)。HTTP 路由和 invocation 语义统一维护在 [API 契约](../forge/README_zh.md)。
 

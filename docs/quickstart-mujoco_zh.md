@@ -12,7 +12,7 @@ MuJoCo 和图像查看器需要可用的图形显示或虚拟显示环境。
 
 ## 1. 安装 Dora
 
-v1.1.1 沿用 Dora CLI **0.4.1**（`dora-message` **0.7.0**）兼容基线：
+v1.2.0 沿用 Dora CLI **0.4.1**（`dora-message` **0.7.0**）兼容基线：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \

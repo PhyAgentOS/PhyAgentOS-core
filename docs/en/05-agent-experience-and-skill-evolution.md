@@ -1,6 +1,6 @@
 # Agent Experience and Skill Evolution
 
-> Documentation version: 1.1.1. This manual describes the implemented Agent-side validation, experience, Lesson, and Skill-evolution path over AgentTask records.
+> Documentation version: 1.2.0. This manual describes the implemented Agent-side validation, experience, Lesson, and Skill-evolution path over AgentTask records.
 
 ## 1. Purpose and boundary
 

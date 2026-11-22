@@ -2,12 +2,9 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Version: **1.1.1**<br>
-Implementation baseline: **Forge Skill binding, Query/Action/Session Tool API, AgentTask recovery, and version-scoped experience, 2026-10-23**
+**PhyAgentOS Core v1.2.0 · 2026-11-22**
 
-This directory serves users, operators and developers. Source, schemas and tests define current behavior; historical design reports do not replace runtime contracts.
-Start development with the [contribution guide](../CONTRIBUTING.md) → [TrackB overview](user_development_guide/track_b/README.md) → [three extension modes](user_development_guide/track_b/SKILL_DEVELOPMENT.md) → [Piper X example](user_development_guide/PIPER_X_DEMO.md).
-External platform submissions and changes to existing registered repositories must wait for completion and opening of the approval service; local development and validation can proceed.
+The user manual covers installation, Forge tools and task recovery. Developers can select an extension mode in the [TrackB overview](user_development_guide/track_b/README.md) and use the [Piper X example](user_development_guide/PIPER_X_DEMO.md) to integrate a robot arm. See the [contribution guide](../CONTRIBUTING.md) for source review and resource registration.
 
 ## Core manuals
 
@@ -21,9 +18,8 @@ External platform submissions and changes to existing registered repositories mu
 
 - [MuJoCo Quickstart](quickstart-mujoco.md): simulation setup, joint and end-effector control, and shutdown recovery.
 - [FAQ](FAQ.md): Resource Registry downloads, full configuration examples and session memory recovery.
-- [DSH plugin](https://github.com/PhyAgentOS/PhyAgentOS-DSH-Plugin): install and use Forge Skills in DeepSeek Harness.
-
-- [Benchmark documentation](benchmarks.md): results, time and token usage, and evaluation context.
+- Install and run Forge Skills from a DeepSeek Harness conversation and read tool results. [DSH plugin repository](https://github.com/PhyAgentOS/PhyAgentOS-DSH-Plugin)
+- Choose policy profiles for RoboTwin, LIBERO and CALVIN, use the RoboDojo π0.5 developer package, and look up evaluation protocols and results. [Benchmark Skill guide](benchmarks.md#benchmark-skills)
 
 - [Governed Interaction Foundation](interaction/README.md): opt-in contracts, task governance, background monitoring, recovery gates and fake-world acceptance.
 
@@ -45,7 +41,7 @@ External platform submissions and changes to existing registered repositories mu
 | Operate a long-running service | [Operations Manual](user_manual/README.md) → [Core Communication Architecture](user_development_guide/COMMUNICATION.md) |
 | Deploy quickly with Docker | [Docker Deployment Guide](user_manual/DOCKER.md) |
 | Add a new robot action in Gateway | [TrackB development manual](user_development_guide/track_b/SKILL_DEVELOPMENT.md) → [Node protocols](user_development_guide/track_b/PROTOCOLS.md) |
-| Develop and package a Forge Skill; publish when available | [TrackB Skill development](user_development_guide/track_b/SKILL_DEVELOPMENT.md) → [Bundle reference](user_development_guide/README.md#5-package-publish-and-close-the-local-loop) |
+| Develop, package and submit a Forge Skill | [TrackB Skill development](user_development_guide/track_b/SKILL_DEVELOPMENT.md) → [Bundle reference](user_development_guide/README.md#5-package-publish-and-close-the-local-loop) |
 | Change evidence, verification, recovery, or persistence | [Core Developer Manual](en/03-developer-manual.md) → [Forge Integration Contract](forge/README.md) |
 | Use or extend task experience, Lessons, or Skill evolution | [Agent Experience and Skill Evolution](en/05-agent-experience-and-skill-evolution.md) → [Core Developer Manual](en/03-developer-manual.md) |
 
