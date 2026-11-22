@@ -19,6 +19,10 @@ External platform submissions and changes to existing registered repositories mu
 
 ## Focused manuals
 
+- [MuJoCo Quickstart](quickstart-mujoco.md): simulation setup, joint and end-effector control, and shutdown recovery.
+- [FAQ](FAQ.md): Resource Registry downloads, full configuration examples and session memory recovery.
+- [DSH plugin](https://github.com/PhyAgentOS/PhyAgentOS-DSH-Plugin): install and use Forge Skills in DeepSeek Harness.
+
 - [Benchmark documentation](benchmarks.md): results, time and token usage, and evaluation context.
 
 - [Governed Interaction Foundation](interaction/README.md): opt-in contracts, task governance, background monitoring, recovery gates and fake-world acceptance.
