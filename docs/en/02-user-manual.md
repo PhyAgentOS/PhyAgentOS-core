@@ -318,7 +318,7 @@ is serialized in camelCase and also accepts snake_case.
       "associationQuality": "best_effort"
     }
   },
-  "resourceRegistry": {"url": "https://paos-resource-manager.dev.x-era.com"}
+  "resourceRegistry": {"url": "https://paos-resource-platform.dev.x-era.com"}
 }
 ```
 
