@@ -19,6 +19,10 @@
 
 ## 专题手册
 
+- [MuJoCo Quickstart](quickstart-mujoco_zh.md)：安装仿真 Skill、控制关节与末端位姿，以及停止与恢复。
+- [FAQ](FAQ_zh.md)：资源服务、完整配置示例与会话记忆恢复。
+- [DSH 插件](https://github.com/PhyAgentOS/PhyAgentOS-DSH-Plugin)：在 DeepSeek Harness 中安装和使用 Forge Skill。
+
 - [Benchmark 文档](benchmarks.md)：测评结果、耗时、Token 消耗与评测口径。
 
 - [Game 接入前通用交互基础](interaction/README_zh.md)：可选协议、真实任务治理、后台 Runner、恢复安全门及假环境验收。
