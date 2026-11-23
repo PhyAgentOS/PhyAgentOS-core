@@ -499,6 +499,7 @@ does not delete execution records or evolution history.
 
 | Symptom | Check |
 |:--------|:------|
+| With a proxy set, provider configure/test reports `Endpoint configuration error`, or httpx reports `Invalid port`, `Invalid IDNA hostname` or `Unknown scheme for proxy URL` | httpx 0.28.1 and earlier cannot parse some proxy environment values. At startup, `paos` rewrites them for its own process only, leaving system settings unchanged: `socks://` becomes `socks5://`; bracketed IPv6 `NO_PROXY` entries such as `[::1]` lose their brackets; single-address `/128` entries such as `::1/128` become that address; wider IPv6 ranges such as `fd00::/8` and non-ASCII host names are dropped, so requests to them use the proxy. Variable names match case-insensitively and `NO_PROXY` may also use `;` separators. Scripts that import PhyAgentOS directly must adjust these variables themselves. |
 | Tool not found or not ready | Run `forge_tool_context`; confirm ToolSpec, binding, Endpoint, and Runtime profile. |
 | Skill will not install | Confirm Skill bundle metadata has size and SHA-256, every Node lock has a SHA-256, and each Registry/index Node resolves to a sized direct download. |
 | Skill will not start | Run `paos skill status` and `logs`; verify Dora, dataflow paths, assets, nodes, and Gateway `/tools`. |
