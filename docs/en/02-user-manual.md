@@ -246,6 +246,24 @@ In an existing session, run `/effort none`, then `/provider opper`, followed by
 `/model <model-id>`. Without `providers.opper.defaultModel`, switching providers retains the
 previous model ID.
 
+**[Standard Compute](https://standardcompute.com)** (`standardcompute`) uses the same gateway
+configuration. Create a key at https://standardcompute.com and put it in
+`providers.standardcompute.apiKey`, or supply `STANDARDCOMPUTE_API_KEY` /
+`PAOS_STANDARDCOMPUTE_API_KEY` at startup. The default endpoint is `https://api.stdcmpt.com/v1`.
+Use the model ID `StandardCompute`, which sends each request to the cheapest enabled model that can
+handle it, with automatic fallback, or a pinned ID such as `anthropic/claude-sonnet-5.5` or
+`openai/gpt-5.6-luna` from `GET https://api.stdcmpt.com/v1/models`. This integration also uses
+PAOS's conservative gateway effort validation, so clear any explicit reasoning effort when
+selecting it:
+
+```bash
+paos provider use standardcompute --model StandardCompute --reasoning-effort none
+```
+
+In an existing session, run `/effort none`, then `/provider standardcompute`, followed by
+`/model <model-id>`. Without `providers.standardcompute.defaultModel`, switching providers
+retains the previous model ID.
+
 In terminal chat, bare `/model` opens a picker of saved models across all configured providers,
 labelled by provider. Use Up/Down and Enter to switch both provider and model for the current
 session; the next message uses that choice. Esc or Ctrl+C cancels selection and returns to chat.
